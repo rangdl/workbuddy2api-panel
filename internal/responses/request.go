@@ -131,6 +131,21 @@ func appendResponsesItems(items []any, ctx *ToolContext) []any {
 		if len(pendingCalls) == 0 {
 			return
 		}
+		// 最后一条是 assistant 且尚无 tool_calls → 并入它（对齐 cc-switch
+		// merge_pending_tool_calls_into_adjacent_assistant，避免多出空 assistant 消息）。
+		if n := len(messages); n > 0 {
+			if last, ok := messages[n-1].(map[string]any); ok && last["role"] == "assistant" {
+				if tcs, ok := last["tool_calls"].([]any); !ok || len(tcs) == 0 {
+					last["tool_calls"] = pendingCalls
+					if pendingReasoning != "" {
+						last["reasoning_content"] = joinReasoningUnique(rawString(last, "reasoning_content"), pendingReasoning)
+					}
+					pendingCalls = nil
+					pendingReasoning = ""
+					return
+				}
+			}
+		}
 		msg := map[string]any{"role": "assistant", "tool_calls": pendingCalls}
 		if pendingReasoning != "" {
 			msg["reasoning_content"] = pendingReasoning
@@ -164,15 +179,15 @@ func appendResponsesItems(items []any, ctx *ToolContext) []any {
 		switch stringField(item, "type") {
 		case "function_call":
 			flushMedia()
-			pendingReasoning = joinReasoning(pendingReasoning, responsesItemReasoning(item))
+			pendingReasoning = joinReasoningUnique(pendingReasoning, responsesItemReasoning(item))
 			pendingCalls = append(pendingCalls, responsesFunctionCallToChatToolCall(item, ctx))
 		case "custom_tool_call":
 			flushMedia()
-			pendingReasoning = joinReasoning(pendingReasoning, responsesItemReasoning(item))
+			pendingReasoning = joinReasoningUnique(pendingReasoning, responsesItemReasoning(item))
 			pendingCalls = append(pendingCalls, responsesCustomToolCallToChatToolCall(item))
 		case "tool_search_call":
 			flushMedia()
-			pendingReasoning = joinReasoning(pendingReasoning, responsesItemReasoning(item))
+			pendingReasoning = joinReasoningUnique(pendingReasoning, responsesItemReasoning(item))
 			pendingCalls = append(pendingCalls, responsesToolSearchCallToChatToolCall(item))
 		case "function_call_output", "custom_tool_call_output", "tool_search_output":
 			flushCalls()
@@ -396,6 +411,22 @@ func joinReasoning(existing, add string) string {
 	return existing + "\n\n" + add
 }
 
+// joinReasoningUnique 同 joinReasoning，但已包含该文本时跳过（对齐 cc-switch
+// append_unique_pending_reasoning，避免同一段 reasoning 被重复拼接）。
+func joinReasoningUnique(existing, add string) string {
+	add = strings.TrimSpace(add)
+	if add == "" {
+		return existing
+	}
+	if existing == "" {
+		return add
+	}
+	if strings.Contains(existing, add) {
+		return existing
+	}
+	return existing + "\n\n" + add
+}
+
 // attachReasoningToPreviousAssistant 把剩余 pending reasoning 回溯附挂到上一条
 // assistant 消息（无上一条 assistant 时自然丢弃）。
 func attachReasoningToPreviousAssistant(messages []any, lastAssistant int, pending *string) {
@@ -446,21 +477,38 @@ func isEffortDisabled(effort string) bool {
 	}
 }
 
-// canonicalizeToolArguments 把 tool arguments 规范化为字符串：
-// 字符串原样返回，其他值 JSON 序列化（Go 的 map 序列化按键排序）。
+// canonicalizeToolArguments 把 tool arguments 规范化为字符串（对齐 cc-switch
+// json_canonical）：缺失/空 → "{}"；字符串若是 JSON 则规范化（Go 的 map 序列化
+// 按键排序，保证参数顺序稳定）；其他值 JSON 序列化。
 func canonicalizeToolArguments(v any) string {
 	switch args := v.(type) {
 	case nil:
-		return ""
+		return "{}"
 	case string:
-		return args
+		return canonicalizeJSONStringIfParseable(args)
 	default:
 		raw, err := json.Marshal(args)
 		if err != nil {
-			return ""
+			return "{}"
 		}
 		return string(raw)
 	}
+}
+
+// canonicalizeJSONStringIfParseable 若字符串是合法 JSON 则规范化（键排序），否则原样返回。
+func canonicalizeJSONStringIfParseable(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "{}"
+	}
+	var parsed any
+	if json.Unmarshal([]byte(s), &parsed) != nil {
+		return s
+	}
+	raw, err := json.Marshal(parsed)
+	if err != nil {
+		return s
+	}
+	return string(raw)
 }
 
 // toolOutputString 把 tool output 转成字符串：字符串原样，其他值 JSON 序列化。

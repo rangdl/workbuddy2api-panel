@@ -277,3 +277,27 @@ func TestStreamPartialDropStillCompletes(t *testing.T) {
 		t.Errorf("should complete\n%s", out)
 	}
 }
+
+// TestStreamToolCallOutOfOrder 验证乱序到达的分片仍按 index 顺序释放 output_item.added。
+func TestStreamToolCallOutOfOrder(t *testing.T) {
+	s := NewStreamState(nil)
+	var buf bytes.Buffer
+	// 先到 index=1，再到 index=0。
+	buf.Write(s.HandleChunk(chunk(map[string]any{"tool_calls": []any{
+		map[string]any{"index": float64(1), "id": "call_b", "type": "function", "function": map[string]any{"name": "b", "arguments": "{}"}},
+	}}, "", nil)))
+	buf.Write(s.HandleChunk(chunk(map[string]any{"tool_calls": []any{
+		map[string]any{"index": float64(0), "id": "call_a", "type": "function", "function": map[string]any{"name": "a", "arguments": "{}"}},
+	}}, "tool_calls", nil)))
+	buf.Write(s.Finalize())
+	out := buf.String()
+
+	i0 := strings.Index(out, "call_a")
+	i1 := strings.Index(out, "call_b")
+	if i0 < 0 || i1 < 0 {
+		t.Fatalf("both calls must appear\n%s", out)
+	}
+	if i0 > i1 {
+		t.Errorf("call_a (index 0) must be released before call_b (index 1)\n%s", out)
+	}
+}

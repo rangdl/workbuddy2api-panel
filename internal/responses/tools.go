@@ -7,32 +7,65 @@ import (
 )
 
 // buildToolContext 从 Responses 请求的 tools 声明构造 Chat 工具映射。
+// 除顶层 tools 外，也提升 input 里声明的工具（additional_tools / tool_search_output）。
 func buildToolContext(body map[string]any) *ToolContext {
 	ctx := NewToolContext()
-	tools, _ := body["tools"].([]any)
-	for _, raw := range tools {
-		switch tool := raw.(type) {
-		case string:
-			// 字符串工具名视作 custom 工具（cc-switch 同口径）。
-			ctx.addCustom(map[string]any{"type": toolKindCustom, "name": tool})
-		case map[string]any:
-			// 仅识别可映射到 Chat 的工具类型。web_search / x_search /
-			// image_generation 等服务端工具（Responses server-side tools）无法在
-			// Chat 上游执行，**有意忽略**（对齐 cc-switch：落到 default 不转换、
-			// 不报错）。Codex 发现该工具不可用后会自行降级；保留它会让严格上游 400。
-			switch stringField(tool, "type") {
-			case toolKindFunction:
-				ctx.addFunction(tool, "")
-			case toolKindCustom:
-				ctx.addCustom(tool)
-			case toolKindToolSearch:
-				ctx.addToolSearch()
-			case toolKindNamespace:
-				ctx.addNamespace(tool)
-			}
+	if tools, ok := body["tools"].([]any); ok {
+		for _, raw := range tools {
+			ctx.addResponseTool(raw)
 		}
 	}
+	if input, ok := body["input"]; ok {
+		collectInputDeclaredTools(input, ctx)
+	}
 	return ctx
+}
+
+// addResponseTool 登记一个 Responses 工具声明。
+func (c *ToolContext) addResponseTool(raw any) {
+	switch tool := raw.(type) {
+	case string:
+		// 字符串工具名视作 custom 工具（cc-switch 同口径）。
+		c.addCustom(map[string]any{"type": toolKindCustom, "name": tool})
+	case map[string]any:
+		// 仅识别可映射到 Chat 的工具类型。web_search / x_search /
+		// image_generation 等服务端工具（Responses server-side tools）无法在
+		// Chat 上游执行，**有意忽略**（对齐 cc-switch：落到 default 不转换、
+		// 不报错）。Codex 发现该工具不可用后会自行降级；保留它会让严格上游 400。
+		switch stringField(tool, "type") {
+		case toolKindFunction:
+			c.addFunction(tool, "")
+		case toolKindCustom:
+			c.addCustom(tool)
+		case toolKindToolSearch:
+			c.addToolSearch()
+		case toolKindNamespace:
+			c.addNamespace(tool)
+		}
+	}
+}
+
+// collectInputDeclaredTools 递归收集 input 里声明的工具
+// （additional_tools / tool_search_output 的 tools 数组）。
+func collectInputDeclaredTools(value any, ctx *ToolContext) {
+	switch v := value.(type) {
+	case []any:
+		for _, item := range v {
+			collectInputDeclaredTools(item, ctx)
+		}
+	case map[string]any:
+		switch stringField(v, "type") {
+		case "tool_search_output", "additional_tools":
+			if tools, ok := v["tools"].([]any); ok {
+				for _, tool := range tools {
+					ctx.addResponseTool(tool)
+				}
+			}
+		}
+		for _, item := range v {
+			collectInputDeclaredTools(item, ctx)
+		}
+	}
 }
 
 // addFunction 登记 function 工具（namespace 非空时扁平化命名）。

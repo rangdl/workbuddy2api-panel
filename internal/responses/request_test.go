@@ -275,3 +275,68 @@ func TestResponsesOnlyFieldsIgnored(t *testing.T) {
 		}
 	}
 }
+
+// TestInputDeclaredToolsLifted 验证 input 里的 additional_tools 声明也被提升。
+func TestInputDeclaredToolsLifted(t *testing.T) {
+	body := []byte(`{"model":"m","input":[
+		{"type":"additional_tools","tools":[{"type":"function","name":"extra_tool","parameters":{"type":"object"}}]},
+		{"type":"message","role":"user","content":"hi"}
+	]}`)
+	raw, ctx, err := ToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := decode(t, raw)
+	tools, _ := out["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 lifted tool, got %d (%v)", len(tools), tools)
+	}
+	if _, ok := ctx.Lookup("extra_tool"); !ok {
+		t.Errorf("extra_tool not registered in context")
+	}
+}
+
+// TestReasoningDedupAcrossPendingCalls 验证同一段 reasoning 在合并 tool_calls 时只出现一次。
+func TestReasoningDedupAcrossPendingCalls(t *testing.T) {
+	body := []byte(`{"model":"m","input":[
+		{"type":"function_call","call_id":"c1","name":"a","arguments":"{}","reasoning_content":"same thought"},
+		{"type":"function_call","call_id":"c2","name":"b","arguments":"{}","reasoning_content":"same thought"}
+	]}`)
+	raw, _, err := ToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := decode(t, raw)
+	msgs, _ := out["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("two adjacent calls should merge into one assistant, got %d", len(msgs))
+	}
+	msg, _ := msgs[0].(map[string]any)
+	if msg["reasoning_content"] != "same thought" {
+		t.Errorf("reasoning should be deduped, got %v", msg["reasoning_content"])
+	}
+}
+
+// TestPendingToolCallsMergeIntoAssistant 验证 pending tool_calls 并入相邻的空 assistant。
+func TestPendingToolCallsMergeIntoAssistant(t *testing.T) {
+	body := []byte(`{"model":"m","input":[
+		{"type":"message","role":"assistant","content":"let me check"},
+		{"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"}
+	]}`)
+	raw, _, err := ToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := decode(t, raw)
+	msgs, _ := out["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("should merge into the existing assistant, got %d (%v)", len(msgs), msgs)
+	}
+	msg, _ := msgs[0].(map[string]any)
+	if msg["role"] != "assistant" {
+		t.Errorf("role=%v", msg["role"])
+	}
+	if tcs, _ := msg["tool_calls"].([]any); len(tcs) != 1 {
+		t.Errorf("tool_calls not merged: %v", msg["tool_calls"])
+	}
+}

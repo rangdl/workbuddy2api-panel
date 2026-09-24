@@ -40,6 +40,8 @@ type StreamState struct {
 	toolOrder []int
 	// toolIDIndex call_id → 分配的 index，供上游省略 index 时按 id 归位。
 	toolIDIndex map[string]int
+	// nextToolIndexToAdd 下一个待释放的工具槽位（按 chat index 顺序释放）。
+	nextToolIndexToAdd int
 	// droppedToolCalls 因缺函数名而被丢弃的工具调用数（用于「答一句就停」防御）。
 	droppedToolCalls int
 
@@ -246,7 +248,7 @@ func (s *StreamState) pushToolCall(out *bytes.Buffer, tc map[string]any) {
 	}
 	state, ok := s.tools[idx]
 	if !ok {
-		state = &streamToolCall{outputIndex: s.allocIndex()}
+		state = &streamToolCall{}
 		s.tools[idx] = state
 		s.toolOrder = append(s.toolOrder, idx)
 	}
@@ -258,27 +260,50 @@ func (s *StreamState) pushToolCall(out *bytes.Buffer, tc map[string]any) {
 	if name := rawString(fn, "name"); name != "" {
 		state.name = name
 	}
-	if !state.added && state.name != "" {
-		state.added = true
-		callID := state.callID
-		if callID == "" {
-			callID = fmt.Sprintf("call_%d", idx)
-		}
-		state.itemID = toolCallItemID(callID, state.name, s.toolCtx)
-		item := toolCallItem(callID, state.name, "", "", "in_progress", s.toolCtx)
-		out.Write(sseEvent("response.output_item.added", map[string]any{
-			"output_index": state.outputIndex,
-			"item":         item,
-		}))
-	}
 	if args := rawString(fn, "arguments"); args != "" {
 		state.arguments.WriteString(args)
+		// 已 added 的调用才发 arguments delta；未 added 的由 flushReadyToolCalls
+		// 在释放时补发（避免分片乱序先于 output_item.added）。
 		// custom 工具的 input 不流式发 delta（收尾时一次性发 custom_tool_call_input）。
 		if state.added && !s.isCustom(state.name) {
 			out.Write(sseEvent("response.function_call_arguments.delta", map[string]any{
 				"item_id": state.itemID, "output_index": state.outputIndex, "delta": args,
 			}))
 		}
+	}
+	s.flushReadyToolCalls(out)
+}
+
+// flushReadyToolCalls 按 chat index 顺序释放「call_id 与 name 均已就绪」的工具调用
+// （对齐 cc-switch flush_ready_tool_calls）：保证乱序到达的分片仍按 index 顺序发出
+// output_item.added，且不会因身份未齐而提前 added。
+func (s *StreamState) flushReadyToolCalls(out *bytes.Buffer) {
+	for {
+		key := s.nextToolIndexToAdd
+		state, ok := s.tools[key]
+		if !ok {
+			break
+		}
+		if state.added || state.done {
+			s.nextToolIndexToAdd++
+			continue
+		}
+		if state.callID == "" || strings.TrimSpace(state.name) == "" {
+			break
+		}
+		state.added = true
+		state.outputIndex = s.allocIndex()
+		state.itemID = toolCallItemID(state.callID, state.name, s.toolCtx)
+		out.Write(sseEvent("response.output_item.added", map[string]any{
+			"output_index": state.outputIndex,
+			"item":         toolCallItem(state.callID, state.name, "", "", "in_progress", s.toolCtx),
+		}))
+		if state.arguments.Len() > 0 && !s.isCustom(state.name) {
+			out.Write(sseEvent("response.function_call_arguments.delta", map[string]any{
+				"item_id": state.itemID, "output_index": state.outputIndex, "delta": state.arguments.String(),
+			}))
+		}
+		s.nextToolIndexToAdd++
 	}
 }
 
@@ -346,6 +371,7 @@ func (s *StreamState) finalizeTools(out *bytes.Buffer) {
 		// name 在后续分片才到、尚未发过 output_item.added 时补发。
 		if !state.added {
 			state.added = true
+			state.outputIndex = s.allocIndex()
 			state.itemID = toolCallItemID(callID, state.name, s.toolCtx)
 			out.Write(sseEvent("response.output_item.added", map[string]any{
 				"output_index": state.outputIndex,
