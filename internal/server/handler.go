@@ -62,6 +62,10 @@ type Config struct {
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
 	Usage *usage.Recorder
+
+	// Responses Responses 端点配置（可选；nil = 仍注册 /v1/responses，但无增量补全/模型映射）。
+	// 定义在 responses.go（同包），避免污染上游 Config 字段语义。
+	Responses *ResponsesConfig
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -123,6 +127,9 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	if cfg.Responses != nil {
+		h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
+	}
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)

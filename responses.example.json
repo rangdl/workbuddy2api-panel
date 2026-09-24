@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "model_map": {
+    "gpt-5-codex": "glm-5.2",
+    "gpt-5.6-sol": "glm-5.2"
+  },
+  "default_model": "",
+  "max_cached_responses": 512
+}
