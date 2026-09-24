@@ -6,6 +6,7 @@
 package panel
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,10 +21,12 @@ import (
 // 用户可增删。codex 升级后模型可能变化，可在面板里手动增行。
 var codexDefaultModels = []string{
 	"gpt-6-astra",
+	"gpt-6-sol",
+	"gpt-6-luna",
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",
-	"gpt-5.2",
+	"gpt-5.5",
 }
 
 // defaultResponsesConfig responses.json 不存在时回显的默认值（与 loadResponsesConfig 语义一致）。
@@ -59,8 +62,10 @@ func (p *Panel) getResponsesConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "parse responses.json: "+err.Error())
 		return
 	}
+	// config 用原始字节返回：保留 model_map 的键顺序（供前端拖拽排序展示；
+	// 若解成 map 再序列化，Go 会按 key 排序，顺序丢失）。
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "path": path, "config": cfg, "codex_models": codexDefaultModels,
+		"ok": true, "path": path, "config": json.RawMessage(raw), "codex_models": codexDefaultModels,
 	})
 }
 
@@ -86,13 +91,20 @@ func (p *Panel) saveResponsesConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	pretty, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "marshal: "+err.Error())
-		return
+	// 保存时直接格式化原始 body：保留前端传入的字段顺序（尤其 model_map 的键顺序，
+	// 供拖拽排序持久化）。校验用 cfg（map，仅检查类型，不参与写盘）。
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, raw, "", "  "); err != nil {
+		b, merr := json.MarshalIndent(cfg, "", "  ")
+		if merr != nil {
+			writeErr(w, http.StatusInternalServerError, "marshal: "+merr.Error())
+			return
+		}
+		pretty.Reset()
+		pretty.Write(b)
 	}
-	pretty = append(pretty, '\n')
-	if err := os.WriteFile(path, pretty, 0o600); err != nil {
+	pretty.WriteByte('\n')
+	if err := os.WriteFile(path, pretty.Bytes(), 0o600); err != nil {
 		writeErr(w, http.StatusInternalServerError, "write responses.json: "+err.Error())
 		return
 	}

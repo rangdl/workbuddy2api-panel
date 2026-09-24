@@ -545,11 +545,32 @@ async function loadResponsesConfig() {
     $('respNote').textContent = '';
   } catch (e) { /* 后端未提供该接口时静默 */ }
 }
-/* 模型映射：每行左右两个输入框（客户端模型名 → 上游模型名）。 */
+/* 模型映射：每行「拖拽手柄 + 左输入框 → 右输入框 + 删除」。
+   拖拽手柄用 HTML5 drag&drop 调整行顺序；保存时按 DOM 顺序写盘。 */
+let respDragRow = null;
 function respMapRow(key, val) {
   const row = document.createElement('div');
   row.className = 'resp-map-row';
   row.style.cssText = 'display:flex;align-items:center;gap:8px';
+  const handle = document.createElement('span');
+  handle.className = 'resp-map-handle';
+  handle.textContent = '⠿';
+  handle.title = '拖拽排序';
+  handle.style.cssText = 'cursor:grab;user-select:none;opacity:0.55;padding:0 2px';
+  handle.draggable = true;
+  handle.addEventListener('dragstart', e => {
+    respDragRow = row;
+    row.style.opacity = '0.4';
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+  });
+  handle.addEventListener('dragend', () => { respDragRow = null; row.style.opacity = ''; });
+  row.addEventListener('dragover', e => {
+    e.preventDefault();
+    if (!respDragRow || respDragRow === row) return;
+    const rect = row.getBoundingClientRect();
+    const after = e.clientY > rect.top + rect.height / 2;
+    row.parentNode.insertBefore(respDragRow, after ? row.nextSibling : row);
+  });
   const k = document.createElement('input');
   k.className = 'resp-map-key';
   k.placeholder = '客户端模型名（如 gpt-5.6-sol）';
@@ -568,20 +589,19 @@ function respMapRow(key, val) {
   del.className = 'xs';
   del.textContent = '删除';
   del.onclick = () => row.remove();
-  row.append(k, arrow, v, del);
+  row.append(handle, k, arrow, v, del);
   return row;
 }
 function renderRespMapRows(modelMap, codexModels) {
   const box = $('respMapRows');
   box.innerHTML = '';
-  const seen = new Set();
-  for (const m of codexModels) {
-    seen.add(m);
-    box.append(respMapRow(m, modelMap[m] || ''));
-  }
-  // 用户已有的、不在默认列表里的映射。
-  for (const [k, v] of Object.entries(modelMap)) {
-    if (!seen.has(k)) box.append(respMapRow(k, v));
+  const entries = Object.entries(modelMap);
+  if (entries.length === 0) {
+    // 未配置：展示默认模型列表（左列，右列留空待填）。
+    for (const m of codexModels) box.append(respMapRow(m, ''));
+  } else {
+    // 已配置：只展示已保存的映射（不再叠加默认列表）。
+    for (const [k, v] of entries) box.append(respMapRow(k, v));
   }
 }
 function collectRespModelMap() {
