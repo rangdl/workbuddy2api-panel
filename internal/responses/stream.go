@@ -39,6 +39,8 @@ type StreamState struct {
 	tools     map[int]*streamToolCall
 	toolOrder []int
 
+	toolCtx *ToolContext
+
 	latestUsage  map[string]any
 	finishReason string
 	started      bool
@@ -46,11 +48,13 @@ type StreamState struct {
 	outputItems  []map[string]any
 }
 
-// NewStreamState 构造流式转换状态机。
-func NewStreamState() *StreamState {
+// NewStreamState 构造流式转换状态机。toolCtx 用于把 Chat 工具名还原为
+// Responses 的 function_call / custom_tool_call / tool_search_call（可为 nil）。
+func NewStreamState(toolCtx *ToolContext) *StreamState {
 	return &StreamState{
 		responseID: "resp_wb2api",
 		tools:      map[int]*streamToolCall{},
+		toolCtx:    toolCtx,
 	}
 }
 
@@ -220,18 +224,21 @@ func (s *StreamState) pushToolCall(out *bytes.Buffer, tc map[string]any) {
 	}
 	if !state.added && state.name != "" {
 		state.added = true
-		state.itemID = "fc_" + firstNonEmpty(state.callID, fmt.Sprintf("call_%d", idx))
+		callID := state.callID
+		if callID == "" {
+			callID = fmt.Sprintf("call_%d", idx)
+		}
+		state.itemID = toolCallItemID(callID, state.name, s.toolCtx)
+		item := toolCallItem(callID, state.name, "", "", "in_progress", s.toolCtx)
 		out.Write(sseEvent("response.output_item.added", map[string]any{
 			"output_index": state.outputIndex,
-			"item": map[string]any{
-				"id": state.itemID, "type": "function_call", "status": "in_progress",
-				"call_id": state.callID, "name": state.name, "arguments": "",
-			},
+			"item":         item,
 		}))
 	}
 	if args := rawString(fn, "arguments"); args != "" {
 		state.arguments.WriteString(args)
-		if state.added {
+		// custom 工具的 input 不流式发 delta（收尾时一次性发 custom_tool_call_input）。
+		if state.added && !s.isCustom(state.name) {
 			out.Write(sseEvent("response.function_call_arguments.delta", map[string]any{
 				"item_id": state.itemID, "output_index": state.outputIndex, "delta": args,
 			}))
@@ -289,18 +296,37 @@ func (s *StreamState) finalizeTools(out *bytes.Buffer) {
 		if state == nil || state.done || !state.added {
 			continue
 		}
-		args := state.arguments.String()
-		out.Write(sseEvent("response.function_call_arguments.done", map[string]any{
-			"item_id": state.itemID, "output_index": state.outputIndex, "arguments": args,
-		}))
-		item := map[string]any{
-			"id": state.itemID, "type": "function_call", "status": "completed",
-			"call_id": state.callID, "name": state.name, "arguments": args,
+		callID := state.callID
+		if callID == "" {
+			callID = fmt.Sprintf("call_%d", idx)
+		}
+		arguments := state.arguments.String()
+		item := toolCallItem(callID, state.name, arguments, "", "completed", s.toolCtx)
+		if s.isCustom(state.name) {
+			// custom 工具：收尾一次性发完整 input。
+			input := customToolInputFromArguments(arguments)
+			if input != "" {
+				out.Write(sseEvent("response.custom_tool_call_input.delta", map[string]any{
+					"item_id": state.itemID, "output_index": state.outputIndex, "delta": input,
+				}))
+			}
+			out.Write(sseEvent("response.custom_tool_call_input.done", map[string]any{
+				"item_id": state.itemID, "output_index": state.outputIndex, "input": input,
+			}))
+		} else {
+			out.Write(sseEvent("response.function_call_arguments.done", map[string]any{
+				"item_id": state.itemID, "output_index": state.outputIndex, "arguments": arguments,
+			}))
 		}
 		out.Write(sseEvent("response.output_item.done", map[string]any{"output_index": state.outputIndex, "item": item}))
 		s.outputItems = append(s.outputItems, item)
 		state.done = true
 	}
+}
+
+// isCustom 报告 Chat 工具名是否对应 custom 工具。
+func (s *StreamState) isCustom(name string) bool {
+	return s.toolCtx != nil && s.toolCtx.isCustom(name)
 }
 
 func (s *StreamState) baseResponse(status string, output []any) map[string]any {

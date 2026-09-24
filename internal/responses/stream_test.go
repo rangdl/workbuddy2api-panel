@@ -19,7 +19,7 @@ func chunk(delta map[string]any, finishReason string, usage map[string]any) map[
 }
 
 func TestStreamTextSequence(t *testing.T) {
-	s := NewStreamState()
+	s := NewStreamState(nil)
 	var buf bytes.Buffer
 	buf.Write(s.HandleChunk(chunk(map[string]any{"role": "assistant", "content": "你好"}, "", nil)))
 	buf.Write(s.HandleChunk(chunk(map[string]any{}, "stop", map[string]any{
@@ -60,7 +60,7 @@ func TestStreamTextSequence(t *testing.T) {
 }
 
 func TestStreamToolCallSequence(t *testing.T) {
-	s := NewStreamState()
+	s := NewStreamState(nil)
 	var buf bytes.Buffer
 	buf.Write(s.HandleChunk(chunk(map[string]any{"tool_calls": []any{
 		map[string]any{"index": float64(0), "id": "call_1", "type": "function",
@@ -95,7 +95,7 @@ func TestStreamToolCallSequence(t *testing.T) {
 }
 
 func TestStreamReasoningSequence(t *testing.T) {
-	s := NewStreamState()
+	s := NewStreamState(nil)
 	var buf bytes.Buffer
 	buf.Write(s.HandleChunk(chunk(map[string]any{"reasoning_content": "思考中"}, "", nil)))
 	buf.Write(s.HandleChunk(chunk(map[string]any{"content": "答案"}, "stop", nil)))
@@ -128,7 +128,7 @@ func TestStreamReasoningSequence(t *testing.T) {
 }
 
 func TestStreamFailed(t *testing.T) {
-	s := NewStreamState()
+	s := NewStreamState(nil)
 	s.HandleChunk(chunk(map[string]any{"content": "partial"}, "", nil))
 	out := string(s.Failed("boom", "upstream_error"))
 	if !strings.Contains(out, "event: response.failed") {
@@ -140,7 +140,7 @@ func TestStreamFailed(t *testing.T) {
 }
 
 func TestStreamFinalizeIdempotent(t *testing.T) {
-	s := NewStreamState()
+	s := NewStreamState(nil)
 	s.HandleChunk(chunk(map[string]any{"content": "hi"}, "stop", nil))
 	first := s.Finalize()
 	second := s.Finalize()
@@ -149,5 +149,65 @@ func TestStreamFinalizeIdempotent(t *testing.T) {
 	}
 	if len(second) != 0 {
 		t.Errorf("second finalize should be empty: %s", second)
+	}
+}
+
+// TestStreamCustomToolCall 验证流式下 custom 工具还原：用 custom_tool_call_input
+// 事件而非 function_call_arguments，且 item 类型为 custom_tool_call。
+func TestStreamCustomToolCall(t *testing.T) {
+	ctx := NewToolContext()
+	ctx.addCustom(map[string]any{"type": "custom", "name": "apply_patch"})
+	s := NewStreamState(ctx)
+	var buf bytes.Buffer
+	buf.Write(s.HandleChunk(chunk(map[string]any{"tool_calls": []any{
+		map[string]any{"index": float64(0), "id": "call_1", "type": "function",
+			"function": map[string]any{"name": "apply_patch", "arguments": ""}},
+	}}, "", nil)))
+	buf.Write(s.HandleChunk(chunk(map[string]any{"tool_calls": []any{
+		map[string]any{"index": float64(0), "function": map[string]any{"arguments": `{"input":"*** Begin Patch"}`}},
+	}}, "tool_calls", nil)))
+	buf.Write(s.Finalize())
+	out := buf.String()
+
+	if !strings.Contains(out, "event: response.custom_tool_call_input.done") {
+		t.Errorf("missing custom input done\n%s", out)
+	}
+	if strings.Contains(out, "event: response.function_call_arguments.delta") {
+		t.Errorf("custom tool must not emit function_call_arguments delta\n%s", out)
+	}
+	items := s.OutputItems()
+	if len(items) != 1 {
+		t.Fatalf("items=%d", len(items))
+	}
+	item := items[0].(map[string]any)
+	if item["type"] != "custom_tool_call" || item["input"] != "*** Begin Patch" {
+		t.Errorf("custom item=%v", item)
+	}
+}
+
+// TestStreamNamespaceToolCall 验证流式下 namespace 工具还原（name/namespace 拆回）。
+func TestStreamNamespaceToolCall(t *testing.T) {
+	ctx := NewToolContext()
+	ctx.addNamespace(map[string]any{"type": "namespace", "name": "fs", "tools": []any{
+		map[string]any{"type": "function", "name": "read", "parameters": map[string]any{"type": "object"}},
+	}})
+	s := NewStreamState(ctx)
+	var buf bytes.Buffer
+	buf.Write(s.HandleChunk(chunk(map[string]any{"tool_calls": []any{
+		map[string]any{"index": float64(0), "id": "c1", "type": "function",
+			"function": map[string]any{"name": "fs__read", "arguments": "{}"}},
+	}}, "tool_calls", nil)))
+	buf.Write(s.Finalize())
+
+	items := s.OutputItems()
+	if len(items) != 1 {
+		t.Fatalf("items=%d", len(items))
+	}
+	item := items[0].(map[string]any)
+	if item["type"] != "function_call" || item["name"] != "read" || item["namespace"] != "fs" {
+		t.Errorf("namespace item=%v", item)
+	}
+	if !strings.Contains(buf.String(), "event: response.function_call_arguments.done") {
+		t.Errorf("namespace tool should emit arguments done\n%s", buf.String())
 	}
 }

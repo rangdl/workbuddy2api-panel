@@ -166,15 +166,26 @@ func chatToolCallsToResponseItems(message map[string]any, reasoning string, ctx 
 	return items
 }
 
-// chatToolCallToResponseItem 还原单个 tool_call。
+// chatToolCallToResponseItem 还原单个 tool_call（非流式，status=completed）。
 func chatToolCallToResponseItem(callID, chatName, arguments, reasoning string, ctx *ToolContext) map[string]any {
-	spec, known := ctx.Lookup(chatName)
+	return toolCallItem(callID, chatName, arguments, reasoning, "completed", ctx)
+}
+
+// toolCallItem 按 ToolContext 生成 Responses 工具调用 item，供流式/非流式共用：
+// 依据 Chat 工具名还原为 function_call / custom_tool_call / tool_search_call。
+// status 为 in_progress 时 arguments/input 传空。
+func toolCallItem(callID, chatName, arguments, reasoning, status string, ctx *ToolContext) map[string]any {
+	var spec ToolSpec
+	known := false
+	if ctx != nil {
+		spec, known = ctx.Lookup(chatName)
+	}
 	switch {
 	case known && spec.Kind == toolKindCustom:
 		item := map[string]any{
 			"id":      "ctc_" + callID,
 			"type":    "custom_tool_call",
-			"status":  "completed",
+			"status":  status,
 			"call_id": callID,
 			"name":    spec.Name,
 			"input":   customToolInputFromArguments(arguments),
@@ -185,7 +196,7 @@ func chatToolCallToResponseItem(callID, chatName, arguments, reasoning string, c
 		item := map[string]any{
 			"type":      "tool_search_call",
 			"call_id":   callID,
-			"status":    "completed",
+			"status":    status,
 			"execution": "client",
 			"arguments": parseToolArgumentsObject(arguments),
 		}
@@ -200,7 +211,7 @@ func chatToolCallToResponseItem(callID, chatName, arguments, reasoning string, c
 		item := map[string]any{
 			"id":        "fc_" + callID,
 			"type":      "function_call",
-			"status":    "completed",
+			"status":    status,
 			"call_id":   callID,
 			"name":      name,
 			"arguments": arguments,
@@ -211,6 +222,14 @@ func chatToolCallToResponseItem(callID, chatName, arguments, reasoning string, c
 		attachReasoning(item, reasoning)
 		return item
 	}
+}
+
+// toolCallItemID 计算流式事件里的 item_id（custom 用 ctc_ 前缀，其余 fc_）。
+func toolCallItemID(callID, chatName string, ctx *ToolContext) string {
+	if ctx != nil && ctx.isCustom(chatName) {
+		return "ctc_" + callID
+	}
+	return "fc_" + callID
 }
 
 // chatLegacyFunctionCallToResponseItem 兼容旧式 message.function_call。

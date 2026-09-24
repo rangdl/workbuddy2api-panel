@@ -124,7 +124,7 @@ type responsesWriter struct {
 }
 
 func newResponsesWriter(dst http.ResponseWriter, toolCtx *responses.ToolContext) *responsesWriter {
-	return &responsesWriter{dst: dst, toolCtx: toolCtx, sseState: responses.NewStreamState()}
+	return &responsesWriter{dst: dst, toolCtx: toolCtx, sseState: responses.NewStreamState(toolCtx)}
 }
 
 func (w *responsesWriter) Header() http.Header { return w.dst.Header() }
