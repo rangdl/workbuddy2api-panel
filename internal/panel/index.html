@@ -795,6 +795,32 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </div>
         </div>
 
+        <div class="box" id="respBox">
+          <header><h3>Responses / Codex 接入</h3><span class="grow"></span><span class="note" id="respPath"></span></header>
+          <div class="pad">
+            <div class="switch"><span class="lb">启用 /v1/responses</span>
+              <input type="checkbox" id="respEnabled"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">默认模型（未命中映射时回落）</span>
+                <input id="respDefaultModel" placeholder="留空 = 不改写模型名">
+                <span class="hint">Codex 发 cn:hy3 这类名字时无需填</span></label>
+              <label class="fld"><span class="lb">增量缓存条数</span>
+                <input id="respMaxCache" type="number" min="0" placeholder="512">
+                <span class="hint">进程内 LRU 上限</span></label>
+            </div>
+            <label class="fld"><span class="lb">模型映射（每行一个：客户端模型名 = 上游模型名）</span>
+              <textarea id="respModelMap" rows="4" placeholder="gpt-5-codex = glm-5.2"></textarea>
+              <span class="hint">如 gpt-5-codex = glm-5.2；留空 = 不改写</span></label>
+            <div class="hint" style="margin-top:10px">保存后需重启进程生效（Responses 配置在启动时构造）。</div>
+          </div>
+          <div class="savebar">
+            <span class="grow"></span>
+            <span class="restart-note" id="respNote"></span>
+            <button type="button" id="btnRespReload">放弃修改</button>
+            <button type="button" class="primary" id="btnRespSave">保存 Responses 配置</button>
+          </div>
+        </div>
+
         <div class="savebar">
           <span class="grow"></span>
           <span class="restart-note" id="cfgNote"></span>

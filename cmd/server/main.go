@@ -243,6 +243,8 @@ func main() {
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
 		ConfigPath: *cfgPath,
+		// Responses / Codex 接入配置页：读写独立的 responses.json。
+		ResponsesPath: responsesConfigPath(*cfgPath),
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},

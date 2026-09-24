@@ -61,6 +61,10 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// ResponsesPath responses.json 路径（面板「Responses / Codex 接入」配置页读写用；
+	// 空 = 不提供该接口）。独立于 ConfigPath，不并入主配置表单。
+	ResponsesPath string
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -180,6 +184,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	p.mux.HandleFunc("GET /panel/api/responses_config", p.withAuth(p.getResponsesConfig))
+	p.mux.HandleFunc("POST /panel/api/responses_config", p.withAuth(p.saveResponsesConfig))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API

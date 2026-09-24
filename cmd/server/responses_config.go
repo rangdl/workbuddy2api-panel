@@ -25,6 +25,11 @@ type responsesFileConfig struct {
 	MaxCachedResponses int               `json:"max_cached_responses"` // 增量缓存条数，缺省 512
 }
 
+// responsesConfigPath 返回 responses.json 的完整路径（与 config.json 同目录）。
+func responsesConfigPath(configPath string) string {
+	return filepath.Join(filepath.Dir(configPath), responsesFileName)
+}
+
 // loadResponsesConfig 从 responses.json + 环境变量构造 Responses 配置。
 // 默认启用；enabled=false 时返回 nil（不注册 /v1/responses 路由）。
 //
@@ -36,7 +41,7 @@ type responsesFileConfig struct {
 //	WB2A_RESPONSES_MAX_CACHE
 func loadResponsesConfig(configPath string) *server.ResponsesConfig {
 	fc := responsesFileConfig{}
-	path := filepath.Join(filepath.Dir(configPath), responsesFileName)
+	path := responsesConfigPath(configPath)
 	if raw, err := os.ReadFile(path); err == nil {
 		if err := json.Unmarshal(raw, &fc); err != nil {
 			log.Printf("WARN: [responses] parse %s: %v", path, err)

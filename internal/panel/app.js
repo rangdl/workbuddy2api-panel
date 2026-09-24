@@ -133,7 +133,7 @@ function go(v) {
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
-  if (v === 'config') loadConfig();
+  if (v === 'config') { loadConfig(); loadResponsesConfig(); }
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
@@ -530,6 +530,51 @@ $('cfgForm').onsubmit = async ev => {
     loadOverview(true);
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '保存配置'; }
+};
+
+/* ── Responses / Codex 接入配置（独立 responses.json） ────────────── */
+async function loadResponsesConfig() {
+  try {
+    const d = await api('responses_config');
+    const c = d.config || {};
+    $('respPath').textContent = d.path || '';
+    $('respEnabled').checked = c.enabled !== false;
+    $('respDefaultModel').value = c.default_model || '';
+    $('respMaxCache').value = c.max_cached_responses == null ? '' : c.max_cached_responses;
+    const mm = c.model_map || {};
+    $('respModelMap').value = Object.entries(mm).map(([k, v]) => k + ' = ' + v).join('\n');
+    $('respNote').textContent = '';
+  } catch (e) { /* 后端未提供该接口时静默 */ }
+}
+function collectResponsesConfig() {
+  const model_map = {};
+  for (const line of $('respModelMap').value.split('\n')) {
+    const s = line.trim();
+    if (!s) continue;
+    const i = s.indexOf('=');
+    if (i < 0) throw new Error('模型映射格式应为「客户端名 = 上游名」：' + s);
+    const k = s.slice(0, i).trim(), v = s.slice(i + 1).trim();
+    if (!k || !v) throw new Error('模型映射两侧不能为空：' + s);
+    model_map[k] = v;
+  }
+  const maxRaw = $('respMaxCache').value.trim();
+  const cfg = { enabled: $('respEnabled').checked, model_map, default_model: $('respDefaultModel').value.trim() };
+  if (maxRaw !== '') cfg.max_cached_responses = Number(maxRaw);
+  return cfg;
+}
+$('btnRespReload').onclick = loadResponsesConfig;
+$('btnRespSave').onclick = async () => {
+  const btn = $('btnRespSave');
+  let cfg;
+  try { cfg = collectResponsesConfig(); }
+  catch (e) { toast(e.message, 'err'); return; }
+  btn.disabled = true; btn.textContent = '保存中…';
+  try {
+    await api('responses_config', { method: 'POST', body: JSON.stringify(cfg) });
+    toast('Responses 配置已保存，需重启进程生效', 'ok');
+    loadResponsesConfig();
+  } catch (e) { toast('保存失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '保存 Responses 配置'; }
 };
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
