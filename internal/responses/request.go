@@ -124,6 +124,7 @@ func appendResponsesItems(items []any, ctx *ToolContext) []any {
 	messages := []any{}
 	var pendingCalls []any
 	var pendingReasoning string
+	var pendingMedia []any
 	lastAssistant := -1
 
 	flushCalls := func() {
@@ -140,39 +141,60 @@ func appendResponsesItems(items []any, ctx *ToolContext) []any {
 		pendingReasoning = ""
 	}
 
+	// flushMedia 把累计的工具结果媒体作为一条合成 user 消息投递
+	// （Chat 的 tool 消息是纯文本，媒体必须搬到 user 消息）。
+	flushMedia := func() {
+		if len(pendingMedia) == 0 {
+			return
+		}
+		messages = append(messages, map[string]any{"role": "user", "content": pendingMedia})
+		pendingMedia = nil
+	}
+
 	for _, raw := range items {
 		item, ok := raw.(map[string]any)
 		if !ok {
 			if s, ok := raw.(string); ok {
 				flushCalls()
+				flushMedia()
 				messages = append(messages, map[string]any{"role": "user", "content": s})
 			}
 			continue
 		}
 		switch stringField(item, "type") {
 		case "function_call":
+			flushMedia()
 			pendingReasoning = joinReasoning(pendingReasoning, responsesItemReasoning(item))
 			pendingCalls = append(pendingCalls, responsesFunctionCallToChatToolCall(item, ctx))
 		case "custom_tool_call":
+			flushMedia()
 			pendingReasoning = joinReasoning(pendingReasoning, responsesItemReasoning(item))
 			pendingCalls = append(pendingCalls, responsesCustomToolCallToChatToolCall(item))
 		case "tool_search_call":
+			flushMedia()
 			pendingReasoning = joinReasoning(pendingReasoning, responsesItemReasoning(item))
 			pendingCalls = append(pendingCalls, responsesToolSearchCallToChatToolCall(item))
 		case "function_call_output", "custom_tool_call_output", "tool_search_output":
 			flushCalls()
+			callID := responseItemCallID(item)
+			// 剥离 tool 结果里的媒体块（Chat tool 消息不接受媒体），
+			// 收集到 pendingMedia，稍后作为合成 user 消息投递。
+			toolContent, media := planToolOutputMedia(item["output"])
+			queueToolMedia(&pendingMedia, callID, media)
 			messages = append(messages, map[string]any{
 				"role":         "tool",
-				"tool_call_id": responseItemCallID(item),
-				"content":      toolOutputString(item["output"]),
+				"tool_call_id": callID,
+				"content":      toolContent,
 			})
 		case "reasoning":
+			flushMedia()
 			pendingReasoning = joinReasoning(pendingReasoning, responsesReasoningItemText(item))
 		case "additional_tools":
 			// 工具声明已在 buildToolContext 提升，此处不产生消息。
 		default:
 			if stringField(item, "type") == "message" || item["role"] != nil || item["content"] != nil {
 				flushCalls()
+				flushMedia()
 				msg := responsesMessageToChatMessage(item)
 				if msg["role"] == "assistant" {
 					if pendingReasoning != "" {
@@ -189,6 +211,7 @@ func appendResponsesItems(items []any, ctx *ToolContext) []any {
 		}
 	}
 	flushCalls()
+	flushMedia()
 	attachReasoningToPreviousAssistant(messages, lastAssistant, &pendingReasoning)
 	return messages
 }
