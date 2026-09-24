@@ -541,27 +541,65 @@ async function loadResponsesConfig() {
     $('respEnabled').checked = c.enabled !== false;
     $('respDefaultModel').value = c.default_model || '';
     $('respMaxCache').value = c.max_cached_responses == null ? '' : c.max_cached_responses;
-    const mm = c.model_map || {};
-    $('respModelMap').value = Object.entries(mm).map(([k, v]) => k + ' = ' + v).join('\n');
+    renderRespMapRows(c.model_map || {}, d.codex_models || []);
     $('respNote').textContent = '';
   } catch (e) { /* 后端未提供该接口时静默 */ }
 }
-function collectResponsesConfig() {
-  const model_map = {};
-  for (const line of $('respModelMap').value.split('\n')) {
-    const s = line.trim();
-    if (!s) continue;
-    const i = s.indexOf('=');
-    if (i < 0) throw new Error('模型映射格式应为「客户端名 = 上游名」：' + s);
-    const k = s.slice(0, i).trim(), v = s.slice(i + 1).trim();
-    if (!k || !v) throw new Error('模型映射两侧不能为空：' + s);
-    model_map[k] = v;
+/* 模型映射：每行左右两个输入框（客户端模型名 → 上游模型名）。 */
+function respMapRow(key, val) {
+  const row = document.createElement('div');
+  row.className = 'resp-map-row';
+  row.style.cssText = 'display:flex;align-items:center;gap:8px';
+  const k = document.createElement('input');
+  k.className = 'resp-map-key';
+  k.placeholder = '客户端模型名（如 gpt-5.6-sol）';
+  k.value = key || '';
+  k.style.flex = '1';
+  const arrow = document.createElement('span');
+  arrow.textContent = '→';
+  arrow.style.opacity = '0.5';
+  const v = document.createElement('input');
+  v.className = 'resp-map-val';
+  v.placeholder = '上游模型名（如 glm-5.2）';
+  v.value = val || '';
+  v.style.flex = '1';
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.className = 'xs';
+  del.textContent = '删除';
+  del.onclick = () => row.remove();
+  row.append(k, arrow, v, del);
+  return row;
+}
+function renderRespMapRows(modelMap, codexModels) {
+  const box = $('respMapRows');
+  box.innerHTML = '';
+  const seen = new Set();
+  for (const m of codexModels) {
+    seen.add(m);
+    box.append(respMapRow(m, modelMap[m] || ''));
   }
+  // 用户已有的、不在默认列表里的映射。
+  for (const [k, v] of Object.entries(modelMap)) {
+    if (!seen.has(k)) box.append(respMapRow(k, v));
+  }
+}
+function collectRespModelMap() {
+  const map = {};
+  for (const row of $('respMapRows').children) {
+    const k = row.querySelector('.resp-map-key').value.trim();
+    const v = row.querySelector('.resp-map-val').value.trim();
+    if (k && v) map[k] = v; // 右侧留空 = 不映射
+  }
+  return map;
+}
+function collectResponsesConfig() {
   const maxRaw = $('respMaxCache').value.trim();
-  const cfg = { enabled: $('respEnabled').checked, model_map, default_model: $('respDefaultModel').value.trim() };
+  const cfg = { enabled: $('respEnabled').checked, model_map: collectRespModelMap(), default_model: $('respDefaultModel').value.trim() };
   if (maxRaw !== '') cfg.max_cached_responses = Number(maxRaw);
   return cfg;
 }
+$('btnRespAddRow').onclick = () => $('respMapRows').append(respMapRow('', ''));
 $('btnRespReload').onclick = loadResponsesConfig;
 $('btnRespSave').onclick = async () => {
   const btn = $('btnRespSave');

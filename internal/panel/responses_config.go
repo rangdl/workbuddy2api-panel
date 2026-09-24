@@ -15,6 +15,25 @@ import (
 	"os"
 )
 
+// codexDefaultModels 面板 model_map 预填的 codex 客户端模型名（左列）。
+// 来源：codex 的 model catalog（slug 字段，含 gpt-5.x 系列）；网关仅作展示默认，
+// 用户可增删。codex 升级后模型可能变化，可在面板里手动增行。
+var codexDefaultModels = []string{
+	"gpt-6-astra",
+	"gpt-5.6-sol",
+	"gpt-5.6-terra",
+	"gpt-5.6-luna",
+	"gpt-daybreak-blue-latest",
+	"gpt-daybreak-red-latest",
+	"gpt-5.5",
+	"gpt-5.4",
+	"gpt-5.4-mini",
+	"gpt-5.2",
+	"gpt-5.1-codex",
+	"gpt-5-codex",
+	"codex-auto-review",
+}
+
 // defaultResponsesConfig responses.json 不存在时回显的默认值（与 loadResponsesConfig 语义一致）。
 func defaultResponsesConfig() map[string]any {
 	return map[string]any{
@@ -34,7 +53,9 @@ func (p *Panel) getResponsesConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": path, "config": defaultResponsesConfig()})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "path": path, "config": defaultResponsesConfig(), "codex_models": codexDefaultModels,
+		})
 		return
 	}
 	if err != nil {
@@ -46,7 +67,9 @@ func (p *Panel) getResponsesConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "parse responses.json: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": path, "config": cfg})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "path": path, "config": cfg, "codex_models": codexDefaultModels,
+	})
 }
 
 // saveResponsesConfig 校验并写入 responses.json。

@@ -39,6 +39,10 @@ func TestResponsesConfigAPI(t *testing.T) {
 	if cfg["enabled"] != true {
 		t.Errorf("default enabled=%v", cfg["enabled"])
 	}
+	// 返回 codex_models 列表（供前端预填左列）。
+	if models, ok := got["codex_models"].([]any); !ok || len(models) == 0 {
+		t.Errorf("codex_models missing or empty: %v", got["codex_models"])
+	}
 
 	// 2. 合法保存 → 200 且落盘。
 	body := `{"enabled":true,"model_map":{"gpt-5-codex":"glm-5.2"},"default_model":"glm-5.2","max_cached_responses":256}`
