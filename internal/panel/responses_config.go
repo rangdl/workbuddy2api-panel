@@ -23,15 +23,7 @@ var codexDefaultModels = []string{
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",
-	"gpt-daybreak-blue-latest",
-	"gpt-daybreak-red-latest",
-	"gpt-5.5",
-	"gpt-5.4",
-	"gpt-5.4-mini",
 	"gpt-5.2",
-	"gpt-5.1-codex",
-	"gpt-5-codex",
-	"codex-auto-review",
 }
 
 // defaultResponsesConfig responses.json 不存在时回显的默认值（与 loadResponsesConfig 语义一致）。
