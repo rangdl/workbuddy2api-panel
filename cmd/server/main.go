@@ -228,6 +228,8 @@ func main() {
 	defer rec.Stop()
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
+	// handlerRef 供面板热重载闭包引用（panel 先于 handler 构造，闭包在保存时才调用）。
+	var handlerRef *server.Handler
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -245,6 +247,14 @@ func main() {
 		ConfigPath: *cfgPath,
 		// Responses / Codex 接入配置页：读写独立的 responses.json。
 		ResponsesPath: responsesConfigPath(*cfgPath),
+		// 保存后热重载：重读文件并原子替换 handler 的 Responses 配置（无需重启）。
+		ReloadResponses: func() error {
+			if handlerRef == nil {
+				return nil
+			}
+			handlerRef.SetResponsesConfig(loadResponsesConfig(*cfgPath))
+			return nil
+		},
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
@@ -272,6 +282,7 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 		Responses:     loadResponsesConfig(*cfgPath),
 	})
+	handlerRef = h
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

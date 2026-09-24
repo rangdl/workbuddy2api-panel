@@ -65,6 +65,9 @@ type Config struct {
 	// ResponsesPath responses.json 路径（面板「Responses / Codex 接入」配置页读写用；
 	// 空 = 不提供该接口）。独立于 ConfigPath，不并入主配置表单。
 	ResponsesPath string
+	// ReloadResponses 保存 responses.json 后触发热重载（由 main 注入：重读文件并
+	// 原子替换 handler 的 Responses 配置）。nil = 不热重载（需重启生效）。
+	ReloadResponses func() error
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，

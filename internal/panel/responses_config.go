@@ -104,8 +104,19 @@ func (p *Panel) saveResponsesConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "write responses.json: "+err.Error())
 		return
 	}
-	log.Printf("panel: responses.json 已保存（%s），需重启进程生效", path)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restart_required": []string{"responses"}})
+	restartRequired := []string{}
+	if p.cfg.ReloadResponses != nil {
+		if err := p.cfg.ReloadResponses(); err != nil {
+			// 热重载失败不吞：文件已落盘，但运行期未更新，提示需重启。
+			log.Printf("panel: responses.json 热重载失败: %v", err)
+			restartRequired = []string{"responses"}
+		} else {
+			log.Printf("panel: responses.json 已保存并热重载（%s）", path)
+		}
+	} else {
+		restartRequired = []string{"responses"}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restart_required": restartRequired})
 }
 
 // validateResponsesConfig 校验各字段类型（拒绝脏值，不写盘）。

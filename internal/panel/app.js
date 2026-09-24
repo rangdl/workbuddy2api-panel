@@ -608,8 +608,9 @@ $('btnRespSave').onclick = async () => {
   catch (e) { toast(e.message, 'err'); return; }
   btn.disabled = true; btn.textContent = '保存中…';
   try {
-    await api('responses_config', { method: 'POST', body: JSON.stringify(cfg) });
-    toast('Responses 配置已保存，需重启进程生效', 'ok');
+    const r = await api('responses_config', { method: 'POST', body: JSON.stringify(cfg) });
+    const n = (r.restart_required || []).length;
+    toast(n ? 'Responses 配置已保存，部分项需重启生效' : 'Responses 配置已保存并立即生效', 'ok');
     loadResponsesConfig();
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '保存 Responses 配置'; }

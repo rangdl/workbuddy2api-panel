@@ -16,7 +16,7 @@ func responsesTestHandler(t *testing.T, behavior func(authz string) (int, string
 	return NewHandler(Config{
 		Pool:      testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream:  up,
-		Responses: &ResponsesConfig{Store: responsesstore.NewMemoryStore(0)},
+		Responses: &ResponsesConfig{Enabled: true, Store: responsesstore.NewMemoryStore(0)},
 	})
 }
 
@@ -95,6 +95,7 @@ func TestResponsesModelMap(t *testing.T) {
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up,
 		Responses: &ResponsesConfig{
+			Enabled:      true,
 			Store:        responsesstore.NewMemoryStore(0),
 			ModelMap:     map[string]string{"gpt-5-codex": "glm-5.2"},
 			DefaultModel: "",
@@ -128,7 +129,7 @@ func TestResponsesIncrementalFill(t *testing.T) {
 	h := NewHandler(Config{
 		Pool:      testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream:  up,
-		Responses: &ResponsesConfig{Store: store},
+		Responses: &ResponsesConfig{Enabled: true, Store: store},
 	})
 
 	// 第一次
@@ -161,4 +162,41 @@ func TestResponsesIncrementalFill(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec2.Code, rec2.Body)
 	}
 	_ = lastBody
+}
+
+// TestResponsesHotReload 验证面板保存后热重载：启用/禁用开关与模型映射立即生效，
+// 无需重启（SetResponsesConfig 原子替换）。
+func TestResponsesHotReload(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{
+		Pool:      testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:  up,
+		Responses: &ResponsesConfig{Enabled: true, Store: responsesstore.NewMemoryStore(0)},
+	})
+	post := func(model string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"`+model+`","input":"hi"}`))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 热禁用 → 404（路由仍在，handler 运行期判断）。
+	h.SetResponsesConfig(&ResponsesConfig{Enabled: false})
+	if rec := post("glm-5.2"); rec.Code != 404 {
+		t.Fatalf("disabled should be 404, got %d", rec.Code)
+	}
+
+	// 热启用 + 模型映射 → 200，且请求 model 被映射（上游 fake 固定返回 glm-5.2）。
+	h.SetResponsesConfig(&ResponsesConfig{Enabled: true, ModelMap: map[string]string{"gpt-5-codex": "glm-5.2"}})
+	rec := post("gpt-5-codex")
+	if rec.Code != 200 {
+		t.Fatalf("enabled should be 200, got %d body=%s", rec.Code, rec.Body)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("not json: %v", err)
+	}
+	if resp["model"] != "glm-5.2" {
+		t.Errorf("mapped model=%v", resp["model"])
+	}
 }

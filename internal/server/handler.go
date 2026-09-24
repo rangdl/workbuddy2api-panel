@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -109,6 +110,9 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// responses Responses 端点配置（运行期可原子替换：面板保存 responses.json 后
+	// 热重载，无需重启）。nil 或 Enabled=false 时 /v1/responses 返回 404。
+	responsesCfg atomic.Pointer[ResponsesConfig]
 }
 
 // NewHandler 构建 handler。
@@ -126,7 +130,10 @@ func NewHandler(cfg Config) *Handler {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h.responsesCfg.Store(cfg.Responses)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// 只要注入了 Responses 配置就注册路由（enabled 的开关由 handler 运行期判断，
+	// 以便面板热切换启用/禁用；disabled 时返回 404）。
 	if cfg.Responses != nil {
 		h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	}
@@ -137,6 +144,16 @@ func NewHandler(cfg Config) *Handler {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
 	}
 	return h
+}
+
+// SetResponsesConfig 运行期替换 Responses 配置（面板保存 responses.json 后热重载）。
+// 保留原增量存储实例（避免热重载丢缓存；缓存条数变化需重启）。
+func (h *Handler) SetResponsesConfig(cfg *ResponsesConfig) {
+	old := h.responsesCfg.Load()
+	if old != nil && old.Store != nil && cfg != nil {
+		cfg.Store = old.Store
+	}
+	h.responsesCfg.Store(cfg)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {

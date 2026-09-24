@@ -14,6 +14,8 @@ import (
 // ResponsesConfig Responses 端点配置（由 cmd/server 从独立文件/环境变量构造后注入）。
 // 为降低与上游 config.go 的冲突，不进主 Config 结构。
 type ResponsesConfig struct {
+	// Enabled 是否响应 /v1/responses（运行时可热切换）。
+	Enabled bool
 	// Store 增量会话存储（previous_response_id 上下文补全）。nil = 关闭增量补全。
 	Store responsesstore.Store
 	// ModelMap Responses 模型名 → 上游模型名。
@@ -26,6 +28,12 @@ type ResponsesConfig struct {
 // 既有 chatCompletions 链路（鉴权/轮转/冷却/粘性/日志），再用包装 Writer 把出口
 // 转换为 Responses 形态。零改动 chatCompletions。
 func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
+	// 运行期读取当前配置（支持面板保存后热重载）。
+	cfg := h.responsesCfg.Load()
+	if cfg == nil || !cfg.Enabled {
+		writeResponsesError(w, http.StatusNotFound, "not_found", "responses endpoint is disabled")
+		return
+	}
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeResponsesError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
@@ -33,7 +41,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. 增量补全：previous_response_id → 取缓存 calls 插到 input 前。
-	if cfg := h.cfg.Responses; cfg != nil && cfg.Store != nil {
+	if cfg.Store != nil {
 		if filled, n := cfg.Store.Fill(raw); n > 0 {
 			raw = filled
 		}
@@ -47,7 +55,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. 模型名映射（Codex 发 gpt-5-codex，上游只认 CodeBuddy 模型名）。
-	chatBody = applyResponsesModelMap(chatBody, h.cfg.Responses)
+	chatBody = applyResponsesModelMap(chatBody, cfg)
 
 	// 4. 构造等价 Chat 请求（复制 header，替换 body），走既有链路。
 	nr := r.Clone(r.Context())
@@ -61,7 +69,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	rw.finish()
 
 	// 5. 记录本回合 output items 供下次 previous_response_id 补全。
-	if cfg := h.cfg.Responses; cfg != nil && cfg.Store != nil {
+	if cfg.Store != nil {
 		if items := rw.OutputItems(); len(items) > 0 {
 			cfg.Store.Record(rw.ResponseID(), items)
 		}

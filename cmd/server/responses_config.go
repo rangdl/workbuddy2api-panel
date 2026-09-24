@@ -60,7 +60,9 @@ func loadResponsesConfig(configPath string) *server.ResponsesConfig {
 		}
 	}
 	if !enabled {
-		return nil
+		// 仍返回非 nil（Enabled=false）：路由照常注册，handler 运行期返回 404，
+		// 这样面板可以热切换启用/禁用，无需重启。
+		return &server.ResponsesConfig{Enabled: false}
 	}
 
 	modelMap := fc.ModelMap
@@ -84,6 +86,7 @@ func loadResponsesConfig(configPath string) *server.ResponsesConfig {
 	}
 
 	return &server.ResponsesConfig{
+		Enabled:      true,
 		Store:        responsesstore.NewMemoryStore(maxCache),
 		ModelMap:     modelMap,
 		DefaultModel: defaultModel,
