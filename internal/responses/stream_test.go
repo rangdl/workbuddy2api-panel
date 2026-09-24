@@ -211,3 +211,69 @@ func TestStreamNamespaceToolCall(t *testing.T) {
 		t.Errorf("namespace tool should emit arguments done\n%s", buf.String())
 	}
 }
+
+// TestStreamToolCallWithoutIndex 验证上游省略 index 时按 id 归位（不合并到 0）。
+func TestStreamToolCallWithoutIndex(t *testing.T) {
+	s := NewStreamState(nil)
+	var buf bytes.Buffer
+	buf.Write(s.HandleChunk(chunk(map[string]any{"tool_calls": []any{
+		map[string]any{"id": "call_a", "type": "function", "function": map[string]any{"name": "shell", "arguments": "{}"}},
+	}}, "", nil)))
+	buf.Write(s.HandleChunk(chunk(map[string]any{"tool_calls": []any{
+		map[string]any{"id": "call_b", "type": "function", "function": map[string]any{"name": "read", "arguments": "{}"}},
+	}}, "tool_calls", nil)))
+	buf.Write(s.Finalize())
+
+	items := s.OutputItems()
+	if len(items) != 2 {
+		t.Fatalf("two index-less calls must stay separate, got %d (%v)", len(items), items)
+	}
+	ids := map[string]bool{}
+	for _, it := range items {
+		ids[it.(map[string]any)["call_id"].(string)] = true
+	}
+	if !ids["call_a"] || !ids["call_b"] {
+		t.Errorf("call ids not preserved: %v", ids)
+	}
+}
+
+// TestStreamDroppedToolCallFails 验证「工具全丢」防御：应 completed 的回合里所有
+// 工具调用都缺 name 时，发 response.failed 而不是谎报 completed。
+func TestStreamDroppedToolCallFails(t *testing.T) {
+	s := NewStreamState(nil)
+	var buf bytes.Buffer
+	buf.Write(s.HandleChunk(chunk(map[string]any{"tool_calls": []any{
+		map[string]any{"index": float64(0), "id": "call_x", "type": "function", "function": map[string]any{"arguments": "{}"}},
+	}}, "tool_calls", nil)))
+	buf.Write(s.Finalize())
+	out := buf.String()
+
+	if !strings.Contains(out, "event: response.failed") {
+		t.Errorf("all-dropped tool calls must fail\n%s", out)
+	}
+	if strings.Contains(out, "event: response.completed") {
+		t.Errorf("must not report completed\n%s", out)
+	}
+	if !strings.Contains(out, "upstream_tool_call_dropped") {
+		t.Errorf("missing error type\n%s", out)
+	}
+}
+
+// TestStreamPartialDropStillCompletes 验证只要还剩一个有效工具调用就正常 completed。
+func TestStreamPartialDropStillCompletes(t *testing.T) {
+	s := NewStreamState(nil)
+	var buf bytes.Buffer
+	buf.Write(s.HandleChunk(chunk(map[string]any{"tool_calls": []any{
+		map[string]any{"index": float64(0), "id": "call_x", "type": "function", "function": map[string]any{"arguments": "{}"}},
+		map[string]any{"index": float64(1), "id": "call_ok", "type": "function", "function": map[string]any{"name": "shell", "arguments": "{}"}},
+	}}, "tool_calls", nil)))
+	buf.Write(s.Finalize())
+	out := buf.String()
+
+	if strings.Contains(out, "event: response.failed") {
+		t.Errorf("one valid call remains, must not fail\n%s", out)
+	}
+	if !strings.Contains(out, "event: response.completed") {
+		t.Errorf("should complete\n%s", out)
+	}
+}
