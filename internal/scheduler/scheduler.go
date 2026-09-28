@@ -33,9 +33,8 @@ type Config struct {
 	// 01:00 自动扫描+执行；避开零点整防解锁竞态）
 
 	// ExpiringSoonWindow 快过期积分窗口：签到/余额刷新查余额时，把到期时间
-	// <= now+window 的套餐余额标记为"快过期"（pool 据此优先消耗，见
-	// entry.creditsExpiring）。<=0 时禁用分桶（全部归长期，行为与引入前一致）。
-	// 默认建议 7*24h。
+	// <= now+window 的套餐余额标记为"快过期"（pool 据此做最早到期优先，见
+	// entry.creditsEarliestExpiry）。<=0 时不做路由门槛；展示仍使用完整逐包数据。
 	ExpiringSoonWindow time.Duration
 
 	// CheckinDisabled 显式关闭签到排程（对应 config 的 schedule.checkin_enabled=false）。
@@ -101,6 +100,29 @@ func New(cfg Config) *Scheduler {
 		adoptTried:    make(map[string]string),
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
+	}
+}
+
+// ExpiringSoonWindow 返回当前快过期路由窗口（读取时与热配置写在 schedMu 下同步）。
+func (s *Scheduler) ExpiringSoonWindow() time.Duration {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	return s.cfg.ExpiringSoonWindow
+}
+
+// SetExpiringSoonWindow 热更新快过期路由窗口。窗口变化时清空池内旧快照，避免在下一轮
+// 余额刷新覆盖前，继续用旧窗口得出的最早到期顺序选号。
+func (s *Scheduler) SetExpiringSoonWindow(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.schedMu.Lock()
+	changed := s.cfg.ExpiringSoonWindow != d
+	s.cfg.ExpiringSoonWindow = d
+	poolRef := s.cfg.Pool
+	s.schedMu.Unlock()
+	if changed && poolRef != nil {
+		poolRef.ClearExpiringSnapshots()
 	}
 }
 
@@ -260,6 +282,57 @@ func awaitWakeupGrace(ctx context.Context, planned time.Time) bool {
 	return sleepCtx(ctx, wakeupGraceDelay)
 }
 
+// wallclockCheckStep 墙钟校验段长：等待槽位时单次 timer 的最大时长，每段醒来用
+// 墙钟重判是否到点。值是「时点精度」与「空闲唤醒频率」的折中——60s 段内时点
+// 偏差上限 60s，对签到/保活类任务足够。
+const wallclockCheckStep = time.Minute
+
+// slotWake waitSlot 的三态结果。
+type slotWake int
+
+const (
+	slotFired slotWake = iota // 墙钟已到达计划时点：补跑本批
+	slotRearm                 // 排程已变（Reconfigure）：上层重算下一次唤醒
+	slotCancel                // ctx 取消：上层优雅退出
+)
+
+// waitSlot 分段等待到 next 的**墙钟**时刻（next 由 nextFire 用 time.Date 构造、
+// 不携带单调读数，time.Until 对它是纯墙钟差）。
+//
+// 为什么不一把 time.NewTimer(time.Until(next)) 睡到底：timer 的等待基于单调时钟，
+// macOS / Windows Modern Standby 睡眠会冻结它——睡眠时长不足整个等待时，fire
+// 被顺延「睡眠时长」（墙钟已过点、timer 还要继续等），时点被错过且不会立即补跑；
+// 睡眠时长超过整个等待时倒是无害的（唤醒瞬间 timer 到期，awaitWakeupGrace 补跑）。
+// 分段睡、每段醒来用墙钟重判，把冻结的影响限制在一段之内：睡眠结束后的第一段
+// 末尾必然发现「墙钟已越过时点」并立即补跑，偏差上限 = step + 睡眠落段余量。
+//
+// ctx 取消 / rearmSchedule（在线改配置重排）在每段的 select 里随时返回，段长
+// 不影响两者响应性。返回三态见 slotWake。
+func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Duration) slotWake {
+	for {
+		wallRemain := time.Until(next)
+		if wallRemain <= 0 {
+			return slotFired
+		}
+		d := wallRemain
+		if d > step {
+			d = step
+		}
+		timer := time.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return slotCancel
+		case <-s.rearmSchedule:
+			timer.Stop()
+			return slotRearm
+		case <-timer.C:
+			// 段末回到循环顶用墙钟重判：正常推进时若干段后到点；单调时钟被
+			// 睡眠冻结时，墙钟大幅前进，至多一段之后即到点补跑。
+		}
+	}
+}
+
 // Run 主循环，阻塞直到 ctx 取消。
 // Reconfigure 触发 rearmSchedule 时提前唤醒重算（新时点/开关立即生效）。
 func (s *Scheduler) Run(ctx context.Context) {
@@ -274,14 +347,12 @@ func (s *Scheduler) Run(ctx context.Context) {
 				continue
 			}
 		}
-		timer := time.NewTimer(time.Until(next))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		switch s.waitSlot(ctx, next, wallclockCheckStep) {
+		case slotCancel:
 			return
-		case <-s.rearmSchedule:
-			timer.Stop() // 排程已变：重算下一次唤醒
-		case <-timer.C:
+		case slotRearm:
+			continue // 排程已变：重算下一次唤醒
+		case slotFired:
 			// 到点任务在排程时确定（不依赖唤醒时刻的小时数），迟到唤醒也不会漏跑。
 			// 迟到唤醒（睡眠跨过槽位时刻，timer 在唤醒瞬间才到期）先等网络宽限：
 			// 唤醒瞬间 DNS 未就绪，零宽限派发等于把唯一一次补跑机会打在注定失败
@@ -353,6 +424,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 func (s *Scheduler) RunCheckinNow() {
+	expiringSoon := s.ExpiringSoonWindow()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -375,18 +447,19 @@ func (s *Scheduler) RunCheckinNow() {
 				log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			}
 			// 其余业务错误也继续走余额查询
+		} else {
+			// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
+			// 重复触发时出现），成功也落一行。
+			log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
 		}
-		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗。
-		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
-		remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次。
+		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 		if err != nil {
 			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			continue
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
-		if expiring > 0 {
-			s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring)
-		}
+		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
 	}
 	s.RunStreakBonusNow()
 }
@@ -488,6 +561,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
 func (s *Scheduler) RunBalanceRefreshNow() {
 	var wg sync.WaitGroup
+	expiringSoon := s.ExpiringSoonWindow()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -499,16 +573,13 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
-			remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
 				return
 			}
-			if expiring > 0 {
-				s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring)
-			} else {
-				s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-			}
+			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
+			s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
 		}(a, st.UID)
 	}
 	wg.Wait()
