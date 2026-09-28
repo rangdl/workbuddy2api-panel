@@ -1,0 +1,30 @@
+{
+  "enabled": false,
+  "providers": [
+    {
+      "name": "deepseek",
+      "protocol": "openai",
+      "base_url": "https://api.deepseek.com/v1",
+      "chat_path": "/chat/completions",
+      "models_path": "/models",
+      "api_key": "sk-xxxxxxxxxxxxxxxx",
+      "models": ["deepseek-chat", "deepseek-reasoner"],
+      "timeout_seconds": 120,
+      "headers": {}
+    },
+    {
+      "name": "openai",
+      "protocol": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "sk-xxxxxxxxxxxxxxxx",
+      "models": ["gpt-4o", "gpt-4o-mini"]
+    },
+    {
+      "name": "local-fallback",
+      "protocol": "openai",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "api_key": "",
+      "models": []
+    }
+  ]
+}

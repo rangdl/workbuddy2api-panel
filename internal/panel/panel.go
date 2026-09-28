@@ -25,6 +25,8 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/thirdparty"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
@@ -68,6 +70,28 @@ type Config struct {
 	// ReloadResponses 保存 responses.json 后触发热重载（由 main 注入：重读文件并
 	// 原子替换 handler 的 Responses 配置）。nil = 不热重载（需重启生效）。
 	ReloadResponses func() error
+
+	// ThirdPartyPath third_party.json 路径（面板「上游接入」页读写用；
+	// 空 = 不提供该接口）。独立于 ConfigPath，不并入主配置表单。
+	ThirdPartyPath string
+	// ReloadThirdParty 保存 third_party.json 后触发热重载（由 main 注入：重读文件并
+	// 原子替换 handler 的第三方配置）。nil = 不热重载（需重启生效）。
+	ReloadThirdParty func() error
+	// ThirdPartyClient 第三方转发客户端（「测试连接」用；nil = 该接口返回 501）。
+	// 与 server 侧共用同一实例（连接池不重复建立）。
+	ThirdPartyClient *thirdparty.Client
+
+	// TraePath trae.json 路径（面板「上游接入」页的 Trae 区块读写用；空 = 不提供该接口）。
+	TraePath string
+	// ReloadTrae 保存 trae.json 后触发热重载（由 main 注入）。
+	ReloadTrae func() error
+	// TraeClient Trae 上游客户端（OAuth 换取 token 用；nil = 登录接口返回 501）。
+	TraeClient *trae.Client
+	// TraeCooldowns Trae 账号冷却表（展示与清理用；nil = 不展示冷却信息）。
+	// 与 server 侧共用同一实例。
+	TraeCooldowns *trae.Cooldowns
+	// TraeScheduler Trae 签到调度器（手动触发签到 / 查询最近结果用；nil = 501）。
+	TraeScheduler *trae.Scheduler
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -187,6 +211,19 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 	p.mux.HandleFunc("GET /panel/api/responses_config", p.withAuth(p.getResponsesConfig))
 	p.mux.HandleFunc("POST /panel/api/responses_config", p.withAuth(p.saveResponsesConfig))
+	p.mux.HandleFunc("GET /panel/api/thirdparty_config", p.withAuth(p.getThirdPartyConfig))
+	p.mux.HandleFunc("POST /panel/api/thirdparty_config", p.withAuth(p.saveThirdPartyConfig))
+	p.mux.HandleFunc("POST /panel/api/thirdparty_test", p.withAuth(p.testThirdPartyProvider))
+	p.mux.HandleFunc("GET /panel/api/trae_config", p.withAuth(p.getTraeConfig))
+	p.mux.HandleFunc("POST /panel/api/trae_config", p.withAuth(p.saveTraeConfig))
+	p.mux.HandleFunc("POST /panel/api/trae/import", p.withAuth(p.importTraeDevice))
+	p.mux.HandleFunc("POST /panel/api/trae/login/start", p.withAuth(p.traeLoginStart))
+	p.mux.HandleFunc("POST /panel/api/trae/login/finish", p.withAuth(p.traeLoginFinish))
+	p.mux.HandleFunc("POST /panel/api/trae/accounts/{uid}/remove", p.withAuth(p.removeTraeAccount))
+	p.mux.HandleFunc("POST /panel/api/trae/checkin_all", p.withAuth(p.traeCheckinAll))
+	p.mux.HandleFunc("POST /panel/api/trae/accounts/{uid}/checkin", p.withAuth(p.traeAccountCheckin))
+	p.mux.HandleFunc("POST /panel/api/trae/accounts/{uid}/credits", p.withAuth(p.traeAccountCredits))
+	p.mux.HandleFunc("GET /panel/api/trae/checkin_status", p.withAuth(p.traeCheckinStatus))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API

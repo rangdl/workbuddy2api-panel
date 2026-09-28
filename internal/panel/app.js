@@ -126,7 +126,7 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', upstream: '上游接入', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -134,6 +134,7 @@ function go(v) {
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') { loadConfig(); loadResponsesConfig(); }
+  if (v === 'upstream') { loadThirdPartyConfig(); loadTraeConfig(); }
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
@@ -634,6 +635,376 @@ $('btnRespSave').onclick = async () => {
     loadResponsesConfig();
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '保存 Responses 配置'; }
+};
+
+/* ── 上游接入：第三方 OpenAI 兼容上游（独立 third_party.json） ────── */
+/* 每个上游一行：名称 / 接口地址 / API Key / 模型列表 / 超时 + 测试连接 + 删除。
+   models 逗号分隔；留空 = 兜底上游（承接未命中其他上游的模型名）。 */
+function tpInput(cls, ph, val, flex) {
+  const i = document.createElement('input');
+  i.className = cls;
+  i.placeholder = ph;
+  i.value = val == null ? '' : val;
+  if (flex) i.style.flex = flex;
+  return i;
+}
+function tpProviderRow(p) {
+  p = p || {};
+  const row = document.createElement('div');
+  row.className = 'tp-row';
+  row.style.cssText = 'border:1px solid var(--line);border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:8px';
+
+  const r1 = document.createElement('div');
+  r1.style.cssText = 'display:flex;gap:8px;align-items:center';
+  const name = tpInput('tp-name', '名称（如 deepseek）', p.name, '0 0 180px');
+  const base = tpInput('tp-base', '接口地址（如 https://api.deepseek.com/v1）', p.base_url, '1');
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.className = 'xs';
+  del.textContent = '删除';
+  del.onclick = () => row.remove();
+  r1.append(name, base, del);
+
+  const r2 = document.createElement('div');
+  r2.style.cssText = 'display:flex;gap:8px;align-items:center';
+  const key = tpInput('tp-key', 'API Key（留空 = 不发鉴权头）', p.api_key, '1');
+  key.type = 'password';
+  const models = tpInput('tp-models', '模型名，逗号分隔（留空 = 兜底）', (p.models || []).join(', '), '1');
+  const timeout = tpInput('tp-timeout', '超时秒', p.timeout_seconds, '0 0 90px');
+  timeout.type = 'number';
+  const test = document.createElement('button');
+  test.type = 'button';
+  test.className = 'xs';
+  test.textContent = '测试连接';
+  test.onclick = async () => {
+    let provider;
+    try { provider = tpRowProvider(row); }
+    catch (e) { toast(e.message, 'err'); return; }
+    if (!provider.base_url) { toast('请先填写接口地址', 'err'); return; }
+    test.disabled = true;
+    test.textContent = '测试中…';
+    try {
+      const r = await api('thirdparty_test', { method: 'POST', body: JSON.stringify({ provider }) });
+      if (r.ok) toast(r.message || '连通成功', 'ok');
+      else toast('连接失败：' + (r.error || '未知错误'), 'err');
+    } catch (e) { toast('测试失败：' + e.message, 'err'); }
+    finally { test.disabled = false; test.textContent = '测试连接'; }
+  };
+  r2.append(key, models, timeout, test);
+
+  row.append(r1, r2);
+  return row;
+}
+/* tpRowProvider 收集一行；名称为空视为未填写（调用方据此跳过整行）。 */
+function tpRowProvider(row) {
+  const txt = s => row.querySelector(s).value.trim();
+  const models = txt('.tp-models').split(',').map(s => s.trim()).filter(Boolean);
+  const p = {
+    name: txt('.tp-name'),
+    protocol: 'openai',
+    base_url: txt('.tp-base'),
+    api_key: row.querySelector('.tp-key').value,
+    models: models,
+  };
+  const t = txt('.tp-timeout');
+  if (t !== '') p.timeout_seconds = Number(t);
+  return p;
+}
+function renderTpProviders(list) {
+  const box = $('tpRows');
+  box.innerHTML = '';
+  if (!list || !list.length) { box.append(tpProviderRow({})); return; }
+  for (const p of list) box.append(tpProviderRow(p));
+}
+function collectThirdPartyConfig() {
+  const providers = [];
+  for (const row of $('tpRows').children) {
+    const p = tpRowProvider(row);
+    if (!p.name && !p.base_url) continue; // 整行空白 = 跳过
+    if (!p.name) throw new Error('每个上游都要填名称');
+    if (!p.base_url) throw new Error('上游「' + p.name + '」缺少接口地址');
+    providers.push(p);
+  }
+  return { enabled: $('tpEnabled').checked, providers: providers };
+}
+async function loadThirdPartyConfig() {
+  try {
+    const d = await api('thirdparty_config');
+    const c = d.config || {};
+    $('tpPath').textContent = d.path || '';
+    $('tpEnabled').checked = !!c.enabled;
+    renderTpProviders(c.providers || []);
+    $('tpNote').textContent = '';
+  } catch (e) { /* 后端未提供该接口时静默 */ }
+}
+$('btnTpAddRow').onclick = () => $('tpRows').append(tpProviderRow({}));
+$('btnTpReload').onclick = loadThirdPartyConfig;
+$('btnTpSave').onclick = async () => {
+  const btn = $('btnTpSave');
+  let cfg;
+  try { cfg = collectThirdPartyConfig(); }
+  catch (e) { toast(e.message, 'err'); return; }
+  btn.disabled = true;
+  btn.textContent = '保存中…';
+  try {
+    const r = await api('thirdparty_config', { method: 'POST', body: JSON.stringify(cfg) });
+    const n = (r.restart_required || []).length;
+    toast(n ? '上游配置已保存，部分项需重启生效' : '上游配置已保存并立即生效', 'ok');
+    loadThirdPartyConfig();
+  } catch (e) { toast('保存失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '保存上游配置'; }
+};
+
+/* ── 上游接入：Trae（独立 trae.json） ─────────────────────────────── */
+/* 账号行 = 启用勾选 + uid/名称 + 状态标签 + 删除。
+   凭证永不回显（后端只给 has_* 布尔与尾号），故本页只维护"保留哪些账号 / 顺序 / 启用态"，
+   凭证由服务端从旧文件带入或经 OAuth / 设备凭证导入写入。 */
+function traeTag(text, cls) {
+  const s = document.createElement('span');
+  s.className = 'tag ' + (cls || '');
+  s.textContent = text;
+  return s;
+}
+function traeAccountRow(a, cool) {
+  const row = document.createElement('div');
+  row.className = 'trae-acc';
+  row.dataset.uid = a.uid;
+  row.style.cssText = 'display:flex;align-items:center;gap:10px;border:1px solid var(--line);border-radius:8px;padding:8px 10px;flex-wrap:wrap';
+
+  const on = document.createElement('input');
+  on.type = 'checkbox';
+  on.className = 'trae-acc-on';
+  on.checked = !a.disabled;
+  on.title = '取消勾选 = 该账号不参与轮转';
+
+  const uid = document.createElement('span');
+  uid.style.cssText = 'font-family:ui-monospace,SFMono-Regular,monospace;font-weight:600';
+  uid.textContent = a.uid;
+
+  const name = document.createElement('span');
+  name.style.cssText = 'opacity:.65;font-size:12px';
+  name.textContent = a.name || '';
+
+  const tags = document.createElement('span');
+  tags.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap';
+  tags.append(a.has_token ? traeTag('token ' + (a.token_tail || ''), 'good') : traeTag('无 token', 'bad'));
+  tags.append(a.has_refresh ? traeTag('可续期') : traeTag('无 refresh', 'warn'));
+  tags.append(a.has_device_key ? traeTag('设备签名', 'good') : traeTag('无设备密钥', 'warn'));
+  if (cool) tags.append(traeTag('冷却 ' + Math.max(1, Math.round(cool.remaining_sec / 60)) + ' 分钟', 'bad'));
+  if (a.disabled) tags.append(traeTag('已禁用', 'off'));
+
+  const actions = document.createElement('span');
+  actions.style.cssText = 'margin-left:auto;display:flex;gap:6px';
+  const ck = document.createElement('button');
+  ck.type = 'button';
+  ck.className = 'xs';
+  ck.textContent = '签到';
+  ck.onclick = async () => {
+    ck.disabled = true;
+    ck.textContent = '签到中…';
+    try {
+      const d = await api('trae/accounts/' + encodeURIComponent(a.uid) + '/checkin', { method: 'POST' });
+      if (d.ok) toast(a.uid + (d.already ? ' 今日已签到' : ' 签到成功' + (d.reward > 0 ? ' +' + d.reward : '')), 'ok');
+      else toast('签到失败：' + (d.message || '未知错误'), 'err');
+      loadTraeConfig();
+    } catch (e) { toast('签到失败：' + e.message, 'err'); }
+    finally { ck.disabled = false; ck.textContent = '签到'; }
+  };
+  const cr = document.createElement('button');
+  cr.type = 'button';
+  cr.className = 'xs';
+  cr.textContent = '积分';
+  cr.onclick = async () => {
+    cr.disabled = true;
+    cr.textContent = '查询中…';
+    try {
+      const d = await api('trae/accounts/' + encodeURIComponent(a.uid) + '/credits', { method: 'POST' });
+      if (d.ok && d.credits) {
+        const c = d.credits;
+        toast('通用 ' + Math.round(c.general) + ' / Work ' + Math.round(c.work) +
+          '（合计 ' + Math.round(c.total) + '，额度 ' + Math.round(c.limit) + '）', 'ok');
+      } else {
+        toast('积分查询失败：' + (d.message || '未知错误'), 'err');
+      }
+    } catch (e) { toast('积分查询失败：' + e.message, 'err'); }
+    finally { cr.disabled = false; cr.textContent = '积分'; }
+  };
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.className = 'xs';
+  del.textContent = '删除';
+  del.onclick = async () => {
+    if (!confirm('删除 Trae 账号 ' + a.uid + '？其凭证（token / 设备私钥）一并删除，不可恢复。')) return;
+    try {
+      await api('trae/accounts/' + encodeURIComponent(a.uid) + '/remove', { method: 'POST' });
+      toast('已删除', 'ok');
+      loadTraeConfig();
+    } catch (e) { toast('删除失败：' + e.message, 'err'); }
+  };
+  actions.append(ck, cr, del);
+
+  row.append(on, uid, name, tags, actions);
+  return row;
+}
+function renderTraeAccounts(list, cooldowns) {
+  const box = $('traeAccounts');
+  box.innerHTML = '';
+  const coolMap = {};
+  for (const c of (cooldowns || [])) coolMap[c.uid] = c;
+  if (!list || !list.length) {
+    box.innerHTML = '<div class="hint">还没有 Trae 账号——用下方的「生成授权链接」完成一次 OAuth 登录。</div>';
+    return;
+  }
+  for (const a of list) box.append(traeAccountRow(a, coolMap[a.uid]));
+}
+function collectTraeConfig() {
+  const accounts = [];
+  const disabled = [];
+  for (const row of $('traeAccounts').children) {
+    const uid = row.dataset.uid;
+    if (!uid) continue;
+    accounts.push(uid);
+    const on = row.querySelector('.trae-acc-on');
+    if (on && !on.checked) disabled.push(uid);
+  }
+  return {
+    enabled: $('traeEnabled').checked,
+    chat_base: $('traeChatBase').value.trim(),
+    ide_version: $('traeIdeVersion').value.trim(),
+    timeout_seconds: 120,
+    accounts: accounts,
+    disabled: disabled,
+    schedule: {
+      checkin_enabled: $('traeCheckinEnabled').checked,
+      checkin_hours: parseHours($('traeCheckinHours').value),
+    },
+  };
+}
+/* parseHours 解析 "9, 21" → [9,21]（非法项丢弃；空串 → []）。 */
+function parseHours(s) {
+  return String(s || '').split(',').map(x => parseInt(x.trim(), 10))
+    .filter(n => Number.isInteger(n) && n >= 0 && n <= 23);
+}
+async function loadTraeConfig() {
+  try {
+    const d = await api('trae_config');
+    const c = d.config || {};
+    $('traePath').textContent = d.path || '';
+    $('traeEnabled').checked = !!c.enabled;
+    $('traeChatBase').value = c.chat_base || '';
+    $('traeIdeVersion').value = c.ide_version || '';
+    renderTraeAccounts(c.accounts || [], c.cooldowns || []);
+    $('traeUsable').textContent = '可参与轮转：' + (c.usable || 0) + ' / ' + ((c.accounts || []).length) + ' 个账号';
+    const sch = c.schedule || {};
+    $('traeCheckinEnabled').checked = !!sch.checkin_enabled;
+    $('traeCheckinHours').value = (sch.checkin_hours || []).join(', ');
+    $('traeNote').textContent = '';
+  } catch (e) { /* 后端未提供该接口时静默 */ }
+}
+$('btnTraeReload').onclick = loadTraeConfig;
+$('btnTraeSave').onclick = async () => {
+  const btn = $('btnTraeSave');
+  btn.disabled = true;
+  btn.textContent = '保存中…';
+  try {
+    await api('trae_config', { method: 'POST', body: JSON.stringify(collectTraeConfig()) });
+    toast('Trae 配置已保存并立即生效', 'ok');
+    loadTraeConfig();
+  } catch (e) { toast('保存失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '保存 Trae 配置'; }
+};
+$('btnTraeLogin').onclick = async () => {
+  const btn = $('btnTraeLogin');
+  btn.disabled = true;
+  try {
+    const d = await api('trae/login/start', { method: 'POST' });
+    $('traeLoginHint').innerHTML = '授权链接已生成（设备 ' + esc(d.device_id || '') + '）：' +
+      '<a href="' + esc(d.url) + '" target="_blank" rel="noopener">打开授权页</a>。' +
+      '完成授权后浏览器会跳转到回调地址，把**地址栏完整 URL** 复制到右侧输入框。';
+    window.open(d.url, '_blank', 'noopener');
+    toast('授权链接已生成，请在浏览器完成授权', 'ok');
+  } catch (e) { toast('生成失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; }
+};
+$('btnTraeFinish').onclick = async () => {
+  const cb = $('traeCallback').value.trim();
+  if (!cb) { toast('请先粘贴浏览器地址栏的完整回调 URL', 'err'); return; }
+  const btn = $('btnTraeFinish');
+  btn.disabled = true;
+  btn.textContent = '登录中…';
+  try {
+    const d = await api('trae/login/finish', { method: 'POST', body: JSON.stringify({ callback_url: cb }) });
+    toast('登录成功：' + d.uid + (d.has_device_key ? '（含设备签名能力）' : '（无设备密钥，续期可能受限）'), 'ok');
+    $('traeCallback').value = '';
+    loadTraeConfig();
+  } catch (e) { toast('登录失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '完成登录'; }
+};
+$('btnTraeImport').onclick = async () => {
+  const raw = $('traeStorage').value.trim();
+  const uid = $('traeStorageUid').value.trim();
+  if (!raw) { toast('请粘贴 storage.json 内容或单条 icube 密文', 'err'); return; }
+  if (!uid) { toast('请填写要绑定的 uid', 'err'); return; }
+  // 两种形态：整文件（{ 开头）或单条 "deviceId:密文"。
+  let body;
+  if (raw.startsWith('{')) {
+    body = { uid: uid, storage_json: raw };
+  } else if (raw.indexOf(':') > 0) {
+    const i = raw.indexOf(':');
+    body = { uid: uid, device_id: raw.slice(0, i).trim(), icube_value: raw.slice(i + 1).trim() };
+  } else {
+    toast('单条模式请按 deviceId:密文 格式粘贴，或直接粘贴整个 storage.json', 'err');
+    return;
+  }
+  const btn = $('btnTraeImport');
+  btn.disabled = true;
+  try {
+    const d = await api('trae/import', { method: 'POST', body: JSON.stringify(body) });
+    toast(d.message || '设备凭证已导入', 'ok');
+    $('traeStorage').value = '';
+    loadTraeConfig();
+  } catch (e) { toast('导入失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; }
+};
+/* renderTraeCheckinNote 把逐账号签到结果压成一行摘要（失败项直接列出原因）。 */
+function renderTraeCheckinNote(results, lastRun) {
+  const parts = [];
+  for (const r of results) {
+    const tag = r.status === 'success' ? '✓' : (r.status === 'already' ? '=' : (r.status === 'skipped' ? '-' : '✗'));
+    let s = tag + ' ' + (r.uid || '');
+    if (r.status === 'success' && r.reward > 0) s += ' +' + r.reward;
+    if (r.status === 'fail') s += ' ' + (r.message || '');
+    parts.push(s);
+  }
+  $('traeCheckinNote').textContent = (lastRun ? '[' + lastRun + '] ' : '') + parts.join('　');
+}
+$('btnTraeCheckinAll').onclick = async () => {
+  const btn = $('btnTraeCheckinAll');
+  if (!confirm('对全部可用 Trae 账号执行一轮签到？（账号间限速，账号多时耗时较长）')) return;
+  btn.disabled = true;
+  btn.textContent = '签到中…';
+  try {
+    const d = await api('trae/checkin_all', { method: 'POST' });
+    const rs = d.results || [];
+    let ok = 0, already = 0, fail = 0;
+    for (const r of rs) {
+      if (r.status === 'success') ok++;
+      else if (r.status === 'already') already++;
+      else if (r.status === 'fail') fail++;
+    }
+    toast('签到完成：成功 ' + ok + '，已签 ' + already + '，失败 ' + fail, fail ? 'err' : 'ok');
+    renderTraeCheckinNote(rs);
+    loadTraeConfig();
+  } catch (e) { toast('签到失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '全部签到'; }
+};
+$('btnTraeCheckinStatus').onclick = async () => {
+  try {
+    const d = await api('trae/checkin_status');
+    const rs = d.results || [];
+    if (!rs.length) { toast('还没有签到记录', ''); return; }
+    renderTraeCheckinNote(rs, d.last_run);
+  } catch (e) { toast('查询失败：' + e.message, 'err'); }
 };
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */

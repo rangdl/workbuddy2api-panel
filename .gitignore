@@ -15,6 +15,10 @@ data/
 
 # Config with secrets (use config.example.json)
 config.json
+# 第三方上游配置含 API Key（用 third_party.example.json）
+third_party.json
+# Trae 上游配置含 access_token / refresh_token / 设备私钥
+trae.json
 
 # Build artifacts
 *.tmp

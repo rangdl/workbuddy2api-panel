@@ -48,6 +48,8 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
 | 🖥️ **Web 管理面板** | 内嵌单页面板（明暗主题），账号运维 / 模型档位查询 / 在线改配置（热生效）/ 运行日志 / 积分任务，见 [Web 管理面板](#-web-管理面板) |
+| 🔀 **第三方上游** | 除 CodeBuddy 外可挂任意 OpenAI 兼容上游，走独立前缀 `/tp/v1/*`（与 `/v1/*` 并存互不影响）；多上游按模型名匹配（支持兜底上游）、面板增删改 + 逐条连通性测试、保存即热生效，见 [第三方上游](#-第三方上游openai-兼容) |
+| 🚂 **Trae 上游** | Trae 账号接入（`/trae/v1/*` 独立前缀）：请求体改写为 `llm_utils_chat`、SOLO 自定义 SSE 转 OpenAI、设备凭证（tc 信封解密 + DeviceProof 签名），见 [Trae 上游](#-trae-上游协议层已实现) |
 
 ## 🎯 成长任务一键完成（17/18）
 
@@ -524,7 +526,7 @@ http://127.0.0.1:7863/panel/
 ```
 
 鉴权与 API 同口径：`api_key` 非空时面板要求输入一次密钥（浏览器 localStorage 记住）；为空则直接可用。
-界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航分四个视图：
+界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航视图如下：
 
 | 视图 | 功能 |
 |---|---|
@@ -532,7 +534,8 @@ http://127.0.0.1:7863/panel/
 | **添加账号**（顶部按钮） | 浏览器内完成 OAuth 设备授权（显示授权链接 + 自动轮询），登录后凭证落盘并**热加载进池，免重启** |
 | **积分任务**（账号行内「任务」按钮） | 展示全部任务（进度 / 奖励分数与能量 / 状态）；「全部接受」批量报名；「一键完成」覆盖 **17 个任务**（推进进度 + 异步计分等待 + **自动领奖**，幂等可重复点）；其余任务展示操作指引 |
 | **模型与档位** | 实时查询上游：每模型的积分倍率、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；若存在探测数据，最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」） |
-| **配置** | 在线编辑 config.json：API 密钥、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关 |
+| **配置** | 在线编辑 config.json：API 密钥、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关；同页含 **Responses / Codex 接入**（独立 `responses.json`） |
+| **上游接入** | 第三方 OpenAI 兼容上游的增删改（名称 / 接口地址 / API Key / 模型列表 / 超时）、启用开关、逐条「测试连接」；保存后热生效。同页展示 Trae 接入的规划状态 |
 | **运行日志** | 最近 500 行服务日志 + 请求表格日志（可开关自动滚动） |
 
 **配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
@@ -559,6 +562,12 @@ http://127.0.0.1:7863/panel/
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
+| `POST /tp/v1/chat/completions` | Bearer | **第三方上游**（OpenAI 兼容）转发；流式/非流式；仅在启用第三方时可用（否则 404） |
+| `POST /tp/v1/responses` | Bearer | 第三方上游的 Responses 协议接入（内部转为 Chat 转发，回程投影回 Responses） |
+| `GET /tp/v1/models` | Bearer | 第三方上游模型列表（来自 `third_party.json` 的 `models` 声明） |
+| `POST /trae/v1/chat/completions` | Bearer | **Trae 上游**：OpenAI Chat → `llm_utils_chat`，回程 SOLO SSE → OpenAI |
+| `POST /trae/v1/responses` | Bearer | Trae 上游的 Responses 协议接入（Chat 中转 + 回程投影） |
+| `GET /trae/v1/models` | Bearer | Trae 内置模型目录 |
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
 
@@ -611,6 +620,158 @@ http://127.0.0.1:7863/panel/
 | `activity/growth/tasks/<task_code>/claim` | POST | **领取任务奖励**（任务码在路径、无 body；**Web 域 `www.workbuddy.cn`**，非 CLI 域——这是领奖能成功的关键） |
 
 出站请求统一携带 `CLI/2.63.2 CodeBuddy/2.63.2` UA（可被 `upstream.user_agent` 覆盖）；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。领奖请求额外带 `x-client-platform: web` 与 workbuddy.cn 的 Origin/Referer。
+
+## 🔀 第三方上游（OpenAI 兼容）
+
+除内置的 CodeBuddy 上游外，网关可同时挂载任意 **OpenAI 兼容**上游（DeepSeek / OpenAI / 自建 vLLM / Ollama / 各类中转），走**独立前缀**，与现有链路完全隔离。
+
+### 路由与隔离
+
+| 前缀 | 上游 | 说明 |
+|---|---|---|
+| `/v1/*` | CodeBuddy 账号池 | 现有链路，行为不变 |
+| `/tp/v1/*` | 第三方（OpenAI 兼容） | 新增；不进账号池，不做冷却 / 脱敏 / 提示词改写 |
+| `/trae/v1/*` | Trae | 协议层已实现，见 [Trae 上游](#-trae-上游协议层已实现) |
+
+三者互不影响：第三方未启用时 `/tp/v1/*` 返回 404，`/v1/*` 一切照旧。
+
+### 快速开始
+
+1. 用面板左侧「**上游接入**」页维护，或手工创建 `third_party.json`（与 `config.json` 同目录，可从 `third_party.example.json` 复制）：
+
+```json
+{
+  "enabled": true,
+  "providers": [
+    {
+      "name": "deepseek",
+      "protocol": "openai",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "sk-xxx",
+      "models": ["deepseek-chat", "deepseek-reasoner"],
+      "timeout_seconds": 120
+    }
+  ]
+}
+```
+
+2. 客户端把 `base_url` 指向 `http://<主机>:<端口>/tp/v1` 即可（codex 另加 `wire_api = "responses"` 走 `/tp/v1/responses`）。
+
+### 字段说明
+
+| 字段 | 缺省 | 说明 |
+|---|---|---|
+| `enabled` | `false` | 总开关；关闭时 `/tp/v1/*` 一律 404 |
+| `providers[].name` | 必填 | 全局唯一；用于日志与用量视图（`realm="tp"` 分账） |
+| `providers[].base_url` | 必填 | 含或不含 `/v1` 都可（自动识别版本段 / 补齐） |
+| `providers[].chat_path` | `/chat/completions` | 非标准路径时覆盖 |
+| `providers[].models_path` | `/models` | 同上 |
+| `providers[].api_key` | 空 | 空 = 不发 `Authorization` 头 |
+| `providers[].models` | `[]` | 精确匹配（大小写不敏感）；**留空 = 兜底上游**，承接未命中其他上游的模型名 |
+| `providers[].timeout_seconds` | `120` | 只约束非流式；流式仅约束首字节 |
+| `providers[].headers` | `{}` | 额外出站头（覆盖同名默认头，用于非 Bearer 鉴权的中转） |
+
+匹配顺序：按 `providers` 数组顺序取**首个命中** `models` 的上游；都不命中时回落首个 `models` 为空的兜底上游；仍无则 404 `model_not_found`。
+
+配置错误（`name` 空 / 重复、`base_url` 空或无 scheme、协议不支持）会在**保存时**与**启动时**两处同口径拒绝（fail fast），不会静默忽略。
+
+### 行为边界（与 CodeBuddy 链路的差异）
+
+- **不做**请求体改写：effort 降级、thinking 注入、`prompt_cache_key`、指纹脱敏、系统提示词替换一律不施加——第三方是标准 OpenAI 协议，多做的改写只会制造非法参数；
+- **不做**账号轮转 / 冷却 / 熔断 / 粘性：单上游单 Key，失败即错误直返；
+- **错误处理**：HTTP 状态映射为稳定 `code`，`message` **一律透传上游原文**（含真实原因与 request id，是排查的唯一依据）；
+- **流式**：原样透传上游 SSE（不做帧重建）；非流式直传 JSON；
+- **用量**：计入 `usage` 的独立 `realm="tp"` 分账，`uid` 维度为 provider 名，不污染 CodeBuddy 账号维度。
+
+### 面板
+
+「上游接入」页支持增删改上游、启用开关、逐条「测试连接」（向该上游发一条 `max_tokens=16` 的最小请求），保存后**热生效**，无需重启。
+
+## 🚂 Trae 上游（协议层已实现）
+
+Trae 接入使用**独立前缀 `/trae/v1/*`**，与 `/v1/*`（CodeBuddy）、`/tp/v1/*`（第三方）三者互不冲突。
+
+| 端点 | 说明 |
+|---|---|
+| `POST /trae/v1/chat/completions` | OpenAI Chat → `llm_utils_chat`，回程 SOLO 自定义 SSE → OpenAI |
+| `POST /trae/v1/responses` | Responses → Chat → SOLO，回程投影回 Responses |
+| `GET /trae/v1/models` | 内置模型目录（与请求构造的模型映射同源） |
+
+### 配置（`trae.json`，与 `config.json` 同目录）
+
+```json
+{
+  "enabled": false,
+  "chat_base": "https://trae-api-cn.mchost.guru",
+  "api_trae_base": "https://api.trae.cn",
+  "schedule": { "checkin_enabled": false, "checkin_hours": [9] },
+  "accounts": [
+    {
+      "uid": "123456",
+      "name": "trae-1",
+      "access_token": "eyJhbGciOi...",
+      "refresh_token": "...",
+      "device_id": "7123456789012345678",
+      "machine_id": "...",
+      "private_key_pem": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+    }
+  ]
+}
+```
+
+`enabled` 缺省 `false`：未启用时 `/trae/v1/*` 一律 404，现有功能完全不受影响。
+
+### 已实现
+
+**协议层（P1/P2）**
+
+- **设备凭证**：tc 信封解密（AES-128-CBC + 随安装包分发的公开 pepper 表 + SHA-512 完整性校验）、
+  EC P-256 私钥解析（PKCS#8 / SEC1）、SPKI 公钥导出、DeviceProof 签名（P1363 `r‖s`）；
+- **请求构造**：OpenAI Chat → `llm_utils_chat`（模型名 → `config_name`/`model_name` 映射、
+  `tool_calls.function` → `function_call` 改名、`tool_choice` 归一化、`tools.parameters` 字符串化、
+  必需字段注入、`function` 按模型分发 `solo_work_lite`/`solo_agent`）；
+- **响应转换**：SOLO 自定义 SSE（`output`/`thought`/`token_usage`/`done`/`error`）→ OpenAI SSE 流式帧
+  与非流式聚合，含 `reasoning_content` 与 `tool_calls` 还原、错误就地透传、无 `done` 时幂等补 `[DONE]`；
+- **上游调用**：完整出站头族（`X-Ide-Token`/`X-Device-Id`/`X-Machine-Id`/`X-App-Id` 等）+ 链路追踪头。
+
+**运维层（P3）**
+
+- **OAuth 登录**：PKCE（S256）+ native_ide 渠道授权链接；服务端部署友好——授权在浏览器完成后，
+  把地址栏回调 URL 粘贴回面板即可（服务端校验 `loginTraceID` 做 CSRF 绑定，无需暴露公网回调端点）；
+- **设备凭证导入**：粘贴 Trae 客户端 `storage.json`（或单条 `deviceId:密文`），服务端解密提取私钥，
+  该账号即具备 DeviceProof 能力；
+- **错误分类与冷却**：1005 套餐额度用尽 → 12h 冷却；20403/20405 设备问题 → 摘出轮转并提示重新导入；
+  4001/4023 模型不可用 → 不罚账号；401 → 需重新登录；429 → 60s；5xx → 5m；成功即清冷却；
+- **面板配置**：账号列表（状态标签 / 冷却剩余 / 启用开关 / 删除）、开关与 base 在线编辑、保存即热生效。
+
+**签到与积分（P4）**
+
+- **签到**：`checkin_credits/status` 预检（已签则跳过）→ `checkin_credits/claim` 领取，解析本次奖励；
+  支持单账号签到与「全部签到」，账号间限速 800ms；
+- **每日自动签到**：面板可配开关与时点（默认 `[9]`），独立调度器按点执行、同日去重；
+  失败按错误分类写入冷却（与 chat 链路共用同一张冷却表）；
+- **积分查询**：`pay/ide_user_ent_usage` 拉取积分包明细，按 `product_id` 动态分类
+  （209 = Work 积分，其余归通用积分——签到积分归属曾变更，不可写死来源），
+  面板展示通用 / Work / 合计 / 额度。
+
+> 签到与积分走 **`api.trae.cn`**（与对话的 `trae-api-cn.mchost.guru` 不同域），
+> 请求头族也不同（VSCode UA + market/session 头），已在实现中分别处理。
+
+> **凭证安全**：面板**永不回显凭证**——只返回"是否已配置"与 token 尾 4 位；
+> 凭证写入只有两条路径（OAuth 换取、用户粘贴设备密文），落盘权限 `0600`，`trae.json` 已 gitignore。
+
+### 未实现
+
+- 账号级会话粘性（当前是简单轮转）。
+
+### 认证前提（重要）
+
+Trae 的 token 续期（ExchangeToken）要求 **DeviceProof 签名**（ECDSA P-256），
+签名私钥存放在 Trae 客户端的 `storage.json` 里（tc 信封加密，**pepper 是公开常量**，
+故服务端拿到密文即可解密）。未导入设备凭证的账号，续期会回落无签名的 Legacy 变体——
+该变体是否仍被上游接受**尚未实测**（P0 PoC 项），可能失败。
+
+完整分析、P0 PoC 验证步骤与三种结果分支见 `docs/trae-upstream-plan.md`。
 
 ## 请求级日志
 

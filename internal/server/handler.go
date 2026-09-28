@@ -21,6 +21,8 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/thirdparty"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
@@ -67,6 +69,22 @@ type Config struct {
 	// Responses Responses 端点配置（可选；nil = 仍注册 /v1/responses，但无增量补全/模型映射）。
 	// 定义在 responses.go（同包），避免污染上游 Config 字段语义。
 	Responses *ResponsesConfig
+
+	// ThirdParty 第三方 OpenAI 兼容上游配置（可选；nil 或 Enabled=false 时不注册 /tp/ 路由）。
+	// 与 CodeBuddy 链路完全隔离：不进账号池、不套用冷却/脱敏/提示词改写。
+	// 定义在 internal/thirdparty（独立包），实现见 thirdparty.go（同包）。
+	ThirdParty *thirdparty.Config
+	// ThirdPartyClient 第三方转发客户端（ThirdParty 启用时必填；nil 则视为未启用）。
+	ThirdPartyClient *thirdparty.Client
+
+	// Trae Trae 上游配置（可选；nil 或 Enabled=false 时 /trae/v1/* 返回 404）。
+	// 与 CodeBuddy、第三方链路互不影响（独立前缀 /trae/v1/*）。
+	Trae *trae.Config
+	// TraeClient Trae 上游客户端（Trae 启用时必填；nil 则视为未启用）。
+	TraeClient *trae.Client
+	// TraeCooldowns Trae 账号冷却表（可选；nil 时 handler 自建）。
+	// 由外部注入的原因：面板需要读同一实例才能展示冷却状态。
+	TraeCooldowns *trae.Cooldowns
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -113,6 +131,13 @@ type Handler struct {
 	// responses Responses 端点配置（运行期可原子替换：面板保存 responses.json 后
 	// 热重载，无需重启）。nil 或 Enabled=false 时 /v1/responses 返回 404。
 	responsesCfg atomic.Pointer[ResponsesConfig]
+	// thirdpartyCfg 第三方上游配置（运行期可原子替换：面板保存 third_party.json 后
+	// 热重载，无需重启）。nil 或 Enabled=false 时 /tp/v1/* 返回 404。
+	thirdpartyCfg atomic.Pointer[thirdparty.Config]
+	// traeCfg Trae 上游配置（运行期可原子替换）。nil 或 Enabled=false 时 /trae/v1/* 返回 404。
+	traeCfg atomic.Pointer[trae.Config]
+	// traeCool Trae 账号级冷却表（进程内，重启清零）。nil 时不做冷却判定。
+	traeCool *trae.Cooldowns
 }
 
 // NewHandler 构建 handler。
@@ -130,7 +155,14 @@ func NewHandler(cfg Config) *Handler {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	// 冷却表可由外部注入（面板需读同一实例展示冷却状态）；未注入时自建。
+	h.traeCool = cfg.TraeCooldowns
+	if h.traeCool == nil {
+		h.traeCool = trae.NewCooldowns()
+	}
 	h.responsesCfg.Store(cfg.Responses)
+	h.thirdpartyCfg.Store(cfg.ThirdParty)
+	h.traeCfg.Store(cfg.Trae)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	// 只要注入了 Responses 配置就注册路由（enabled 的开关由 handler 运行期判断，
 	// 以便面板热切换启用/禁用；disabled 时返回 404）。
@@ -140,6 +172,21 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	// 第三方上游（/tp/v1/*）：与 CodeBuddy 的 /v1/* 完全隔离。
+	// 只要注入了转发客户端就注册路由，enabled 开关由 handler 运行期判断——
+	// 否则面板里热启用后路由仍不存在（与 /v1/responses 同一取舍）。
+	// 这三条路由是本 fork 与上游 handler.go 的唯一交集（见 docs/third-party-upstream-plan.md §9.4）。
+	if cfg.ThirdPartyClient != nil {
+		h.mux.HandleFunc("POST /tp/v1/chat/completions", h.withAuth(h.thirdpartyChat))
+		h.mux.HandleFunc("POST /tp/v1/responses", h.withAuth(h.thirdpartyResponses))
+		h.mux.HandleFunc("GET /tp/v1/models", h.withAuth(h.thirdpartyModels))
+	}
+	// Trae 上游（/trae/v1/*）：与 /v1/*、/tp/v1/* 三者互不影响，同样由运行期开关控制。
+	if cfg.TraeClient != nil {
+		h.mux.HandleFunc("POST /trae/v1/chat/completions", h.withAuth(h.traeChat))
+		h.mux.HandleFunc("POST /trae/v1/responses", h.withAuth(h.traeResponses))
+		h.mux.HandleFunc("GET /trae/v1/models", h.withAuth(h.traeModels))
+	}
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
 	}
@@ -154,6 +201,17 @@ func (h *Handler) SetResponsesConfig(cfg *ResponsesConfig) {
 		cfg.Store = old.Store
 	}
 	h.responsesCfg.Store(cfg)
+}
+
+// SetThirdPartyConfig 运行期替换第三方上游配置（面板保存 third_party.json 后热重载）。
+// 转发客户端（ThirdPartyClient）不随之替换——它只持有连接池，与配置无关。
+func (h *Handler) SetThirdPartyConfig(cfg *thirdparty.Config) {
+	h.thirdpartyCfg.Store(cfg)
+}
+
+// SetTraeConfig 运行期替换 Trae 上游配置（面板保存 trae.json 后热重载）。
+func (h *Handler) SetTraeConfig(cfg *trae.Config) {
+	h.traeCfg.Store(cfg)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {

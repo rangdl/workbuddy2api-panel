@@ -25,6 +25,8 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/thirdparty"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
@@ -230,6 +232,25 @@ func main() {
 	defer rec.Stop()
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
+	// 第三方 OpenAI 兼容上游（可选）。提前到面板构造之前：面板「上游接入」页
+	// 需要同一份配置路径与转发客户端（两者共用连接池，不重复建立）。
+	tpCfg := loadThirdPartyConfig(*cfgPath)
+	tpClient := thirdparty.NewClient()
+	// Trae 上游（可选；trae.json 缺失或 enabled=false 时不启用）。
+	// 冷却表在 main 构造：面板与 handler 需共用同一实例（前者展示、后者读写）。
+	traeCfg := loadTraeConfig(*cfgPath)
+	traeClient := trae.NewClient()
+	traeCool := trae.NewCooldowns()
+	// 签到调度器：ConfigFn 每次 tick 重新读文件（热重载自然生效）；
+	// 用 trae.Load 而非 loadTraeConfig 是为了避免每分钟重复打启动摘要日志。
+	traeSched := trae.NewScheduler(func() *trae.Config {
+		cfg, err := trae.Load(trae.ConfigPath(*cfgPath))
+		if err != nil {
+			return nil
+		}
+		return cfg
+	}, traeClient, traeCool)
+
 	// handlerRef 供面板热重载闭包引用（panel 先于 handler 构造，闭包在保存时才调用）。
 	var handlerRef *server.Handler
 	pn := panel.New(panel.Config{
@@ -255,6 +276,29 @@ func main() {
 				return nil
 			}
 			handlerRef.SetResponsesConfig(loadResponsesConfig(*cfgPath))
+			return nil
+		},
+		// 第三方上游「上游接入」页：读写独立的 third_party.json。
+		ThirdPartyPath:   thirdparty.ConfigPath(*cfgPath),
+		ThirdPartyClient: tpClient,
+		// 保存后热重载：只换配置，转发客户端（连接池）进程内复用。
+		ReloadThirdParty: func() error {
+			if handlerRef == nil {
+				return nil
+			}
+			handlerRef.SetThirdPartyConfig(loadThirdPartyConfig(*cfgPath))
+			return nil
+		},
+		// Trae 上游：配置 + 登录 + 设备凭证导入 + 冷却状态展示。
+		TraePath:      trae.ConfigPath(*cfgPath),
+		TraeClient:    traeClient,
+		TraeCooldowns: traeCool,
+		TraeScheduler: traeSched,
+		ReloadTrae: func() error {
+			if handlerRef == nil {
+				return nil
+			}
+			handlerRef.SetTraeConfig(loadTraeConfig(*cfgPath))
 			return nil
 		},
 		LoadConfig: func() (any, error) {
@@ -286,12 +330,22 @@ func main() {
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 		Responses:     loadResponsesConfig(*cfgPath),
+		// 第三方上游（/tp/v1/*）：独立于账号池链路。客户端非 nil 即注册路由，
+		// enabled 开关由 handler 运行期判断（面板可热启用，无需重启）。
+		ThirdParty:       tpCfg,
+		ThirdPartyClient: tpClient,
+		// Trae 上游（/trae/v1/*）：同样独立，与 /v1/*、/tp/v1/* 三者互不影响。
+		Trae:          traeCfg,
+		TraeClient:    traeClient,
+		TraeCooldowns: traeCool,
 	})
 	handlerRef = h
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	// Trae 签到调度（独立于 CodeBuddy 的 scheduler：两者账号体系与排程配置互不相干）。
+	go traeSched.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 
 	srv := &http.Server{
