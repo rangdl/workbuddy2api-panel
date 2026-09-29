@@ -2,6 +2,7 @@ package responses
 
 import (
 	"encoding/json"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -503,4 +504,116 @@ func TestAliasRoundTripShellToExecCommand(t *testing.T) {
 	if !strings.Contains(args, `echo hi`) || !strings.Contains(args, `/tmp`) {
 		t.Errorf("arguments lost data: %s", args)
 	}
+}
+
+// namespace 下的 custom 子工具（codex 0.154+ 的 functions.exec JS 编排工具）必须
+// 提升——cc-switch PR #7454 将其列为已知边界（模型视野中工具消失 → 盲调 →
+// unsupported call），本实现修复该边界。
+func TestNamespaceCustomChildLifted(t *testing.T) {
+	body := []byte(`{
+		"model":"m",
+		"input":[
+			{"type":"additional_tools","role":"developer","tools":[
+				{"type":"namespace","name":"functions","tools":[
+					{"type":"custom","name":"exec","description":"Run JavaScript code to orchestrate tool calls"},
+					{"type":"function","name":"wait","description":"wait","parameters":{"type":"object"}}
+				]},
+				{"type":"namespace","name":"clock","tools":[
+					{"type":"function","name":"sleep","description":"sleep","parameters":{"type":"object"}}
+				]}
+			]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+		]
+	}`)
+	raw, ctx, err := ToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := decode(t, raw)
+	tools, _ := out["tools"].([]any)
+	names := map[string]map[string]any{}
+	for _, raw := range tools {
+		tl, _ := raw.(map[string]any)
+		fn, _ := tl["function"].(map[string]any)
+		names[fn["name"].(string)] = fn
+	}
+	// custom 子工具 functions.exec → 扁平名 functions__exec（{input:string} 包装）
+	execFn, ok := names["functions__exec"]
+	if !ok {
+		t.Fatalf("functions__exec not lifted, got tools %v", keysOf(names))
+	}
+	if !strings.Contains(execFn["description"].(string), "Run JavaScript code") {
+		t.Errorf("exec description should embed original definition: %v", execFn["description"])
+	}
+	// function 子工具照常提升
+	if _, ok := names["functions__wait"]; !ok {
+		t.Errorf("functions__wait missing, got %v", keysOf(names))
+	}
+	if _, ok := names["clock__sleep"]; !ok {
+		t.Errorf("clock__sleep missing, got %v", keysOf(names))
+	}
+	// ToolContext：functions__exec 按 custom 通道登记，Name 为裸名
+	spec, ok := ctx.Lookup("functions__exec")
+	if !ok || spec.Kind != toolKindCustom || spec.Name != "exec" || spec.Namespace != "functions" {
+		t.Errorf("Lookup(functions__exec) = %+v ok=%v", spec, ok)
+	}
+}
+
+// 回程：模型调用 functions__exec → custom_tool_call item（name=exec）。
+func TestNamespaceCustomChildRoundTrip(t *testing.T) {
+	body := []byte(`{
+		"model":"m",
+		"input":[{"type":"additional_tools","role":"developer","tools":[
+			{"type":"namespace","name":"functions","tools":[
+				{"type":"custom","name":"exec","description":"run js"}
+			]}
+		]}]
+	}`)
+	_, ctx, err := ToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatResp := map[string]any{
+		"id": "chat-1", "model": "m", "created": float64(1),
+		"choices": []any{map[string]any{
+			"finish_reason": "tool_calls",
+			"message": map[string]any{
+				"role": "assistant",
+				"tool_calls": []any{map[string]any{
+					"id": "call_e1", "type": "function",
+					"function": map[string]any{
+						"name":      "functions__exec",
+						"arguments": `{"input":"await functions.wait()"}`,
+					},
+				}},
+			},
+		}},
+	}
+	resp, err := FromChat(chatResp, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, _ := resp["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("output=%v", output)
+	}
+	item, _ := output[0].(map[string]any)
+	if item["type"] != "custom_tool_call" {
+		t.Fatalf("type=%v, want custom_tool_call", item["type"])
+	}
+	if item["name"] != "exec" {
+		t.Errorf("name=%v, want bare exec", item["name"])
+	}
+	if item["input"] != "await functions.wait()" {
+		t.Errorf("input=%v, want unwrapped raw input", item["input"])
+	}
+}
+
+func keysOf(m map[string]map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

@@ -249,7 +249,16 @@ func (c *ToolContext) addToolSearch() {
 	c.add(toolSearchProxyName, ToolSpec{Kind: toolKindToolSearch, Name: toolSearchProxyName}, chatTool)
 }
 
-// addNamespace 展开 namespace 工具的 function 子工具。
+// addNamespace 展开 namespace 工具的子工具：function 子工具扁平化为
+// namespace__name 的 Chat function；custom 子工具（如 codex 0.154+ 的
+// functions.exec JS 编排工具）同样提升——用既有的 custom 工具通道往返
+// （Chat 侧包成 {input:string} function，回程还原 custom_tool_call item）。
+//
+// 背景参考：cc-switch PR #7454 明确把「namespace 下的 custom 子工具不提升」
+// 列为已知边界（issue #6158/#7451：codex 0.154+ 的 exec 沙箱工具经 Chat
+// 转换后从模型视野消失，模型凭 instructions 描述盲调 → unsupported call）。
+// 本实现修复该边界：custom 子工具的还原不需要新的 name round-trip，
+// 走既有 custom_tool_call 通道（回程按 call_id 扁平名反查 ToolSpec）。
 func (c *ToolContext) addNamespace(tool map[string]any) {
 	namespace := stringField(tool, "name")
 	if namespace == "" {
@@ -261,11 +270,47 @@ func (c *ToolContext) addNamespace(tool map[string]any) {
 	}
 	for _, raw := range children {
 		child, ok := raw.(map[string]any)
-		if !ok || stringField(child, "type") != toolKindFunction {
+		if !ok {
 			continue
 		}
-		c.addFunction(child, namespace)
+		switch stringField(child, "type") {
+		case toolKindFunction:
+			c.addFunction(child, namespace)
+		case toolKindCustom:
+			c.addNamespaceCustom(child, namespace)
+		}
 	}
+}
+
+// addNamespaceCustom 提升 namespace 下的 custom 子工具：扁平化命名后按
+// custom 工具通道登记（addCustom 的 namespace 变体）。
+func (c *ToolContext) addNamespaceCustom(tool map[string]any, namespace string) {
+	name := responsesToolName(tool)
+	if name == "" {
+		return
+	}
+	chatName := name
+	if namespace != "" {
+		chatName = flattenNamespaceToolName(namespace, name)
+	}
+	chatTool := map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        chatName,
+			"description": customToolDescription(tool),
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					customToolInputField: map[string]any{
+						"type":        "string",
+						"description": "Raw string input for the original custom tool. Preserve formatting exactly.",
+					},
+				},
+				"required": []any{customToolInputField},
+			},
+		},
+	}
+	c.add(chatName, ToolSpec{Kind: toolKindCustom, Name: name, Namespace: namespace}, chatTool)
 }
 
 // responsesToolName 提取 Responses 工具名：优先 tool.function.name，其次 tool.name。
