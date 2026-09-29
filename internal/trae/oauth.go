@@ -277,6 +277,9 @@ func (c *Client) ExchangeAuthCode(ctx context.Context, cfg *Config, authCode, ve
 	var errs []string
 	for _, v := range variants {
 		pair, err := c.exchangeOnce(ctx, cfg, host+OAuthExchangePathNew, v.payload, deviceID, v.withDev)
+		if c.Trace != nil {
+			c.Trace(v.tag, err == nil, err)
+		}
 		if err == nil {
 			return pair, nil
 		}
@@ -363,6 +366,9 @@ func (c *Client) ExchangeRefresh(ctx context.Context, cfg *Config, acc *Account)
 	var errs []string
 	for _, v := range variants {
 		pair, err := c.exchangeOnce(ctx, cfg, v.url, v.payload, acc.DeviceID, v.withDev)
+		if c.Trace != nil {
+			c.Trace(v.tag, err == nil, err)
+		}
 		if err == nil {
 			return pair, nil
 		}

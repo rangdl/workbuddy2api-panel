@@ -30,6 +30,14 @@ type Client struct {
 	transport  *http.Transport
 	streamHTTP *http.Client
 	jsonHTTP   *http.Client
+
+	// Trace 变体尝试追踪（可选；nil = 不追踪，生产路径零开销）。
+	//
+	// 存在的理由：ExchangeAuthCode / ExchangeRefresh 是"变体链"——依次尝试直到成功，
+	// 但**哪个变体成功**恰恰是 P0 要回答的问题（服务端无客户端私钥时，无 DeviceProof
+	// 的兜底变体是否仍被上游接受）。PoC 工具（cmd/traepoc）挂上它即可逐变体报告；
+	// 生产路径不设置，行为与不追踪时完全一致。
+	Trace func(tag string, ok bool, err error)
 }
 
 // NewClient 构造客户端。
