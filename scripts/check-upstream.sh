@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# check-upstream.sh — 检查本 fork 是否落后于上游 parent（只读：不 fetch、不提交、不推送）
+# check-upstream.sh — 检查本 fork 是否落后于上游 parent
+#                     （只读：不改工作区、不提交、不推送；会 fetch 上游以刷新引用）
 #
 # 用法:
 #   ./scripts/check-upstream.sh
+#   SKIP_FETCH=1 ./scripts/check-upstream.sh    # 离线：直接用本地引用
 #
 # 可覆盖的环境变量:
 #   FORK_REPO    默认从 origin remote URL 解析（如 rangdl/workbuddy2api-panel）
 #   PARENT_REPO  默认取 upstream remote URL，其次取 fork 的 parent 字段
 #   BASE_BRANCH  默认 main
+#   SKIP_FETCH   1 = 跳过 git fetch upstream（离线场景）
 #
 # 输出: 上游领先/落后提交数、上游新增提交列表、涉及文件、
 #       与当前分支改动重叠的文件（合并冲突风险）、试合并预演结论。
@@ -16,6 +19,31 @@
 set -euo pipefail
 
 export PATH="$HOME/.local/bin:$PATH"
+
+# ---------- 环境防御：残缺的 GIT_CONFIG_* ----------
+# 坑: harness 可能只注入 GIT_CONFIG_COUNT 与 GIT_CONFIG_VALUE_0，却漏掉配对的
+#     GIT_CONFIG_KEY_0。git 在**配置解析阶段**就 fatal，于是任何 git 子命令
+#     （哪怕 git status）全部失败，报 "missing config key GIT_CONFIG_KEY_0"。
+#     检测到不完整就整组清除。（若确实需要 codeg 的凭据助手，应补上
+#     GIT_CONFIG_KEY_0=credential.helper，而不是清除。）
+git_env_broken=0
+if [ "${GIT_CONFIG_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+  i=0
+  while [ "$i" -lt "$GIT_CONFIG_COUNT" ]; do
+    key_var="GIT_CONFIG_KEY_$i"; val_var="GIT_CONFIG_VALUE_$i"
+    if [ -z "${!key_var:-}" ] || [ -z "${!val_var:-}" ]; then git_env_broken=1; break; fi
+    i=$((i + 1))
+  done
+fi
+if [ "$git_env_broken" = 1 ]; then
+  echo "提示: GIT_CONFIG_* 注入不完整（缺 GIT_CONFIG_KEY_<n>），已临时清除以免 git 报错。" >&2
+  i=0
+  while [ "$i" -lt "$GIT_CONFIG_COUNT" ]; do
+    unset "GIT_CONFIG_KEY_$i" "GIT_CONFIG_VALUE_$i"
+    i=$((i + 1))
+  done
+  unset GIT_CONFIG_COUNT
+fi
 
 sep() { printf '\n=== %s ===\n' "$*"; }
 
@@ -55,6 +83,24 @@ printf 'fork     : %s\n' "$FORK_REPO"
 printf 'parent   : %s\n' "$PARENT_REPO"
 printf '基线分支 : %s\n' "$BASE_BRANCH"
 printf '当前分支 : %s\n' "$CUR_BRANCH"
+
+# ---------- 刷新上游引用 ----------
+# 坑: 本地 upstream/<base> 可能是过期快照。曾出现：本地引用停在旧提交，
+#     于是"试合并预演"报"干净合并"、涉及文件也偏少，结论完全失真。
+#     所以先 fetch，再谈落后多少、会不会冲突。
+sep "刷新上游引用"
+if [ "${SKIP_FETCH:-0}" = "1" ]; then
+  echo "（SKIP_FETCH=1，跳过 fetch，使用本地引用——结论可能过期）"
+elif ! git remote get-url upstream >/dev/null 2>&1; then
+  echo "（无 upstream remote，跳过 fetch）"
+elif git fetch upstream --prune 2>&1 | sed 's/^/  /'; then
+  echo "上游引用已刷新 ✓"
+else
+  echo "⚠ git fetch upstream 失败（网络？），继续使用本地引用——结论可能过期" >&2
+fi
+if git rev-parse --verify -q "upstream/$BASE_BRANCH" >/dev/null; then
+  printf '本地 upstream/%s = %s\n' "$BASE_BRANCH" "$(git rev-parse --short "upstream/$BASE_BRANCH")"
+fi
 
 # ---------- compare API ----------
 # 方向语义: GET /repos/{parent}/compare/{base}...{head} 的 ahead_by = head 比 base 多的提交数

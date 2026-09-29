@@ -13,13 +13,44 @@
 #   ./scripts/sync-upstream.sh          # 到第 6 步为止（不推送）
 #   ./scripts/sync-upstream.sh --push   # 验证通过后把当前分支推送到 origin
 #
+# 环境自愈（无需手工处理，脚本自行检测）:
+#   · 残缺的 GIT_CONFIG_*（缺 GIT_CONFIG_KEY_n）会让所有 git 命令 fatal → 自动清除
+#   · GOMODCACHE / GOCACHE 落在不可写路径（如沙箱外的 $HOME）→ 回退到 GO_CACHE_ROOT
+#   · GOPROXY 不可达（proxy.golang.org 超时）→ 自动切换到可达镜像
+#
 # 可覆盖的环境变量:
 #   FORK_REPO / PARENT_REPO / BASE_BRANCH / GO_BIN
+#   GO_CACHE_ROOT  缓存回退根目录，默认 ${TMPDIR:-/tmp}/dsh-go
 #
 # 退出码: 0 = 成功；非 0 = 任一步骤失败（含合并冲突）。
 set -euo pipefail
 
 export PATH="$HOME/.local/bin:$PATH"
+
+# ---------- 环境防御：残缺的 GIT_CONFIG_* ----------
+# 坑: harness 可能只注入 GIT_CONFIG_COUNT 与 GIT_CONFIG_VALUE_0，却漏掉配对的
+#     GIT_CONFIG_KEY_0。git 在**配置解析阶段**就 fatal，于是任何 git 子命令
+#     （哪怕 git status）全部失败，报 "missing config key GIT_CONFIG_KEY_0"。
+#     检测到不完整就整组清除。（若确实需要 codeg 的凭据助手，应补上
+#     GIT_CONFIG_KEY_0=credential.helper，而不是清除。）
+git_env_broken=0
+if [ "${GIT_CONFIG_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+  i=0
+  while [ "$i" -lt "$GIT_CONFIG_COUNT" ]; do
+    key_var="GIT_CONFIG_KEY_$i"; val_var="GIT_CONFIG_VALUE_$i"
+    if [ -z "${!key_var:-}" ] || [ -z "${!val_var:-}" ]; then git_env_broken=1; break; fi
+    i=$((i + 1))
+  done
+fi
+if [ "$git_env_broken" = 1 ]; then
+  echo "提示: GIT_CONFIG_* 注入不完整（缺 GIT_CONFIG_KEY_<n>），已临时清除以免 git 报错。" >&2
+  i=0
+  while [ "$i" -lt "$GIT_CONFIG_COUNT" ]; do
+    unset "GIT_CONFIG_KEY_$i" "GIT_CONFIG_VALUE_$i"
+    i=$((i + 1))
+  done
+  unset GIT_CONFIG_COUNT
+fi
 
 sep() { printf '\n=== %s ===\n' "$*"; }
 die() { echo "错误: $*" >&2; exit 1; }
@@ -41,6 +72,70 @@ if [ -z "$GO_BIN" ]; then
   done
 fi
 [ -n "$GO_BIN" ] || die "未找到 go（可设 GO_BIN=/path/to/go）"
+
+# ---------- Go 构建环境自愈 ----------
+# 坑 1: 沙箱下 GOMODCACHE / GOCACHE 默认落在 $HOME（工作区之外，不可写）。
+#       go 读不到缓存会静默改为联网下载，表现成一堆 permission denied + 超时。
+# 坑 2: proxy.golang.org 在部分网络不可达，不换镜像则编译直接失败。
+go_env_changed=0
+
+probe_writable() {
+  # 整组重定向 stderr：否则 `> file` 失败时 shell 会先报 "Permission denied"，
+  # 此时函数内的 2>/dev/null 还没生效，会在输出里留下噪音。
+  {
+    mkdir -p "$1" || return 1
+    : > "$1/.dsh-write-probe" || return 1
+    rm -f "$1/.dsh-write-probe"
+  } 2>/dev/null
+}
+
+go_cache_root="${GO_CACHE_ROOT:-${TMPDIR:-/tmp}/dsh-go}"
+for pair in "GOMODCACHE:modcache" "GOCACHE:buildcache"; do
+  gv="${pair%%:*}"; gsub="${pair##*:}"
+  gcur="$("$GO_BIN" env "$gv" 2>/dev/null || true)"
+  if [ -z "$gcur" ] || ! probe_writable "$gcur"; then
+    gfallback="$go_cache_root/$gsub"
+    probe_writable "$gfallback" \
+      || die "$gv 与回退路径均不可写: '$gcur' / '$gfallback'（可用 GO_CACHE_ROOT 指定）"
+    export "$gv=$gfallback"
+    go_env_changed=1
+    echo "· $gv 不可写（$gcur）→ 回退到 $gfallback"
+  fi
+done
+
+# 取 GOPROXY 列表里第一个 http(s) 条目（列表以 , 或 | 分隔）
+first_proxy() {
+  local rest="${1//|/,}" item
+  while [ -n "$rest" ]; do
+    item="${rest%%,*}"
+    case "$item" in http://*|https://*) printf '%s' "$item"; return 0 ;; esac
+    [ "$item" = "$rest" ] && return 1
+    rest="${rest#*,}"
+  done
+  return 1
+}
+
+probe_url() { curl -sS -o /dev/null -m 6 "$1" >/dev/null 2>&1; }
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "· 未找到 curl，跳过 GOPROXY 可达性探测"
+elif goproxy_first="$(first_proxy "$("$GO_BIN" env GOPROXY 2>/dev/null || true)")" \
+     && ! probe_url "$goproxy_first"; then
+  for mirror in https://goproxy.cn https://goproxy.io https://mirrors.aliyun.com/goproxy; do
+    if probe_url "$mirror"; then
+      export GOPROXY="$mirror,direct"
+      # 校验库 sum.golang.org 通常同样不可达；go.sum 仍会校验已记录模块的哈希
+      export GOSUMDB=off
+      go_env_changed=1
+      echo "· GOPROXY $goproxy_first 不可达 → 改用 $mirror"
+      break
+    fi
+  done
+fi
+
+if [ "$go_env_changed" = 1 ]; then
+  echo "· 生效的 Go 环境: GOMODCACHE=$("$GO_BIN" env GOMODCACHE) GOCACHE=$("$GO_BIN" env GOCACHE) GOPROXY=$("$GO_BIN" env GOPROXY)"
+fi
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 [ -n "$repo_root" ] || die "当前目录不是 git 仓库"
