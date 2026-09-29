@@ -205,7 +205,14 @@ func toolCallItem(callID, chatName, arguments, reasoning, status string, ctx *To
 	default:
 		name, namespace := chatName, ""
 		if known {
-			name = spec.Name
+			if spec.Kind == toolKindAlias {
+				// 别名工具：还原为 codex 实际声明的新版工具名（如 shell→exec_command），
+				// 参数同步转换（旧版 command 数组 → 新版 cmd 字符串）。
+				name = spec.AliasFor
+				arguments = remapAliasArguments(chatName, arguments)
+			} else {
+				name = spec.Name
+			}
 			namespace = spec.Namespace
 		}
 		item := map[string]any{
@@ -255,6 +262,25 @@ func customToolInputFromArguments(arguments string) string {
 				return input
 			}
 		}
+	}
+	return arguments
+}
+
+// remapAliasArguments 把模型按旧版工具 schema 生成的 arguments 转换为新版工具
+// 的参数（shell 的 command 数组 → exec_command 的 cmd 字符串）。chatName 未命中
+// 别名表时原样返回。返回值重新序列化为 JSON 字符串（保持 Responses arguments
+// 的字符串形态）；转换产出的 map 不再二次 canonicalize（键序无语义影响）。
+func remapAliasArguments(chatName, arguments string) string {
+	for _, alias := range legacyAliases {
+		if alias.legacyName != chatName || alias.remapArgs == nil {
+			continue
+		}
+		out := alias.remapArgs(arguments)
+		raw, err := json.Marshal(out)
+		if err != nil {
+			return arguments
+		}
+		return string(raw)
 	}
 	return arguments
 }

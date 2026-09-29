@@ -264,8 +264,9 @@ func (s *StreamState) pushToolCall(out *bytes.Buffer, tc map[string]any) {
 		state.arguments.WriteString(args)
 		// 已 added 的调用才发 arguments delta；未 added 的由 flushReadyToolCalls
 		// 在释放时补发（避免分片乱序先于 output_item.added）。
-		// custom 工具的 input 不流式发 delta（收尾时一次性发 custom_tool_call_input）。
-		if state.added && !s.isCustom(state.name) {
+		// custom 工具的 input 不流式发 delta（收尾时一次性发 custom_tool_call_input）；
+		// 别名工具同理（收尾时一次性发转换后的完整参数）。
+		if state.added && !s.isCustom(state.name) && !s.isAlias(state.name) {
 			out.Write(sseEvent("response.function_call_arguments.delta", map[string]any{
 				"item_id": state.itemID, "output_index": state.outputIndex, "delta": args,
 			}))
@@ -298,7 +299,7 @@ func (s *StreamState) flushReadyToolCalls(out *bytes.Buffer) {
 			"output_index": state.outputIndex,
 			"item":         toolCallItem(state.callID, state.name, "", "", "in_progress", s.toolCtx),
 		}))
-		if state.arguments.Len() > 0 && !s.isCustom(state.name) {
+		if state.arguments.Len() > 0 && !s.isCustom(state.name) && !s.isAlias(state.name) {
 			out.Write(sseEvent("response.function_call_arguments.delta", map[string]any{
 				"item_id": state.itemID, "output_index": state.outputIndex, "delta": state.arguments.String(),
 			}))
@@ -405,6 +406,11 @@ func (s *StreamState) finalizeTools(out *bytes.Buffer) {
 // isCustom 报告 Chat 工具名是否对应 custom 工具。
 func (s *StreamState) isCustom(name string) bool {
 	return s.toolCtx != nil && s.toolCtx.isCustom(name)
+}
+
+// isAlias 报告 Chat 工具名是否对应别名工具（回程还原为真名 + 参数转换）。
+func (s *StreamState) isAlias(name string) bool {
+	return s.toolCtx != nil && s.toolCtx.isAlias(name)
 }
 
 // toolCallIndex 取 Chat delta 的 tool_call index（缺省返回 false）。

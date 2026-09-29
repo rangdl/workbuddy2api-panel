@@ -4,10 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 )
 
 // buildToolContext 从 Responses 请求的 tools 声明构造 Chat 工具映射。
 // 除顶层 tools 外，也提升 input 里声明的工具（additional_tools / tool_search_output）。
+// 最后按别名表注入别名工具（见 legacyAliasTools）。
 func buildToolContext(body map[string]any) *ToolContext {
 	ctx := NewToolContext()
 	if tools, ok := body["tools"].([]any); ok {
@@ -18,7 +20,120 @@ func buildToolContext(body map[string]any) *ToolContext {
 	if input, ok := body["input"]; ok {
 		collectInputDeclaredTools(input, ctx)
 	}
+	ctx.injectAliasTools()
 	return ctx
+}
+
+// legacyAlias 旧版 codex 工具名 → 新版真名的别名条目。
+type legacyAlias struct {
+	legacyName  string            // 模型可能幻觉输出的旧名（Chat 侧别名工具名）
+	targetName  string            // codex 实际声明的新名（Responses 侧真名）
+	legacyDesc  string            // 别名工具描述（供模型选择）
+	legacyParam map[string]any    // 别名工具的旧版参数 schema
+	remapArgs   func(string) any // 旧版参数 → 新版参数（nil = 原样透传）
+}
+
+// legacyAliases 旧版 codex 工具别名表。
+// 背景：codex 0.15x 注册的工具是 exec_command / write_stdin 等，glm / deepseek
+// 类模型按训练记忆常输出旧版 codex 的 shell / apply_patch 等——codex 端报
+// "unsupported call: shell" 并拒绝执行（实测复现）。提示注入只能纠偏概率，
+// 这里补确定性兜底：当 codex 声明了新版工具时，向 Chat 上游注入同名旧版工具，
+// 模型输出旧名也能落到「真实声明」的调用，回程还原为新名。
+// 只处理 shell（旧版执行命令的入口，模型幻觉的重灾区）：
+// apply_patch / update_plan 等旧名在新版 codex 中无一一对应的新工具
+// （apply_patch 的语义已并入 exec_command 的 heredoc 用法），无法安全映射。
+var legacyAliases = []legacyAlias{
+	{
+		legacyName: "shell",
+		targetName: "exec_command",
+		legacyDesc: "Runs a shell command and returns its output.",
+		legacyParam: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "The command tokens to execute (first element is the program).",
+				},
+				"workdir": map[string]any{"type": "string", "description": "Working directory."},
+				"timeout": map[string]any{"type": "number", "description": "Timeout in milliseconds."},
+			},
+		},
+		// 旧版 command 是 token 数组（["bash","-lc","..."]），新版 cmd 是 shell 字符串。
+		// 数组按 OpenAI shells 的 bash -lc 惯例拼回一行；已是字符串则原样用。
+		remapArgs: func(arguments string) any {
+			var args map[string]any
+			if err := json.Unmarshal([]byte(arguments), &args); err != nil || args == nil {
+				return map[string]any{"cmd": arguments}
+			}
+			out := map[string]any{}
+			for k, v := range args {
+				out[k] = v
+			}
+			if _, ok := out["cmd"]; ok {
+				return out // 已有 cmd（模型混用两套参数）：原样
+			}
+			switch cmd := args["command"].(type) {
+			case []any:
+				out["cmd"] = joinCommandTokens(cmd)
+			case string:
+				out["cmd"] = cmd
+			default:
+				// 无 command 参数：保留其余字段（workdir/timeout），cmd 留空由上游纠错
+				out["cmd"] = ""
+			}
+			delete(out, "command")
+			return out
+		},
+	},
+}
+
+// joinCommandTokens 把旧版 command token 数组拼回 shell 字符串。
+// 首个 token 是程序名（惯常 bash/sh）；bash/sh 的 -lc 惯例下最后一个 token 是
+// 完整脚本，直接取它；否则逐 token 空格拼接。
+func joinCommandTokens(tokens []any) string {
+	parts := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		if s, ok := t.(string); ok {
+			parts = append(parts, s)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	for _, shell := range []string{"bash", "sh", "zsh", "dash"} {
+		if parts[0] == shell && len(parts) >= 3 {
+			for _, flag := range parts[1 : len(parts)-1] {
+				if flag == "-lc" || flag == "-c" {
+					return parts[len(parts)-1]
+				}
+			}
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// injectAliasTools 按 legacyAliases 注入别名工具：仅当目标工具已被 codex 声明
+// 且旧名未被占用时。别名与真名并存——模型输出哪个名字都能命中真实声明。
+func (c *ToolContext) injectAliasTools() {
+	for _, alias := range legacyAliases {
+		spec, declared := c.chatNameToSpec[alias.targetName]
+		if !declared || spec.Kind != toolKindFunction || spec.Namespace != "" {
+			continue
+		}
+		if _, taken := c.chatNameToSpec[alias.legacyName]; taken {
+			continue
+		}
+		chatTool := map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        alias.legacyName,
+				"description": alias.legacyDesc,
+				"parameters":  alias.legacyParam,
+			},
+		}
+		c.add(alias.legacyName, ToolSpec{Kind: toolKindAlias, Name: alias.legacyName, AliasFor: alias.targetName}, chatTool)
+	}
 }
 
 // addResponseTool 登记一个 Responses 工具声明。

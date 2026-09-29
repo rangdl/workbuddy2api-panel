@@ -2,6 +2,7 @@ package responses
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -338,5 +339,168 @@ func TestPendingToolCallsMergeIntoAssistant(t *testing.T) {
 	}
 	if tcs, _ := msg["tool_calls"].([]any); len(tcs) != 1 {
 		t.Errorf("tool_calls not merged: %v", msg["tool_calls"])
+	}
+}
+
+func TestToolRosterHintAppendedAtTail(t *testing.T) {
+	body := []byte(`{
+		"model":"m",
+		"instructions":"You are a coding agent.",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"tools":[
+			{"type":"function","name":"exec_command","description":"Runs a command in a PTY. Returns output.","parameters":{"type":"object"}},
+			{"type":"function","name":"write_stdin","description":"Write to a running session.","parameters":{"type":"object"}}
+		]
+	}`)
+	raw, _, err := ToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := decode(t, raw)
+	msgs, _ := out["messages"].([]any)
+	if len(msgs) < 3 {
+		t.Fatalf("messages len=%d", len(msgs))
+	}
+	// 名单提示位于头部 system 区：instructions 之后、首条对话消息之前
+	//（对齐 TWA wb_toolexec 注入范式：约束行为 + prompt cache 前缀稳定）。
+	first, _ := msgs[0].(map[string]any)
+	if first["role"] != "system" || !strings.Contains(rawString(first, "content"), "You are a coding agent.") {
+		t.Fatalf("first message should be instructions system, got %v", first)
+	}
+	hint, _ := msgs[1].(map[string]any)
+	if hint["role"] != "system" {
+		t.Fatalf("second message role=%v, want system roster hint", hint["role"])
+	}
+	content := rawString(hint, "content")
+	for _, want := range []string{"exec_command", "write_stdin", "shell", "apply_patch"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("roster hint missing %q: %q", want, content)
+		}
+	}
+	if u, _ := msgs[2].(map[string]any); u["role"] != "user" {
+		t.Errorf("third message should be the first conversation message, got %v", u)
+	}
+}
+
+func TestNoToolsNoRosterHint(t *testing.T) {
+	body := []byte(`{"model":"m","input":"hi"}`)
+	raw, _, err := ToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := decode(t, raw)
+	msgs, _ := out["messages"].([]any)
+	for _, m := range msgs {
+		msg, _ := m.(map[string]any)
+		if c, _ := msg["content"].(string); strings.Contains(c, "authoritative list") {
+			t.Errorf("unexpected roster hint without tools: %v", msgs)
+		}
+	}
+}
+
+func TestAliasToolInjectedWhenTargetDeclared(t *testing.T) {
+	body := []byte(`{
+		"model":"m",
+		"input":"hi",
+		"tools":[{"type":"function","name":"exec_command","description":"run",
+			"parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]
+	}`)
+	raw, ctx, err := ToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := decode(t, raw)
+	tools, _ := out["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools len=%d, want exec_command + shell alias", len(tools))
+	}
+	// 别名工具以旧版 schema 声明（command 数组）
+	var aliasFn map[string]any
+	for _, raw := range tools {
+		tl, _ := raw.(map[string]any)
+		fn, _ := tl["function"].(map[string]any)
+		if fn["name"] == "shell" {
+			aliasFn = fn
+		}
+	}
+	if aliasFn == nil {
+		t.Fatal("shell alias tool not injected")
+	}
+	params, _ := aliasFn["parameters"].(map[string]any)
+	props, _ := params["properties"].(map[string]any)
+	if _, ok := props["command"]; !ok {
+		t.Errorf("alias schema missing legacy command param: %v", props)
+	}
+	// ToolContext 记录别名关系
+	spec, ok := ctx.Lookup("shell")
+	if !ok || spec.Kind != toolKindAlias || spec.AliasFor != "exec_command" {
+		t.Errorf("Lookup(shell) = %+v ok=%v", spec, ok)
+	}
+}
+
+func TestNoAliasWhenTargetNotDeclared(t *testing.T) {
+	body := []byte(`{
+		"model":"m",
+		"input":"hi",
+		"tools":[{"type":"function","name":"write_stdin","description":"w","parameters":{"type":"object"}}]
+	}`)
+	raw, _, err := ToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := decode(t, raw)
+	tools, _ := out["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools len=%d, want only declared tool", len(tools))
+	}
+}
+
+func TestAliasRoundTripShellToExecCommand(t *testing.T) {
+	// 请求侧：codex 声明 exec_command
+	body := []byte(`{
+		"model":"m",
+		"input":"hi",
+		"tools":[{"type":"function","name":"exec_command","description":"run",
+			"parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]
+	}`)
+	_, ctx, err := ToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 回程：模型输出了旧名 shell + 旧版 command 数组参数
+	chatResp := map[string]any{
+		"id": "chat-1", "model": "m", "created": float64(1),
+		"choices": []any{map[string]any{
+			"finish_reason": "tool_calls",
+			"message": map[string]any{
+				"role": "assistant",
+				"tool_calls": []any{map[string]any{
+					"id": "call_1", "type": "function",
+					"function": map[string]any{
+						"name":      "shell",
+						"arguments": `{"command":["bash","-lc","echo hi"],"workdir":"/tmp"}`,
+					},
+				}},
+			},
+		}},
+	}
+	resp, err := FromChat(chatResp, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, _ := resp["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("output=%v", output)
+	}
+	item, _ := output[0].(map[string]any)
+	if item["type"] != "function_call" || item["name"] != "exec_command" {
+		t.Fatalf("item=%v, want function_call exec_command", item)
+	}
+	args, _ := item["arguments"].(string)
+	if !strings.Contains(args, `"cmd"`) || strings.Contains(args, `"command"`) {
+		t.Errorf("arguments not remapped: %s", args)
+	}
+	if !strings.Contains(args, `echo hi`) || !strings.Contains(args, `/tmp`) {
+		t.Errorf("arguments lost data: %s", args)
 	}
 }

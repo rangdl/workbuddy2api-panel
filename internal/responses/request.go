@@ -39,6 +39,15 @@ func ToChat(body []byte) ([]byte, *ToolContext, error) {
 		msgs := appendResponsesInput(input, toolCtx)
 		messages = append(messages, msgs...)
 	}
+
+	// 工具名单提示（见 toolRosterHint）：插在头部 system 区末尾（instructions 之后、
+	// 首条对话消息之前）。位置对齐 TraeWorkAssistant wb_toolexec.rs 的注入范式
+	// （"首个非 system 消息之前"）：约束模型行为的同时保持 prompt cache 前缀稳定
+	// ——每轮对话只在尾部追加历史，头部注入段不变，缓存不因名单提示断裂。
+	chatTools := toolCtx.ChatTools()
+	if len(chatTools) > 0 {
+		messages = append(messages, map[string]any{"role": "system", "content": toolRosterHint(chatTools)})
+	}
 	out["messages"] = collapseSystemMessages(messages)
 
 	// 输出上限：max_output_tokens → max_tokens（项目出站管线会再做一次别名翻译）。
@@ -525,4 +534,44 @@ func toolOutputString(v any) string {
 		}
 		return string(raw)
 	}
+}
+
+// toolRosterHint 生成「工具名单提示」：声明本次会话可用的工具全集，禁止调用
+// 名单之外的名字。背景：codex 新版（0.15x）注册的工具是 exec_command /
+// write_stdin / view_image 等，glm / deepseek 类模型按训练记忆常输出旧版 codex
+// 的 shell / apply_patch / update_plan——codex 端报 "unsupported call: shell"
+// 并拒绝执行（实测复现）。名单放在消息序列末尾（collapseSystemMessages 之后追加），
+// 贴近模型生成 tool_calls 的位置，约束力最强。
+func toolRosterHint(chatTools []any) string {
+	var b strings.Builder
+	b.WriteString("Tool availability for this turn (authoritative list):\n")
+	for _, raw := range chatTools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, _ := tool["function"].(map[string]any)
+		name := rawString(fn, "name")
+		if name == "" {
+			name = rawString(tool, "name")
+		}
+		if name == "" {
+			continue
+		}
+		b.WriteString("- ")
+		b.WriteString(name)
+		if desc := rawString(fn, "description"); desc != "" {
+			// 单行摘要：截到首句/120 字符，避免提示本身膨胀。
+			if i := strings.IndexAny(desc, ".\n"); i > 0 && i < 120 {
+				desc = desc[:i]
+			} else if len(desc) > 120 {
+				desc = desc[:120]
+			}
+			b.WriteString(": ")
+			b.WriteString(desc)
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString(`Call tools ONLY by the exact names listed above. Do not invent or use tool names from other coding-agent versions (for example "shell", "apply_patch", "update_plan", "read_file" are NOT available unless listed above); use the closest listed tool instead. If no listed tool fits, answer in plain text instead of calling a tool.`)
+	return b.String()
 }

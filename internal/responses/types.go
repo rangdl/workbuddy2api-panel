@@ -17,6 +17,7 @@ const (
 	toolKindCustom     = "custom"
 	toolKindToolSearch = "tool_search"
 	toolKindNamespace  = "namespace"
+	toolKindAlias      = "alias"
 )
 
 // customToolInputField custom 工具包成 Chat function 时的入参字段名。
@@ -31,9 +32,11 @@ const chatToolNameMaxLen = 64
 // ToolSpec 记录一个 Responses 工具到 Chat 工具的映射，供回程把 Chat 的
 // function_call 还原为 Responses 的 function_call / custom_tool_call / tool_search_call。
 type ToolSpec struct {
-	Kind      string // function / custom / tool_search / namespace
+	Kind      string // function / custom / tool_search / namespace / alias
 	Name      string // Responses 侧原始工具名
 	Namespace string // namespace 工具所属命名空间（空 = 无）
+	// AliasFor 别名工具指向的 Responses 侧真名（仅 Kind=alias 使用）。
+	AliasFor string
 }
 
 // ToolContext 承载一次请求内 Responses 工具 ↔ Chat 工具的映射关系。
@@ -69,6 +72,12 @@ func (c *ToolContext) Lookup(chatName string) (ToolSpec, bool) {
 func (c *ToolContext) isCustom(chatName string) bool {
 	spec, ok := c.chatNameToSpec[chatName]
 	return ok && spec.Kind == toolKindCustom
+}
+
+// isAlias 报告 Chat 工具名是否对应别名工具。
+func (c *ToolContext) isAlias(chatName string) bool {
+	spec, ok := c.chatNameToSpec[chatName]
+	return ok && spec.Kind == toolKindAlias
 }
 
 // chatNameForResponseFunction 由 Responses 的 (namespace, name) 求 Chat 侧工具名。
