@@ -174,11 +174,14 @@ func chatToolCallToResponseItem(callID, chatName, arguments, reasoning string, c
 // toolCallItem 按 ToolContext 生成 Responses 工具调用 item，供流式/非流式共用：
 // 依据 Chat 工具名还原为 function_call / custom_tool_call / tool_search_call。
 // status 为 in_progress 时 arguments/input 传空。
+// 反查用 LookupLoose（精确 miss 后按裸名宽松纠偏）：部分模型不按声明输出扁平名
+// functions__exec 而是裸名 exec，精确 miss 会把 custom 工具还原成 function_call，
+// codex 端校验失败执行被中止（会话级故障，实测 deepseek 上游）。
 func toolCallItem(callID, chatName, arguments, reasoning, status string, ctx *ToolContext) map[string]any {
 	var spec ToolSpec
 	known := false
 	if ctx != nil {
-		spec, known = ctx.Lookup(chatName)
+		spec, known = ctx.LookupLoose(chatName)
 	}
 	switch {
 	case known && spec.Kind == toolKindCustom:
@@ -235,6 +238,14 @@ func toolCallItem(callID, chatName, arguments, reasoning, status string, ctx *To
 func toolCallItemID(callID, chatName string, ctx *ToolContext) string {
 	if ctx != nil && ctx.isCustom(chatName) {
 		return "ctc_" + callID
+	}
+	// 精确 miss 时按裸名宽松纠偏（与 toolCallItem 的 LookupLoose 同口径）：
+	// 模型输出裸名 exec 时 item 会还原成 custom_tool_call，item_id 前缀必须
+	// 同步为 ctc_，否则 codex 端按 id 前缀分发事件会错配。
+	if ctx != nil && !ctx.isKnown(chatName) {
+		if spec, ok := ctx.LookupLoose(chatName); ok && spec.Kind == toolKindCustom {
+			return "ctc_" + callID
+		}
 	}
 	return "fc_" + callID
 }

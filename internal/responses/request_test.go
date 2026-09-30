@@ -617,3 +617,105 @@ func keysOf(m map[string]map[string]any) []string {
 	sort.Strings(out)
 	return out
 }
+
+// 裸名纠偏（实测 deepseek 上游故障）：模型不按声明输出 functions__exec 而是裸名
+// exec 时，回程必须还原为 custom_tool_call（而非 function_call），否则 codex 端
+// 校验失败、工具执行被中止。
+func TestBareNameCustomRoundTrip(t *testing.T) {
+	body := []byte(`{
+		"model":"m",
+		"input":[{"type":"additional_tools","role":"developer","tools":[
+			{"type":"namespace","name":"functions","tools":[
+				{"type":"custom","name":"exec","description":"run js"},
+				{"type":"function","name":"wait","parameters":{"type":"object"}}
+			]},
+			{"type":"namespace","name":"clock","tools":[
+				{"type":"function","name":"sleep","parameters":{"type":"object"}}
+			]}
+		]}]
+	}`)
+	_, ctx, err := ToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模型输出了裸名 exec
+	chatResp := map[string]any{
+		"id": "chat-1", "model": "m", "created": float64(1),
+		"choices": []any{map[string]any{
+			"finish_reason": "tool_calls",
+			"message": map[string]any{
+				"role": "assistant",
+				"tool_calls": []any{map[string]any{
+					"id": "call_b1", "type": "function",
+					"function": map[string]any{"name": "exec", "arguments": `{"input":"text('hi')"}`},
+				}},
+			},
+		}},
+	}
+	resp, err := FromChat(chatResp, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, _ := resp["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("output=%v", output)
+	}
+	item, _ := output[0].(map[string]any)
+	if item["type"] != "custom_tool_call" {
+		t.Fatalf("type=%v, want custom_tool_call (bare name must be re-associated)", item["type"])
+	}
+	if item["name"] != "exec" {
+		t.Errorf("name=%v", item["name"])
+	}
+	if item["input"] != "text('hi')" {
+		t.Errorf("input=%v", item["input"])
+	}
+	// item_id 前缀同步为 ctc_
+	if id := toolCallItemID("call_b1", "exec", ctx); id != "ctc_call_b1" {
+		t.Errorf("itemID=%v, want ctc_call_b1", id)
+	}
+}
+
+// 歧义不猜：两个 namespace 有同名子工具时裸名不纠偏（保持 function_call default）。
+func TestBareNameAmbiguousNotGuessed(t *testing.T) {
+	body := []byte(`{
+		"model":"m",
+		"input":[{"type":"additional_tools","role":"developer","tools":[
+			{"type":"namespace","name":"functions","tools":[
+				{"type":"custom","name":"run","description":"a"}
+			]},
+			{"type":"namespace","name":"tools","tools":[
+				{"type":"custom","name":"run","description":"b"}
+			]}
+		]}]
+	}`)
+	_, ctx, err := ToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ctx.LookupLoose("run"); ok {
+		t.Error("ambiguous bare name should not match")
+	}
+	chatResp := map[string]any{
+		"id": "chat-1", "model": "m", "created": float64(1),
+		"choices": []any{map[string]any{
+			"finish_reason": "tool_calls",
+			"message": map[string]any{
+				"role": "assistant",
+				"tool_calls": []any{map[string]any{
+					"id": "call_a1", "type": "function",
+					"function": map[string]any{"name": "run", "arguments": "{}"},
+				}},
+			},
+		}},
+	}
+	resp, err := FromChat(chatResp, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, _ := resp["output"].([]any)
+	item, _ := output[0].(map[string]any)
+	if item["type"] != "function_call" {
+		t.Errorf("ambiguous case type=%v, want function_call (unchanged default)", item["type"])
+	}
+}

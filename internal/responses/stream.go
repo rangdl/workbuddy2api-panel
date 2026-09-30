@@ -403,9 +403,22 @@ func (s *StreamState) finalizeTools(out *bytes.Buffer) {
 	}
 }
 
-// isCustom 报告 Chat 工具名是否对应 custom 工具。
+// isCustom 报告 Chat 工具名是否对应 custom 工具（含裸名宽松纠偏：
+// 模型输出裸名 exec 时也要走 custom 的收尾策略——input 一次性下发）。
 func (s *StreamState) isCustom(name string) bool {
-	return s.toolCtx != nil && s.toolCtx.isCustom(name)
+	if s.toolCtx == nil {
+		return false
+	}
+	if s.toolCtx.isCustom(name) {
+		return true
+	}
+	if s.toolCtx.isKnown(name) {
+		return false
+	}
+	if spec, ok := s.toolCtx.LookupLoose(name); ok {
+		return spec.Kind == toolKindCustom
+	}
+	return false
 }
 
 // isAlias 报告 Chat 工具名是否对应别名工具（回程还原为真名 + 参数转换）。

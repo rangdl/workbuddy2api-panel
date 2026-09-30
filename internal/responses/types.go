@@ -68,10 +68,41 @@ func (c *ToolContext) Lookup(chatName string) (ToolSpec, bool) {
 	return spec, ok
 }
 
+// LookupLoose 宽松反查：精确未命中时按「裸名 == spec.Name」或「扁平名以 __裸名
+// 结尾」匹配唯一项。背景（实测 codex 0.154 + deepseek 上游，会话级故障）：部分
+// 模型不按声明输出扁平名 functions__exec，而是输出裸名 exec——精确 Lookup miss
+// 后走 default 分支还原成 function_call，而 exec 在 codex 端是 custom 工具，不接
+// 受 function_call 形态，工具执行被中止（回喂 "aborted"，模型反复重试全灭）。
+// 唯一匹配才纠偏；歧义（多个 namespace 有同名子工具）保持原样，不猜。
+func (c *ToolContext) LookupLoose(chatName string) (ToolSpec, bool) {
+	if spec, ok := c.chatNameToSpec[chatName]; ok {
+		return spec, true
+	}
+	var hit ToolSpec
+	found := false
+	for name, spec := range c.chatNameToSpec {
+		if spec.Name != chatName {
+			continue
+		}
+		if found {
+			return ToolSpec{}, false // 歧义：多个 namespace 同名子工具，不猜
+		}
+		hit, found = spec, true
+		_ = name
+	}
+	return hit, found
+}
+
 // isCustom 报告 Chat 工具名是否对应 custom 工具。
 func (c *ToolContext) isCustom(chatName string) bool {
 	spec, ok := c.chatNameToSpec[chatName]
 	return ok && spec.Kind == toolKindCustom
+}
+
+// isKnown 报告 Chat 工具名是否已精确登记。
+func (c *ToolContext) isKnown(chatName string) bool {
+	_, ok := c.chatNameToSpec[chatName]
+	return ok
 }
 
 // isAlias 报告 Chat 工具名是否对应别名工具。
