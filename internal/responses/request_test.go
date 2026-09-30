@@ -1,6 +1,7 @@
 package responses
 
 import (
+	"bytes"
 	"encoding/json"
 	"sort"
 	"strings"
@@ -718,4 +719,114 @@ func TestBareNameAmbiguousNotGuessed(t *testing.T) {
 	if item["type"] != "function_call" {
 		t.Errorf("ambiguous case type=%v, want function_call (unchanged default)", item["type"])
 	}
+}
+
+// 组合回归（对照真实会话 #103 的调用形态）：custom exec（裸名）与 namespace
+// function 子工具 clock__sleep（裸名 sleep）在同一轮并行发起，且 arguments 分片
+// 到达。三个工具调用必须各自还原为正确的 item 类型，互不串扰。
+func TestMixedCustomAndNamespaceFunctionParallel(t *testing.T) {
+	body := []byte(`{
+		"model":"m",
+		"input":[{"type":"additional_tools","role":"developer","tools":[
+			{"type":"namespace","name":"functions","tools":[
+				{"type":"custom","name":"exec","description":"run js"},
+				{"type":"function","name":"wait","parameters":{"type":"object"}}
+			]},
+			{"type":"namespace","name":"clock","tools":[
+				{"type":"function","name":"sleep","parameters":{"type":"object"}}
+			]}
+		]}]
+	}`)
+	_, ctx, err := ToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 流式回程：两个裸名调用（exec custom + sleep function），arguments 分 2 片
+	st := NewStreamState(ctx)
+	var out bytes.Buffer
+	tc1 := map[string]any{"index": 0, "id": "call_c1", "type": "function",
+		"function": map[string]any{"name": "exec", "arguments": ""}}
+	tc2 := map[string]any{"index": 1, "id": "call_c2", "type": "function",
+		"function": map[string]any{"name": "sleep", "arguments": `{"ms":`}}
+	out.Write(st.HandleChunk(map[string]any{"id": "chat-1", "model": "m", "created": float64(1),
+		"choices": []any{map[string]any{"delta": map[string]any{"tool_calls": []any{tc1, tc2}}}}}))
+	tc3 := map[string]any{"index": 1, "function": map[string]any{"arguments": `10}`}}
+	out.Write(st.HandleChunk(map[string]any{"id": "chat-1", "model": "m", "created": float64(1),
+		"choices": []any{map[string]any{"delta": map[string]any{"tool_calls": []any{tc3}}}}}))
+	out.Write(st.Finalize())
+
+	events := parseSSEEvents(t, out.Bytes())
+	// exec（裸名，custom）→ custom_tool_call（本场景未发 arguments，input 为空）
+	execDone := findDoneItem(t, events, "custom_tool_call")
+	if execDone["name"] != "exec" {
+		t.Errorf("exec item name=%v", execDone["name"])
+	}
+	// sleep（裸名，namespace function）→ function_call，且还原 namespace=clock
+	sleepDone := findDoneItem(t, events, "function_call")
+	if sleepDone["name"] != "sleep" {
+		t.Errorf("sleep item name=%v, want bare sleep (namespace restored separately)", sleepDone["name"])
+	}
+	if sleepDone["namespace"] != "clock" {
+		t.Errorf("sleep item namespace=%v, want clock", sleepDone["namespace"])
+	}
+	if sleepDone["arguments"] != `{"ms":10}` {
+		t.Errorf("sleep arguments=%v, want跨片拼接", sleepDone["arguments"])
+	}
+	// item_id 前缀：exec 用 ctc_，sleep 用 fc_
+	if !hasEventWith(t, events, "response.output_item.added", `"id":"ctc_call_c1"`) {
+		t.Error("exec item_id prefix should be ctc_")
+	}
+	if !hasEventWith(t, events, "response.output_item.added", `"id":"fc_call_c2"`) {
+		t.Error("sleep item_id prefix should be fc_")
+	}
+}
+
+// parseSSEEvents 从 SSE 字节流解析 (event, data) 对。
+func parseSSEEvents(t *testing.T, raw []byte) []map[string]any {
+	t.Helper()
+	var events []map[string]any
+	for _, block := range strings.Split(string(raw), "\n\n") {
+		for _, line := range strings.Split(block, "\n") {
+			if strings.HasPrefix(line, "data: ") {
+				var m map[string]any
+				if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &m) == nil {
+					events = append(events, m)
+				}
+			}
+		}
+	}
+	return events
+}
+
+// findDoneItem 取指定类型的 response.output_item.done 事件 item（取最后一个）。
+func findDoneItem(t *testing.T, events []map[string]any, itemType string) map[string]any {
+	t.Helper()
+	var hit map[string]any
+	for _, e := range events {
+		if e["type"] != "response.output_item.done" {
+			continue
+		}
+		if item, ok := e["item"].(map[string]any); ok && item["type"] == itemType {
+			hit = item
+		}
+	}
+	if hit == nil {
+		t.Fatalf("no done item of type %s", itemType)
+	}
+	return hit
+}
+
+// hasEventWith 报告是否存在 type 相符且 data 含子串的事件。
+func hasEventWith(t *testing.T, events []map[string]any, eventType, substr string) bool {
+	t.Helper()
+	for _, e := range events {
+		if e["type"] != eventType {
+			continue
+		}
+		raw, _ := json.Marshal(e)
+		if strings.Contains(string(raw), substr) {
+			return true
+		}
+	}
+	return false
 }
