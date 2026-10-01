@@ -365,7 +365,7 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
 	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
 		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
-			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
+			logfmt.Label(e.a.UID, e.a.NicknameValue()), model, e.credits, p.creditFloor)
 		return nil
 	}
 	if p.inFlightFull(e) {
@@ -496,7 +496,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
 		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
 		Realm:                    e.a.Realm(),
-		Nickname:                 e.a.Nickname,
+		Nickname:                 e.a.NicknameValue(),
 		Credits:                  e.credits,
 		CreditsTotal:             e.creditsTotal,
 		CreditsExpiring:          e.creditsExpiring,

@@ -846,7 +846,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		st.uid = acct.UID
 		// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
-		st.nick = acct.Nickname
+		st.nick = acct.NicknameValue()
 		tried[acct.UID] = true
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
@@ -882,7 +882,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			if err := acct.SaveAtomic(); err != nil {
 				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
-				log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
+				log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.NicknameValue()), err)
 			}
 		}
 
@@ -1029,7 +1029,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 502 观测没有意义）。
 				st.status = http.StatusBadGateway
 				st.outcome = reqlog.OutcomeStreamError
-				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
+				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.NicknameValue()), bareModel)
 			case sErr != nil:
 				st.outcome = reqlog.OutcomeInterrupted
 			case stats.SawErrorFrame():
@@ -1318,6 +1318,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_, _ = w.Write(raw)
 }
 
+// writeOpenAIError 写 OpenAI 形错误体。type 固定 "api_error"（OpenAI 形状；
+// Anthropic 侧的 error.type 由 anthropic.ErrorToMessages 按状态另行映射，
+// 不经此处——429 的 rate_limit_error 语义在转换层补齐）。
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, map[string]any{
 		"error": map[string]any{

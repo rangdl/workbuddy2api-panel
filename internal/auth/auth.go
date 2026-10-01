@@ -91,6 +91,22 @@ func (a *Auth) RefreshTokenValue() string {
 	return a.RefreshToken
 }
 
+// NicknameValue 加锁读取 Nickname（同 AccessTokenValue 这族访问器）。
+// SetNickname（pool/cooldown.go）在 a.mu 内改写 Nickname，而 chat 热路径
+// （handler st.nick）、调度器日志、面板任务中心、upstream 指纹构造都在锁外
+// 直读——string 是两个机器字（ptr+len），无同步并发读写构成数据竞争
+// （go test -race 会报；与 AccessToken 同一缺陷类，该族访问器当年漏了它）。
+// 仅限初始化/单线程生命周期内的读写（Parse 加载、SaveAtomic 序列化、面板
+// import 后未入池前）可继续直读字段。
+func (a *Auth) NicknameValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Nickname
+}
+
 // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
 // 默认开启（与 config global.enabled 缺省 true 一致）：Realm() 正常按显式 realm/
 // domain 判定 global/cn。显式 SetGlobalEnabled(false)（config "enabled": false）关闭
