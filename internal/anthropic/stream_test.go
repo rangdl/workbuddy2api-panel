@@ -290,3 +290,40 @@ func TestStreamArgumentsIncremental(t *testing.T) {
 		t.Errorf("concatenated args=%q, want exactly one copy (no duplication)", args.String())
 	}
 }
+
+// message_delta 的 usage 必须带完整四桶（input/cache_read/cache_creation/output）——
+// CC 以该事件记账，会话 #106 实测丢 input 桶导致 CC 转写输入侧全 0、上下文仪表空白。
+func TestStreamMessageDeltaFullUsage(t *testing.T) {
+	st := NewStreamState()
+	var raw []byte
+	chunk1 := chatChunk(map[string]any{"content": "hi"}, "stop")
+	chunk2 := chatChunk(map[string]any{}, "stop")
+	chunk2["usage"] = map[string]any{
+		"prompt_tokens":         1000,
+		"completion_tokens":     42,
+		"prompt_tokens_details": map[string]any{"cached_tokens": 300, "cache_write_tokens": 100},
+	}
+	raw = append(raw, st.HandleChunk(chunk1)...)
+	raw = append(raw, st.HandleChunk(chunk2)...)
+	raw = append(raw, st.Finalize()...)
+
+	var md map[string]any
+	for _, e := range parseAnthropicSSE(t, raw) {
+		if e.event == "message_delta" {
+			md = e.data
+		}
+	}
+	u, _ := md["usage"].(map[string]any)
+	if u["input_tokens"] != float64(600) { // 1000-300-100 减法
+		t.Errorf("input_tokens=%v, want 600", u["input_tokens"])
+	}
+	if u["cache_read_input_tokens"] != float64(300) {
+		t.Errorf("cache_read=%v", u["cache_read_input_tokens"])
+	}
+	if u["cache_creation_input_tokens"] != float64(100) {
+		t.Errorf("cache_creation=%v", u["cache_creation_input_tokens"])
+	}
+	if u["output_tokens"] != float64(42) {
+		t.Errorf("output_tokens=%v", u["output_tokens"])
+	}
+}

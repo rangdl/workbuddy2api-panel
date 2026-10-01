@@ -136,12 +136,16 @@ func (s *StreamState) Finalize() []byte {
 	s.finalizeTools(&out)
 
 	// message_delta：单发（从缓存 flush）。无 finish_reason 的空流按 end_turn 处理。
+	// usage 必须透传 anthropicUsage() 的完整四桶（input/cache_read/cache_creation/
+	// output）——CC 以 message_delta 的 usage 记账，丢掉 input 侧桶会让 CC 转写里
+	// 输入计数全 0（会话 #106 实测：CC 转写 192 条 assistant 记录 input 侧全 0，
+	// 上下文仪表空白；根因即此处只发了 output_tokens）。
 	stopReason := stopReasonOf(s.stopReason, s.hasToolUse())
 	usage := s.anthropicUsage()
 	out.Write(sseEvent("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
-		"usage": map[string]any{"output_tokens": usage["output_tokens"]},
+		"usage": usage,
 	}))
 	out.Write(sseEvent("message_stop", map[string]any{"type": "message_stop"}))
 	s.completed = true
@@ -162,7 +166,7 @@ func (s *StreamState) Failed() []byte {
 	out.Write(sseEvent("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
-		"usage": map[string]any{"output_tokens": 0},
+		"usage": s.anthropicUsage(), // 同 Finalize：完整四桶（异常断流也如实记账）
 	}))
 	out.Write(sseEvent("message_stop", map[string]any{"type": "message_stop"}))
 	s.completed = true
