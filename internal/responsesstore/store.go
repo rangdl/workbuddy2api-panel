@@ -106,6 +106,13 @@ func (s *memoryStore) Record(responseID string, output []any) {
 }
 
 // Fill 实现 Store。
+//
+// 并发契约：previous/fallback 指向 store 内部的 cachedResponse（含 callsByID/
+// callOrder），buildRestoreGroup 与 mergeCalls 直接读它们。整个「取引用 → 合并」
+// 过程在 RLock 内完成——若锁外读，并发的 Record(responseID)（insertCallsLocked
+// 写同一 map/slice）构成 Go map 并发读写（fatal，不可 recover）。安全前提是
+// 「同一 responseID 永不二次 Record」，但该不变式仅靠 upstream id 唯一性隐式
+// 成立（fallback id 等历史形态可复现同 id），不显式依赖它。
 func (s *memoryStore) Fill(body []byte) ([]byte, int) {
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -128,10 +135,10 @@ func (s *memoryStore) Fill(body []byte) ([]byte, int) {
 	s.mu.RLock()
 	previous := s.responses[previousID]
 	fallback := s.uniqueFallbackLocked(requested, previous)
-	s.mu.RUnlock()
-
 	restoreGroup := buildRestoreGroup(previous, fallback, outputCallIDs, existingCallIDs)
 	newItems, changed := mergeCalls(items, restoreGroup, previous, fallback)
+	s.mu.RUnlock()
+
 	if changed == 0 {
 		return body, 0
 	}
