@@ -26,10 +26,10 @@ func buildToolContext(body map[string]any) *ToolContext {
 
 // legacyAlias 旧版 codex 工具名 → 新版真名的别名条目。
 type legacyAlias struct {
-	legacyName  string            // 模型可能幻觉输出的旧名（Chat 侧别名工具名）
-	targetName  string            // codex 实际声明的新名（Responses 侧真名）
-	legacyDesc  string            // 别名工具描述（供模型选择）
-	legacyParam map[string]any    // 别名工具的旧版参数 schema
+	legacyName  string           // 模型可能幻觉输出的旧名（Chat 侧别名工具名）
+	targetName  string           // codex 实际声明的新名（Responses 侧真名）
+	legacyDesc  string           // 别名工具描述（供模型选择）
+	legacyParam map[string]any   // 别名工具的旧版参数 schema
 	remapArgs   func(string) any // 旧版参数 → 新版参数（nil = 原样透传）
 }
 

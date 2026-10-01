@@ -694,11 +694,11 @@ func (p *Panel) syncNicknames() {
 		return
 	}
 	var (
-		mu       sync.Mutex
-		updated  int
-		failed   int
-		sem      = make(chan struct{}, 3)
-		wg       sync.WaitGroup
+		mu      sync.Mutex
+		updated int
+		failed  int
+		sem     = make(chan struct{}, 3)
+		wg      sync.WaitGroup
 	)
 	for _, j := range jobs {
 		wg.Add(1)
