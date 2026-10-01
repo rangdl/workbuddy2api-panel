@@ -65,7 +65,8 @@ type streamToolBlock struct {
 	callID     string // Chat call id（即 Anthropic tool_use.id）
 	name       string
 	arguments  strings.Builder
-	blockOpen  bool // content_block_start 已发
+	sent       int    // 已通过 input_json_delta 发出的字节数（增量发送）
+	blockOpen  bool   // content_block_start 已发
 	done       bool
 }
 
@@ -337,12 +338,7 @@ func (s *StreamState) flushReadyToolBlocks(out *bytes.Buffer) {
 				},
 			}))
 		}
-		if state.arguments.Len() > 0 {
-			out.Write(sseEvent("content_block_delta", map[string]any{
-				"type": "content_block_delta", "index": state.blockIndex,
-				"delta": map[string]any{"type": "input_json_delta", "partial_json": state.arguments.String()},
-			}))
-		}
+		s.flushNewArguments(out, state)
 		s.nextToolIndexToAdd++
 	}
 }
@@ -373,12 +369,7 @@ func (s *StreamState) finalizeTools(out *bytes.Buffer) {
 				},
 			}))
 		}
-		if state.arguments.Len() > 0 {
-			out.Write(sseEvent("content_block_delta", map[string]any{
-				"type": "content_block_delta", "index": state.blockIndex,
-				"delta": map[string]any{"type": "input_json_delta", "partial_json": state.arguments.String()},
-			}))
-		}
+		s.flushNewArguments(out, state)
 		out.Write(sseEvent("content_block_stop", map[string]any{
 			"type": "content_block_stop", "index": state.blockIndex,
 		}))
@@ -462,4 +453,20 @@ func sseEvent(eventType string, data map[string]any) []byte {
 	b.Write(raw)
 	b.WriteString("\n\n")
 	return b.Bytes()
+}
+
+// flushNewArguments 把 state 中尚未发出的 arguments 增量经 input_json_delta 发出
+// （蓝本按 delta 增量发；首个实现误发全量导致 CC 端 JSON 拼接重复、解析失败——
+// 真实 Claude Code 端到端捕获，见 docs/anthropic-messages-plan.md §5.2）。
+func (s *StreamState) flushNewArguments(out *bytes.Buffer, state *streamToolBlock) {
+	args := state.arguments.String()
+	if len(args) <= state.sent {
+		return
+	}
+	delta := args[state.sent:]
+	state.sent = len(args)
+	out.Write(sseEvent("content_block_delta", map[string]any{
+		"type": "content_block_delta", "index": state.blockIndex,
+		"delta": map[string]any{"type": "input_json_delta", "partial_json": delta},
+	}))
 }

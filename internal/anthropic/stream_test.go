@@ -257,3 +257,36 @@ func TestStreamNamelessToolDropped(t *testing.T) {
 func join(items []string) string {
 	return strings.Join(items, ",")
 }
+
+// input_json_delta 必须增量发送（真实 CC 端到端捕获的 bug）：flush 触发两次时
+// 已发送的参数不得重复。首个实现误发全量导致 CC 端 JSON 拼接重复、工具调用
+// 解析失败（InputValidationError）。
+func TestStreamArgumentsIncremental(t *testing.T) {
+	st := NewStreamState()
+	var raw []byte
+	// 三帧：首帧带 id+name+空参，第二帧带全量参数，第三帧无新增
+	chunk1 := chatChunk(map[string]any{"tool_calls": []any{
+		map[string]any{"index": 0, "id": "c1", "type": "function",
+			"function": map[string]any{"name": "Bash", "arguments": ""}},
+	}}, "")
+	raw = append(raw, st.HandleChunk(chunk1)...)
+	chunk2 := chatChunk(map[string]any{"tool_calls": []any{
+		map[string]any{"index": 0, "function": map[string]any{"arguments": `{"command":"echo hi"}`}},
+	}}, "")
+	raw = append(raw, st.HandleChunk(chunk2)...)
+	raw = append(raw, st.HandleChunk(chatChunk(map[string]any{}, "tool_calls"))...)
+	raw = append(raw, st.Finalize()...)
+
+	var args strings.Builder
+	for _, e := range parseAnthropicSSE(t, raw) {
+		if e.event == "content_block_delta" {
+			d, _ := e.data["delta"].(map[string]any)
+			if d["type"] == "input_json_delta" {
+				args.WriteString(d["partial_json"].(string))
+			}
+		}
+	}
+	if args.String() != `{"command":"echo hi"}` {
+		t.Errorf("concatenated args=%q, want exactly one copy (no duplication)", args.String())
+	}
+}
