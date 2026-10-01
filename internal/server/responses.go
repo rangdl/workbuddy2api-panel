@@ -279,14 +279,23 @@ func (w *responsesWriter) ResponseID() string {
 }
 
 // takeSSEBlock 从缓冲中取一个以空行分隔的 SSE 块。
+// 同时支持 LF（\n\n）与 CRLF（\r\n\r\n）分帧——SSE 规范两者皆合法，第三方中转
+// 常见 CRLF；只按 \n\n 切会让整条流永远凑不出一个块，finish() 时整体丢弃。
+// 混合流取**最早**出现的分隔符：LF 优先策略会跳过更靠前的 CRLF 空行，把两个
+// 事件并进一个块（帧内多 data 行只取第一行 → 后一帧丢失）。
 func takeSSEBlock(buf *bytes.Buffer) (string, bool) {
 	data := buf.Bytes()
-	idx := bytes.Index(data, []byte("\n\n"))
+	idxLF := bytes.Index(data, []byte("\n\n"))
+	idxCRLF := bytes.Index(data, []byte("\r\n\r\n"))
+	idx, n := idxLF, 2
+	if idxLF < 0 || (idxCRLF >= 0 && idxCRLF < idxLF) {
+		idx, n = idxCRLF, 4
+	}
 	if idx < 0 {
 		return "", false
 	}
 	block := string(data[:idx])
-	buf.Next(idx + 2)
+	buf.Next(idx + n)
 	return block, true
 }
 

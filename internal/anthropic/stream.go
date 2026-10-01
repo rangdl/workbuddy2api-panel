@@ -26,10 +26,9 @@ type StreamState struct {
 	model      string
 
 	// 消息级事件状态。
-	started             bool   // message_start 已发（幂等）
-	messageDeltaPending bool   // 有待发的 message_delta（stop_reason/usage 已缓存）
-	stopReason          string // 最近一次 finish_reason（首个胜出，与蓝本去重一致）
-	usage               map[string]any
+	started    bool   // message_start 已发（幂等）
+	stopReason string // 最近一次 finish_reason（首个胜出，与蓝本去重一致）
+	usage      map[string]any
 
 	// content block 状态：index 连续递增；同刻至多一个打开的非工具块。
 	nextIndex     int
@@ -37,16 +36,16 @@ type StreamState struct {
 	openBlockType string
 
 	// 文本块。
-	textOpen        bool
-	textBuf         strings.Builder
-	textClosed      bool // 文本块已关闭后不可再开（Anthropic 语义一惯：后续文本另开块）
-	textBlockIndex  int
+	textOpen       bool
+	textBuf        strings.Builder
+	textClosed     bool // 文本块已关闭（后续文本另开新块，见 pushText）
+	textBlockIndex int
 
 	// 思考块。
-	thinkingOpen        bool
-	thinkingBuf         strings.Builder
-	thinkingClosed      bool
-	thinkingBlockIndex  int
+	thinkingOpen       bool
+	thinkingBuf        strings.Builder
+	thinkingClosed     bool
+	thinkingBlockIndex int
 
 	// 工具块：Chat index → 状态。
 	tools              map[int]*streamToolBlock
@@ -65,23 +64,28 @@ type streamToolBlock struct {
 	callID     string // Chat call id（即 Anthropic tool_use.id）
 	name       string
 	arguments  strings.Builder
-	sent       int    // 已通过 input_json_delta 发出的字节数（增量发送）
-	blockOpen  bool   // content_block_start 已发
+	sent       int  // 已通过 input_json_delta 发出的字节数（增量发送）
+	blockOpen  bool // content_block_start 已发
 	done       bool
 }
 
 // NewStreamState 构造流式转换状态机。
 func NewStreamState() *StreamState {
 	return &StreamState{
-		openBlock:          -1,
-		tools:              map[int]*streamToolBlock{},
-		toolIDIndex:        map[string]int{},
-		messageDeltaPending: false,
+		openBlock:   -1,
+		tools:       map[int]*streamToolBlock{},
+		toolIDIndex: map[string]int{},
 	}
 }
 
 // HandleChunk 处理一个 Chat chunk，返回需要写出的 Anthropic SSE 事件字节。
 func (s *StreamState) HandleChunk(chunk map[string]any) []byte {
+	// 终态守卫：message_stop 已发出后（Failed/Finalize），上游残留的后续帧
+	// （部分中转在流内错误帧之后仍继续推 delta/usage）不得再产生任何事件——
+	// 否则会在 message_stop 之后追加 content_block_*，构成非法事件序列。
+	if s.completed {
+		return nil
+	}
 	var out bytes.Buffer
 	if id := rawString(chunk, "id"); id != "" {
 		s.responseID = id
@@ -119,7 +123,6 @@ func (s *StreamState) HandleChunk(chunk map[string]any) []byte {
 	// 多个 finish_reason chunk：首个胜出（蓝本 has_emitted_message_delta 去重语义）。
 	if fr := rawString(choice, "finish_reason"); fr != "" && s.stopReason == "" {
 		s.stopReason = fr
-		s.messageDeltaPending = true
 	}
 	return out.Bytes()
 }
@@ -155,6 +158,16 @@ func (s *StreamState) Finalize() []byte {
 // Failed 流异常时发出可终止的收尾（stop_reason=end_turn + message_stop），
 // 让 CC 明确流已结束而不是静默卡死（方案 §5.2 第 5 条）。
 func (s *StreamState) Failed() []byte {
+	return s.FailedWithMessage("", "")
+}
+
+// FailedWithMessage 同 Failed，但在收尾序列之前先发规范的流内 error 事件
+// （Anthropic SSE 协议事件之一；CC 收到后会向用户展示错误而非渲染一个
+// completed-but-empty 的空回合）。message 为空时退化为纯 Failed（不发 error 事件）。
+// 实际发出序列：error → message_delta → message_stop——按严格协议 error 即终止、
+// 不再发 stop 对，但部分客户端只认 message_delta+message_stop 的收尾对，
+// 这里选择「error 传信 + stop 对兜底」的双保险口径（测试锁定该顺序）。
+func (s *StreamState) FailedWithMessage(message, errType string) []byte {
 	if s.completed {
 		return nil
 	}
@@ -163,6 +176,12 @@ func (s *StreamState) Failed() []byte {
 	s.closeThinking(&out)
 	s.closeText(&out)
 	s.finalizeTools(&out)
+	if strings.TrimSpace(message) != "" {
+		out.Write(sseEvent("error", map[string]any{
+			"type":  "error",
+			"error": map[string]any{"type": firstNonEmpty(errType, "api_error"), "message": message},
+		}))
+	}
 	out.Write(sseEvent("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
@@ -220,7 +239,9 @@ func (s *StreamState) closeOpenBlock(out *bytes.Buffer) {
 
 func (s *StreamState) pushThinking(out *bytes.Buffer, delta string) {
 	if s.thinkingClosed {
-		return // 已收尾的思考块不再追加（防御异常流）
+		// 已关闭的思考块后续到思考：另开新块（text → tool → thinking 序列下
+		// 丢弃会静默丢失尾段内容），而不是吞掉 delta。
+		s.thinkingClosed = false
 	}
 	if !s.thinkingOpen {
 		s.closeOpenBlock(out) // 互斥：先关文本块
@@ -255,7 +276,9 @@ func (s *StreamState) closeThinking(out *bytes.Buffer) {
 
 func (s *StreamState) pushText(out *bytes.Buffer, delta string) {
 	if s.textClosed {
-		return
+		// 已关闭的文本块后续到文本：另开新块（Anthropic 允许任意多个 text 块；
+		// text → tool_calls → text 序列丢弃尾段等于静默丢内容）。
+		s.textClosed = false
 	}
 	if !s.textOpen {
 		s.closeOpenBlock(out)

@@ -327,3 +327,104 @@ func TestStreamMessageDeltaFullUsage(t *testing.T) {
 		t.Errorf("output_tokens=%v", u["output_tokens"])
 	}
 }
+
+// TestStreamGuardAfterMessageStop 终态守卫：message_stop 之后上游残留帧不得再产生事件。
+func TestStreamGuardAfterMessageStop(t *testing.T) {
+	st := NewStreamState()
+	st.HandleChunk(chatChunk(map[string]any{"content": "partial"}, ""))
+	if out := st.Failed(); len(out) == 0 {
+		t.Fatal("Failed must emit")
+	}
+	if out := st.HandleChunk(chatChunk(map[string]any{"content": "stray"}, "")); len(out) != 0 {
+		t.Errorf("chunks after message_stop must emit nothing, got %d bytes: %s", len(out), out)
+	}
+	if out := st.Finalize(); len(out) != 0 {
+		t.Errorf("Finalize after Failed must be nil: %s", out)
+	}
+}
+
+// TestStreamTextReopenAfterToolClose 文本 → 工具 → 再文本：尾段文本必须另开新块，
+// 不得静默丢弃（textClosed 后的 pushText 曾直接 return）。
+func TestStreamTextReopenAfterToolClose(t *testing.T) {
+	st := NewStreamState()
+	var raw []byte
+	raw = append(raw, st.HandleChunk(chatChunk(map[string]any{"content": "before"}, ""))...)
+	raw = append(raw, st.HandleChunk(chatChunk(map[string]any{"tool_calls": []any{
+		map[string]any{"index": 0, "id": "c1", "type": "function",
+			"function": map[string]any{"name": "Bash", "arguments": "{}"}},
+	}}, ""))...)
+	raw = append(raw, st.HandleChunk(chatChunk(map[string]any{"content": "after"}, "tool_calls"))...)
+	raw = append(raw, st.Finalize()...)
+
+	var text strings.Builder
+	blocks := 0
+	for _, e := range parseAnthropicSSE(t, raw) {
+		if e.event == "content_block_start" {
+			cb, _ := e.data["content_block"].(map[string]any)
+			if cb["type"] == "text" {
+				blocks++
+			}
+		}
+		if e.event == "content_block_delta" {
+			d, _ := e.data["delta"].(map[string]any)
+			if d["type"] == "text_delta" {
+				text.WriteString(d["text"].(string))
+			}
+		}
+	}
+	if text.String() != "beforeafter" {
+		t.Errorf("text=%q, want before+after (no silent drop)", text.String())
+	}
+	if blocks != 2 {
+		t.Errorf("text blocks=%d, want 2 (reopen as new block)", blocks)
+	}
+	// 所有 block index 严格递增且 content_block_stop 与 start 数量匹配
+	starts, stops := map[float64]bool{}, map[float64]bool{}
+	for _, e := range parseAnthropicSSE(t, raw) {
+		idx, _ := e.data["index"].(float64)
+		switch e.event {
+		case "content_block_start":
+			starts[idx] = true
+		case "content_block_stop":
+			stops[idx] = true
+		}
+	}
+	for idx := range starts {
+		if !stops[idx] {
+			t.Errorf("block %v started but never stopped", idx)
+		}
+	}
+	if len(starts) != len(stops) {
+		t.Errorf("starts=%d stops=%d", len(starts), len(stops))
+	}
+}
+
+// TestStreamFailedWithMessage 流内错误：error 事件携带上游原文，随后 message_delta
+// + message_stop 兜底收尾（幂等性不变）。
+func TestStreamFailedWithMessage(t *testing.T) {
+	st := NewStreamState()
+	var raw []byte
+	raw = append(raw, st.HandleChunk(chatChunk(map[string]any{"content": "partial"}, ""))...)
+	raw = append(raw, st.FailedWithMessage("upstream exploded", "api_error")...)
+	if extra := st.Failed(); extra != nil {
+		t.Errorf("Failed after FailedWithMessage must be nil")
+	}
+	events := parseAnthropicSSE(t, raw)
+	types := eventTypes(events)
+	found := false
+	for _, e := range events {
+		if e.event == "error" {
+			found = true
+			errObj, _ := e.data["error"].(map[string]any)
+			if errObj["message"] != "upstream exploded" || errObj["type"] != "api_error" {
+				t.Errorf("error event = %v", e.data)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("missing error event: %v", types)
+	}
+	if types[len(types)-2] != "message_delta" || types[len(types)-1] != "message_stop" {
+		t.Errorf("tail=%v, want ...message_delta,message_stop", types)
+	}
+}

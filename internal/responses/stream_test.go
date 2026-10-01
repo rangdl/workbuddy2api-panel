@@ -301,3 +301,61 @@ func TestStreamToolCallOutOfOrder(t *testing.T) {
 		t.Errorf("call_a (index 0) must be released before call_b (index 1)\n%s", out)
 	}
 }
+
+// TestStreamGuardAfterFailed 终态守卫：response.failed 之后上游残留帧不得再产生事件。
+func TestStreamGuardAfterFailed(t *testing.T) {
+	s := NewStreamState(nil)
+	s.HandleChunk(chunk(map[string]any{"content": "partial"}, "", nil))
+	if out := s.Failed("boom", "upstream_error"); len(out) == 0 {
+		t.Fatal("Failed must emit")
+	}
+	if out := s.HandleChunk(chunk(map[string]any{"content": "stray"}, "", nil)); len(out) != 0 {
+		t.Errorf("chunks after Failed must emit nothing, got %d bytes: %s", len(out), out)
+	}
+	if out := s.Finalize(); len(out) != 0 {
+		t.Errorf("Finalize after Failed must be nil: %s", out)
+	}
+}
+
+// TestStreamTruncatedStreamFails 截断防御：无 finish_reason 也无 [DONE] 的断流
+// 必须报 response.failed，不得谎报 completed。
+func TestStreamTruncatedStreamFails(t *testing.T) {
+	s := NewStreamState(nil)
+	var buf bytes.Buffer
+	buf.Write(s.HandleChunk(chunk(map[string]any{"content": "half text"}, "", nil)))
+	buf.Write(s.Finalize()) // 模拟上游断流后直接收尾
+	out := buf.String()
+	if !strings.Contains(out, "event: response.failed") {
+		t.Errorf("truncated stream must fail\n%s", out)
+	}
+	if !strings.Contains(out, "upstream_truncated") {
+		t.Errorf("missing truncated error type\n%s", out)
+	}
+	if strings.Contains(out, "event: response.completed") {
+		t.Errorf("truncated stream must not complete\n%s", out)
+	}
+}
+
+// TestStreamReasoningPersistedToToolItems 流式工具项必须携带 reasoning_content
+// （DeepSeek 系上游增量第二轮恢复 tool_call 时必需，否则 400）。
+func TestStreamReasoningPersistedToToolItems(t *testing.T) {
+	s := NewStreamState(nil)
+	var buf bytes.Buffer
+	buf.Write(s.HandleChunk(chunk(map[string]any{"reasoning_content": "先想一下"}, "", nil)))
+	buf.Write(s.HandleChunk(chunk(map[string]any{"tool_calls": []any{
+		map[string]any{"index": float64(0), "id": "call_1", "type": "function",
+			"function": map[string]any{"name": "shell", "arguments": "{}"}},
+	}}, "tool_calls", nil)))
+	buf.Write(s.Finalize())
+	items := s.OutputItems()
+	if len(items) != 2 {
+		t.Fatalf("items=%d (%v)", len(items), items)
+	}
+	fc, ok := items[1].(map[string]any)
+	if !ok || fc["type"] != "function_call" {
+		t.Fatalf("second item=%v", items[1])
+	}
+	if fc["reasoning_content"] != "先想一下" {
+		t.Errorf("reasoning_content=%v, want persisted", fc["reasoning_content"])
+	}
+}

@@ -52,6 +52,10 @@ type StreamState struct {
 	started      bool
 	completed    bool
 	outputItems  []map[string]any
+	// sawTerminalSource 报告流是否以合法方式结束（收到 [DONE] 或 finish_reason）。
+	// 两者都缺 = 上游在流中途断开（连接死亡/非正常终止），Finalize 不得谎报
+	// response.completed——残缺文本与截断的工具参数会被客户端当完整回合执行。
+	sawTerminalSource bool
 }
 
 // NewStreamState 构造流式转换状态机。toolCtx 用于把 Chat 工具名还原为
@@ -67,6 +71,12 @@ func NewStreamState(toolCtx *ToolContext) *StreamState {
 
 // HandleChunk 处理一个 Chat chunk，返回需要写出的 Responses 事件字节。
 func (s *StreamState) HandleChunk(chunk map[string]any) []byte {
+	// 终态守卫：response.failed/completed 已发出后，上游残留的后续帧（部分中转
+	// 在流内错误帧之后仍继续推 delta/usage）不得再产生任何事件——否则会在
+	// 终态事件之后追加 output_item/delta，构成非法事件流、打乱客户端解析。
+	if s.completed {
+		return nil
+	}
 	var out bytes.Buffer
 
 	if id := rawString(chunk, "id"); id != "" {
@@ -108,11 +118,17 @@ func (s *StreamState) HandleChunk(chunk map[string]any) []byte {
 	}
 	if fr := rawString(choice, "finish_reason"); fr != "" {
 		s.finishReason = fr
+		s.sawTerminalSource = true
 	}
 	return out.Bytes()
 }
 
 // Finalize 收尾：关闭所有打开的 item 并发 response.completed（幂等）。
+//
+// 截断防御：收尾前若从未见过 finish_reason（[DONE] 或 finish_reason 帧均缺席），
+// 说明上游在流中途断开——发 response.failed 而不是 response.completed，否则
+// 残缺文本/半截工具参数会被客户端当完整回合继续执行（如 codex 把截断的
+// arguments 直接交给 shell）。
 func (s *StreamState) Finalize() []byte {
 	if s.completed {
 		return nil
@@ -122,6 +138,14 @@ func (s *StreamState) Finalize() []byte {
 	s.finalizeReasoning(&out)
 	s.finalizeText(&out)
 	s.finalizeTools(&out)
+
+	// 上游异常断流（无任何 finish_reason）：如实报失败。
+	if !s.sawTerminalSource {
+		out.Write(sseEvent("response.failed", map[string]any{"response": s.failedResponse(
+			"upstream stream ended before finish_reason (truncated)", "upstream_truncated")}))
+		s.completed = true
+		return out.Bytes()
+	}
 
 	status := responseStatusFromFinishReason(s.finishReason)
 
@@ -380,7 +404,10 @@ func (s *StreamState) finalizeTools(out *bytes.Buffer) {
 			}))
 		}
 		arguments := state.arguments.String()
-		item := toolCallItem(callID, state.name, arguments, "", "completed", s.toolCtx)
+		// reasoning 紧邻附挂（与非流式 FromChat 同口径）：DeepSeek 系上游要求
+		// assistant 的 tool_call 携带 reasoning_content，否则增量第二轮
+		// previous_response_id 恢复后 400（codex 恒走流式，必须在此持久化）。
+		item := toolCallItem(callID, state.name, arguments, s.reasoningBuf.String(), "completed", s.toolCtx)
 		if s.isCustom(state.name) {
 			// custom 工具：收尾一次性发完整 input。
 			input := customToolInputFromArguments(arguments)
