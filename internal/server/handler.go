@@ -196,6 +196,7 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.ThirdPartyClient != nil {
 		h.mux.HandleFunc("POST /tp/v1/chat/completions", h.withAuth(h.thirdpartyChat))
 		h.mux.HandleFunc("POST /tp/v1/responses", h.withAuth(h.thirdpartyResponses))
+		h.mux.HandleFunc("POST /tp/v1/messages", h.withAuthAnthropic(h.thirdpartyAnthropicMessages))
 		h.mux.HandleFunc("GET /tp/v1/models", h.withAuth(h.thirdpartyModels))
 	}
 	// Trae 上游（/trae/v1/*）：与 /v1/*、/tp/v1/* 三者互不影响，同样由运行期开关控制。

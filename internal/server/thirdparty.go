@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/anthropic"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/responses"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/thirdparty"
@@ -275,4 +276,102 @@ func (h *Handler) thirdpartyRecordDelta(model, provider string, d pool.TokenUsag
 		TokensPerSecond:  tps,
 		HasTPS:           hasTPS,
 	}, d.HasTotalTokens || d.HasCompletionTokens || d.HasPromptTokens)
+}
+
+// thirdpartyAnthropicMessages 处理 POST /tp/v1/messages：Anthropic Messages → Chat
+// 转换后转发第三方上游，回程复用 anthropicWriter（Chat SSE → Anthropic SSE /
+// Chat JSON → Anthropic message）。与 h.anthropicMessages（/v1/messages）的差异：
+// 中间那段「内部调用 h.chatCompletions」换成「直连第三方上游」——协议转换、
+// 模型映射、错误形状全部照旧。
+func (h *Handler) thirdpartyAnthropicMessages(w http.ResponseWriter, r *http.Request) {
+	if !h.thirdpartyEnabled() {
+		writeAnthropicError(w, http.StatusNotFound, "not_found_error", "third-party upstream is disabled")
+		return
+	}
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error())
+		return
+	}
+	var peek struct {
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
+	}
+	_ = json.Unmarshal(raw, &peek)
+
+	p := h.thirdpartyConfig().ProviderForModel(peek.Model)
+	if p == nil {
+		writeAnthropicError(w, http.StatusNotFound, "not_found_error",
+			"no third-party provider serves model "+peek.Model+" (check third_party.json)")
+		return
+	}
+
+	// Anthropic → Chat + 模型映射（与 /v1/messages 同一套配置注入逻辑：
+	// anthropicCfg 为 nil 时跳过映射，模型名原样转发）。
+	chatBody, err := anthropic.ToChat(raw)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	if cfg := h.anthropicCfg.Load(); cfg != nil {
+		chatBody = applyAnthropicModelMap(chatBody, cfg)
+	}
+
+	st := newChatStat(time.Now(), chatBody, peek.Stream)
+	defer st.done()
+	st.uid = p.Name
+	st.nick = p.Name
+
+	rc, status, respBody, err := h.cfg.ThirdPartyClient.Chat(r.Context(), p, chatBody, peek.Stream)
+	if err != nil {
+		st.status = http.StatusBadGateway
+		writeAnthropicError(w, http.StatusBadGateway, "api_error", err.Error())
+		return
+	}
+	if status >= 400 {
+		shape := thirdparty.Classify(status, respBody)
+		st.status = shape.Status
+		writeAnthropicError(w, shape.Status, shape.Code, shape.Message)
+		return
+	}
+
+	// anthropicWriter 靠 dst 的 Content-Type 判定流式/非流式，故须在写入前设定。
+	aw := newAnthropicWriter(w)
+	if peek.Stream {
+		defer rc.Close()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		st.status = http.StatusOK
+		stats := newChatStatsReaderSince(rc, st.start)
+		buf := make([]byte, 8192)
+		for {
+			n, rerr := stats.Read(buf)
+			if n > 0 {
+				if _, werr := aw.Write(buf[:n]); werr != nil {
+					break
+				}
+				aw.Flush()
+			}
+			if rerr != nil {
+				break
+			}
+		}
+		st.ttfb = stats.TTFB()
+		if toks, ok := stats.Tokens(); ok {
+			st.toks = toks
+		}
+		aw.finish()
+		h.thirdpartyRecordDelta(st.model, p.Name, stats.Usage(), time.Since(st.start))
+		return
+	}
+
+	// 非流式：Chat 已读全响应体并关闭连接，rc 为 nil（勿再 Close）。
+	w.Header().Set("Content-Type", "application/json")
+	st.status = http.StatusOK
+	if _, err := aw.Write(respBody); err != nil {
+		st.status = http.StatusBadGateway
+		return
+	}
+	aw.finish()
+	st.toks = h.thirdpartyRecord(peek.Model, p.Name, respBody, time.Since(st.start))
 }
