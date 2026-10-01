@@ -109,14 +109,14 @@ type anthropicWriter struct {
 	headerSent bool
 	isSSE      *bool
 
-	// 流式状态机（A3 实现；A1 先缓冲——CC 非流式为主，流式路径在 A3 落地）。
+	sseState  *anthropic.StreamState
 	streamBuf bytes.Buffer
 
 	bodyBuf bytes.Buffer
 }
 
 func newAnthropicWriter(dst http.ResponseWriter) *anthropicWriter {
-	return &anthropicWriter{dst: dst}
+	return &anthropicWriter{dst: dst, sseState: anthropic.NewStreamState()}
 }
 
 func (w *anthropicWriter) Header() http.Header { return w.dst.Header() }
@@ -128,10 +128,47 @@ func (w *anthropicWriter) Write(p []byte) (int, error) {
 		w.detectMode()
 	}
 	if *w.isSSE {
-		// A3：流式实时转换。A1 阶段先缓冲整流，finish 时一次性转换。
-		return w.streamBuf.Write(p)
+		return w.writeSSE(p)
 	}
 	return w.bodyBuf.Write(p)
+}
+
+// writeSSE 逐块解析 Chat SSE 并实时转换为 Anthropic SSE（照抄 responsesWriter.writeSSE）。
+func (w *anthropicWriter) writeSSE(p []byte) (int, error) {
+	w.streamBuf.Write(p)
+	for {
+		block, ok := takeSSEBlock(&w.streamBuf)
+		if !ok {
+			break
+		}
+		if err := w.handleSSEBlock(block); err != nil {
+			return 0, err
+		}
+	}
+	return len(p), nil
+}
+
+func (w *anthropicWriter) handleSSEBlock(block string) error {
+	data := extractDataLine(block)
+	if data == "" {
+		return nil
+	}
+	if data == "[DONE]" {
+		return w.writeOut(w.sseState.Finalize())
+	}
+	var chunk map[string]any
+	if json.Unmarshal([]byte(data), &chunk) != nil {
+		return nil
+	}
+	if errObj, ok := chunk["error"].(map[string]any); ok {
+		msg, _ := errObj["message"].(string)
+		_ = msg
+		// 上游错误：以流内收尾事件告知 CC（stop_reason=end_turn），错误详情
+		// 由 message_delta 的 stop_reason 体现——CC 侧表现为正常结束的空消息。
+		// 更精确的错误传播需要 Anthropic 的 error SSE 事件，A5 增强。
+		return w.writeOut(w.sseState.Failed())
+	}
+	return w.writeOut(w.sseState.HandleChunk(chunk))
 }
 
 // Flush 实现 http.Flusher：流式下把已产生的 Anthropic 事件刷给客户端。
@@ -165,28 +202,25 @@ func (w *anthropicWriter) flushHeader() {
 // finish 在 chatCompletions 返回后调用：流式补收尾事件；非流式做整体转换。
 func (w *anthropicWriter) finish() {
 	if w.isSSE != nil && *w.isSSE {
-		w.finishStream()
+		// 上游未发 [DONE] 就断流（异常终止）：Finalize 幂等，补收尾。
+		_ = w.writeOut(w.sseState.Finalize())
 		return
 	}
 	w.finalizeNonStream()
 }
 
-// finishStream A1 过渡实现：把缓冲的 Chat SSE 聚合成一个 Chat 对象再整体转换。
-// A3 落地 StreamState 后替换为逐帧实时转换。
-func (w *anthropicWriter) finishStream() {
-	aggregated := aggregateChatSSE(w.streamBuf.Bytes())
-	if aggregated == nil {
-		// 上游流异常（无有效帧）：如实报错，不谎报成功。
-		w.flushHeader()
-		writeAnthropicError(w.dst, http.StatusBadGateway, "api_error", "upstream stream ended without data")
-		return
+func (w *anthropicWriter) writeOut(b []byte) error {
+	if len(b) == 0 {
+		return nil
 	}
-	msg, err := anthropic.FromChat(aggregated)
-	if err != nil {
-		writeAnthropicError(w.dst, http.StatusBadGateway, "api_error", err.Error())
-		return
+	w.flushHeader()
+	if _, err := w.dst.Write(b); err != nil {
+		return err
 	}
-	w.writeMessageJSON(http.StatusOK, msg)
+	if fl, ok := w.dst.(http.Flusher); ok {
+		fl.Flush()
+	}
+	return nil
 }
 
 func (w *anthropicWriter) finalizeNonStream() {
