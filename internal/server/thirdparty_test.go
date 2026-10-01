@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/thirdparty"
 )
 
@@ -228,5 +229,199 @@ func TestThirdPartyUpstreamError(t *testing.T) {
 	}
 	if !strings.Contains(body, "invalid_api_key") {
 		t.Fatalf("错误 code 未归一: %s", body)
+	}
+}
+
+// ---- /tp/v1/messages（Anthropic 协议接入第三方上游）----
+// 此前该端点零测试覆盖；model_map 跳过与错误枚举映射的回归都在这里锁定。
+
+// newTPAnthropicHandler 构造带第三方上游的 handler（沿用 newThirdPartyHandler，
+// 另设错误的 anthropic.json 映射，验证 /tp 不套用该映射）。
+func newTPAnthropicHandler(t *testing.T, upstreamURL string) *Handler {
+	t.Helper()
+	h := newThirdPartyHandler(t, upstreamURL)
+	h.SetAnthropicConfig(&AnthropicConfig{
+		Enabled:      true,
+		DefaultModel: "mapped-should-not-apply",
+		ModelMap:     map[string]string{"claude-sonnet-4-5": "mapped-should-not-apply"},
+	})
+	return h
+}
+
+// TestTPAnthropicNonStream 端到端：Anthropic 请求 → Chat → 第三方上游 → 回程
+// Anthropic message；model 原样透传（/tp 有意不套用 anthropicCfg 的模型映射）。
+func TestTPAnthropicNonStream(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-tp","object":"chat.completion","model":"fake-model",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"hello from tp"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	}))
+	defer srv.Close()
+
+	h := newTPAnthropicHandler(t, srv.URL)
+	req := httptest.NewRequest(http.MethodPost, "/tp/v1/messages",
+		strings.NewReader(`{"model":"fake-model","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("x-api-key", "k")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	// 上游收到的必须是 Chat 请求体，且 model 未被映射改写。
+	if gotBody["model"] != "fake-model" {
+		t.Errorf("上游 model = %v, want fake-model（/tp 不套用 anthropicCfg 映射）", gotBody["model"])
+	}
+	if _, ok := gotBody["max_tokens"]; !ok {
+		t.Errorf("max_tokens 未透传: %v", gotBody)
+	}
+	// 回程是 Anthropic message 形状。
+	var msg map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &msg); err != nil {
+		t.Fatalf("响应非 JSON: %s", rec.Body.String())
+	}
+	if msg["type"] != "message" || msg["role"] != "assistant" {
+		t.Fatalf("非 Anthropic message: %v", msg)
+	}
+	content, _ := msg["content"].([]any)
+	if len(content) == 0 {
+		t.Fatalf("空 content: %v", msg)
+	}
+	block, _ := content[0].(map[string]any)
+	if block["type"] != "text" || block["text"] != "hello from tp" {
+		t.Errorf("text block = %v", block)
+	}
+}
+
+// TestTPAnthropicStream 流式：Chat SSE → Anthropic SSE 六事件族收尾。
+func TestTPAnthropicStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		frames := []string{
+			"data: {\"id\":\"c1\",\"model\":\"fake-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"好\"}}]}\n\n",
+			"data: {\"id\":\"c1\",\"model\":\"fake-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+			"data: [DONE]\n\n",
+		}
+		for _, f := range frames {
+			_, _ = w.Write([]byte(f))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}))
+	defer srv.Close()
+
+	h := newTPAnthropicHandler(t, srv.URL)
+	req := httptest.NewRequest(http.MethodPost, "/tp/v1/messages",
+		strings.NewReader(`{"model":"fake-model","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("x-api-key", "k")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"} {
+		if !strings.Contains(body, "event: "+want) {
+			t.Errorf("缺事件 %s\n%s", want, body)
+		}
+	}
+	if !strings.Contains(body, `"text":"好"`) {
+		t.Errorf("缺文本增量\n%s", body)
+	}
+}
+
+// TestTPAnthropicUpstreamError 上游 4xx → Anthropic closed-enum error.type
+// （Classify 的 OpenAI 风格码不得直接当 error.type 发）。本测试同时走真实
+// x-api-key 鉴权（APIKey 非空时 VerifyAnthropic 不再短路放行），锁定中间件接线。
+func TestTPAnthropicUpstreamError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"bad upstream key"}}`))
+	}))
+	defer srv.Close()
+
+	h := newTPAnthropicHandler(t, srv.URL)
+	// 真实鉴权：Live 快照设 APIKey 后 VerifyAnthropic 不再空 key 短路放行，
+	// 顺带锁定 x-api-key 中间件接线（错误 key 必须 401）。
+	h.cfg.Live = livecfg.New(livecfg.Snapshot{APIKey: "sk-live-key"})
+	req := httptest.NewRequest(http.MethodPost, "/tp/v1/messages",
+		strings.NewReader(`{"model":"fake-model","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("x-api-key", "sk-live-key")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"authentication_error"`) {
+		t.Errorf("error.type 应为 Anthropic 枚举 authentication_error: %s", body)
+	}
+	if strings.Contains(body, "invalid_api_key") {
+		t.Errorf("OpenAI 风格码不得出现在 error.type: %s", body)
+	}
+	if !strings.Contains(body, "bad upstream key") {
+		t.Errorf("上游原文应透传: %s", body)
+	}
+
+	// 错误 key → 401（鉴权中间件真实生效）。
+	reqBad := httptest.NewRequest(http.MethodPost, "/tp/v1/messages",
+		strings.NewReader(`{"model":"fake-model","max_tokens":16,"messages":[]}`))
+	reqBad.Header.Set("x-api-key", "wrong-key")
+	recBad := httptest.NewRecorder()
+	h.ServeHTTP(recBad, reqBad)
+	if recBad.Code != http.StatusUnauthorized {
+		t.Errorf("错误 x-api-key 应 401, got %d", recBad.Code)
+	}
+	if !strings.Contains(recBad.Body.String(), "authentication_error") {
+		t.Errorf("鉴权错误形状应为 Anthropic 枚举: %s", recBad.Body.String())
+	}
+}
+
+// TestTPAnthropicUpstream429 429 → rate_limit_error（CC 据此做限流退避）。
+func TestTPAnthropicUpstream429(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"quota"}}`))
+	}))
+	defer srv.Close()
+
+	h := newTPAnthropicHandler(t, srv.URL)
+	req := httptest.NewRequest(http.MethodPost, "/tp/v1/messages",
+		strings.NewReader(`{"model":"fake-model","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("x-api-key", "k")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"rate_limit_error"`) {
+		t.Errorf("error.type 应为 rate_limit_error: %s", rec.Body.String())
+	}
+}
+
+// TestTPAnthropicUnknownModel 未命中 provider → 404 not_found_error。
+func TestTPAnthropicUnknownModel(t *testing.T) {
+	h := newThirdPartyHandler(t, "http://127.0.0.1:1")
+	req := httptest.NewRequest(http.MethodPost, "/tp/v1/messages",
+		strings.NewReader(`{"model":"unknown","max_tokens":16,"messages":[]}`))
+	req.Header.Set("x-api-key", "k")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"not_found_error"`) {
+		t.Errorf("error.type 应为 not_found_error: %s", rec.Body.String())
 	}
 }
