@@ -248,6 +248,15 @@ func (h *Handler) thirdpartyRecord(model, provider string, respBody []byte, elap
 	return completionTokens(resp)
 }
 
+// anthropicErrorType 把（HTTP 状态, 稳定 code）映射为 Anthropic error.type：
+// 状态优先（401/403/404/429/503 都有明确规范类），code 兜底。
+func anthropicErrorType(status int, code string) string {
+	if t := anthropic.StatusErrorType(status); t != "" {
+		return t
+	}
+	return anthropic.ErrorTypeForCode(code)
+}
+
 // thirdpartyRecordDelta 写入用量时序：realm 固定 "tp"、uid 用 provider 名，
 // 使面板「用量」视图能把第三方流量与 CodeBuddy 账号分账显示（不污染账号维度）。
 func (h *Handler) thirdpartyRecordDelta(model, provider string, d pool.TokenUsageDelta, elapsed time.Duration) {
@@ -282,7 +291,7 @@ func (h *Handler) thirdpartyRecordDelta(model, provider string, d pool.TokenUsag
 // 转换后转发第三方上游，回程复用 anthropicWriter（Chat SSE → Anthropic SSE /
 // Chat JSON → Anthropic message）。与 h.anthropicMessages（/v1/messages）的差异：
 // 中间那段「内部调用 h.chatCompletions」换成「直连第三方上游」——协议转换、
-// 模型映射、错误形状全部照旧。
+// 错误形状全部照旧；**模型映射有意跳过**（见函数内注释）。
 func (h *Handler) thirdpartyAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	if !h.thirdpartyEnabled() {
 		writeAnthropicError(w, http.StatusNotFound, "not_found_error", "third-party upstream is disabled")
@@ -306,15 +315,16 @@ func (h *Handler) thirdpartyAnthropicMessages(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Anthropic → Chat + 模型映射（与 /v1/messages 同一套配置注入逻辑：
-	// anthropicCfg 为 nil 时跳过映射，模型名原样转发）。
+	// Anthropic → Chat。**有意不套用 anthropicCfg 的 model_map/default_model**：
+	// /tp 的路由决策已按客户端请求的原始 model 选定第三方 provider
+	// （ProviderForModel(peek.Model)），随后再改写模型名会让路由与上游看到的
+	// model 脱钩——例：CC 请求 deepseek-chat 路由到声明该模型的 provider，却被
+	// default_model 改写成 glm-5.2 → 必然上游 404/400。第三方 provider 自己声明
+	// 了模型清单，改写只属于 /v1/messages（CodeBuddy 上游）。
 	chatBody, err := anthropic.ToChat(raw)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
-	}
-	if cfg := h.anthropicCfg.Load(); cfg != nil {
-		chatBody = applyAnthropicModelMap(chatBody, cfg)
 	}
 
 	st := newChatStat(time.Now(), chatBody, peek.Stream)
@@ -331,7 +341,10 @@ func (h *Handler) thirdpartyAnthropicMessages(w http.ResponseWriter, r *http.Req
 	if status >= 400 {
 		shape := thirdparty.Classify(status, respBody)
 		st.status = shape.Status
-		writeAnthropicError(w, shape.Status, shape.Code, shape.Message)
+		// Classify 的 code 是 OpenAI 风格码（invalid_api_key 等），不是 Anthropic
+		// closed enum——直接发会让 CC 当未知类型处理。按 HTTP 状态映射规范
+		// error.type（状态为主、code 兜底）。
+		writeAnthropicError(w, shape.Status, anthropicErrorType(status, shape.Code), shape.Message)
 		return
 	}
 

@@ -317,7 +317,7 @@ func TestToolInputBadJSONFallback(t *testing.T) {
 // ---- 错误形状 ----
 
 func TestErrorToMessages(t *testing.T) {
-	out := ErrorToMessages([]byte(`{"error":{"message":"boom","type":"invalid_request_error","code":"x"}}`))
+	out := ErrorToMessages([]byte(`{"error":{"message":"boom","type":"invalid_request_error","code":"x"}}`), 0)
 	if out["type"] != "error" {
 		t.Errorf("envelope=%v", out)
 	}
@@ -326,10 +326,58 @@ func TestErrorToMessages(t *testing.T) {
 		t.Errorf("error=%v", errObj)
 	}
 	// 非 JSON 体 → api_error 原文。
-	out = ErrorToMessages([]byte(`plain gateway text`))
+	out = ErrorToMessages([]byte(`plain gateway text`), 0)
 	errObj, _ = out["error"].(map[string]any)
 	if errObj["type"] != "api_error" {
 		t.Errorf("plain body type=%v", errObj["type"])
+	}
+}
+
+// TestErrorToMessagesStatusFirst HTTP 状态是 error.type 的第一判定键：网关自家
+// 429 错误体写的是 type=api_error + code=rate_limit_exceeded，必须按状态映射为
+// rate_limit_error（CC 据此做限流退避；此前只看字符串恒报 api_error）。
+func TestErrorToMessagesStatusFirst(t *testing.T) {
+	body := []byte(`{"error":{"message":"rate limited: all accounts are cooling down","type":"api_error","code":"rate_limit_exceeded"}}`)
+	out := ErrorToMessages(body, 429)
+	errObj, _ := out["error"].(map[string]any)
+	if errObj["type"] != "rate_limit_error" {
+		t.Errorf("429 type=%v, want rate_limit_error", errObj["type"])
+	}
+	// 503（no_healthy_account）→ overloaded_error。
+	out = ErrorToMessages([]byte(`{"error":{"message":"no healthy account","type":"api_error","code":"no_healthy_account"}}`), 503)
+	errObj, _ = out["error"].(map[string]any)
+	if errObj["type"] != "overloaded_error" {
+		t.Errorf("503 type=%v, want overloaded_error", errObj["type"])
+	}
+	// 401 → authentication_error。
+	out = ErrorToMessages([]byte(`{"error":{"message":"bad key","type":"api_error","code":"invalid_api_key"}}`), 401)
+	errObj, _ = out["error"].(map[string]any)
+	if errObj["type"] != "authentication_error" {
+		t.Errorf("401 type=%v, want authentication_error", errObj["type"])
+	}
+	// 状态未知（0）时保留上游自带的 Anthropic 规范 type；OpenAI 型 type 走字符串映射。
+	out = ErrorToMessages([]byte(`{"error":{"message":"m","type":"invalid_request_error"}}`), 0)
+	errObj, _ = out["error"].(map[string]any)
+	if errObj["type"] != "invalid_request_error" {
+		t.Errorf("passthrough type=%v", errObj["type"])
+	}
+}
+
+// TestErrorTypeForCode Classify 风格稳定 code → Anthropic closed enum。
+func TestErrorTypeForCode(t *testing.T) {
+	cases := map[string]string{
+		"invalid_api_key":     "authentication_error",
+		"permission_denied":   "permission_error",
+		"model_not_found":     "not_found_error",
+		"rate_limit_exceeded": "rate_limit_error",
+		"invalid_request":     "invalid_request_error",
+		"upstream_error":      "api_error",
+		"whatever":            "api_error",
+	}
+	for code, want := range cases {
+		if got := ErrorTypeForCode(code); got != want {
+			t.Errorf("ErrorTypeForCode(%q)=%q, want %q", code, got, want)
+		}
 	}
 }
 
@@ -407,7 +455,7 @@ func TestToolChoiceMapping(t *testing.T) {
 		{`{"type":"none"}`, "none"},
 	}
 	for _, c := range cases {
-		out := mustToChat(t, `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}],"tool_choice":` + c.in + `}`)
+		out := mustToChat(t, `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}],"tool_choice":`+c.in+`}`)
 		if out["tool_choice"] != c.want {
 			t.Errorf("%s → %v, want %v", c.in, out["tool_choice"], c.want)
 		}

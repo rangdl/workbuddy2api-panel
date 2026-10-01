@@ -162,11 +162,10 @@ func (w *anthropicWriter) handleSSEBlock(block string) error {
 	}
 	if errObj, ok := chunk["error"].(map[string]any); ok {
 		msg, _ := errObj["message"].(string)
-		_ = msg
-		// 上游错误：以流内收尾事件告知 CC（stop_reason=end_turn），错误详情
-		// 由 message_delta 的 stop_reason 体现——CC 侧表现为正常结束的空消息。
-		// 更精确的错误传播需要 Anthropic 的 error SSE 事件，A5 增强。
-		return w.writeOut(w.sseState.Failed())
+		// 上游错误：发规范流内 error 事件（含上游原文）+ message_delta/message_stop
+		// 收尾——CC 收到 error 事件会向用户展示错误并停止重试解析，而不是把
+		// 这个回合渲染成 completed-but-empty 的空消息（A5 增强落地）。
+		return w.writeOut(w.sseState.FailedWithMessage(msg, "api_error"))
 	}
 	return w.writeOut(w.sseState.HandleChunk(chunk))
 }
@@ -232,12 +231,17 @@ func (w *anthropicWriter) finalizeNonStream() {
 
 	var parsed map[string]any
 	if json.Unmarshal(body, &parsed) != nil {
-		writeAnthropicError(w.dst, status, "api_error", string(body))
+		// 非 JSON 200 体按 502 处理：把上游原文塞进 200 会让 CC 当合法消息解析失败。
+		respStatus := status
+		if respStatus < 400 {
+			respStatus = http.StatusBadGateway
+		}
+		writeAnthropicError(w.dst, respStatus, "api_error", string(body))
 		return
 	}
 	if _, hasErr := parsed["error"]; hasErr {
 		w.flushHeader()
-		writeJSON(w.dst, status, anthropic.ErrorToMessages(body))
+		writeJSON(w.dst, status, anthropic.ErrorToMessages(body, status))
 		return
 	}
 	msg, err := anthropic.FromChat(parsed)
