@@ -15,6 +15,29 @@ import (
 // bearerPrefix 认证方案前缀（大小写敏感，与 HTTP 规范及既有实现一致）。
 const bearerPrefix = "Bearer "
 
+// VerifyAnthropic 校验 Anthropic 协议的 API 密钥：CC 客户端发 x-api-key 头
+// （部分代理形态也发 Authorization: Bearer），两者任一命中即放行。
+//
+// key 为空表示"未启用鉴权"，恒返回 true（与 VerifyBearer 同语义）。
+// 两条路径都做一次摘要比较（无论命中与否），保持耗时形状一致——
+// 与 VerifyBearer 的常量时间口径相同（SHA-256 摘要 + ConstantTimeCompare）。
+func VerifyAnthropic(r *http.Request, key string) bool {
+	if key == "" {
+		return true
+	}
+	if tok := r.Header.Get("x-api-key"); tok != "" {
+		return subtle.ConstantTimeCompare(digest(tok), digest(key)) == 1
+	}
+	// 无 x-api-key 时回落到 Bearer 校验（沿用 VerifyBearer 的耗时形状）。
+	authz := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authz, bearerPrefix) {
+		subtle.ConstantTimeCompare(digest(""), digest(key))
+		return false
+	}
+	tok := authz[len(bearerPrefix):]
+	return subtle.ConstantTimeCompare(digest(tok), digest(key)) == 1
+}
+
 // VerifyBearer 校验请求头是否携带正确的 Bearer 密钥。
 //
 // key 为空表示"未启用鉴权"，恒返回 true（调用方据此放行）。

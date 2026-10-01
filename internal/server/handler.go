@@ -71,6 +71,10 @@ type Config struct {
 	// 定义在 responses.go（同包），避免污染上游 Config 字段语义。
 	Responses *ResponsesConfig
 
+	// Anthropic Anthropic Messages 端点配置（可选；nil 或 Enabled=false 时不注册 /v1/messages）。
+	// 定义在 anthropic.go（同包）。Claude Code 等客户端接入用。
+	Anthropic *AnthropicConfig
+
 	// ThirdParty 第三方 OpenAI 兼容上游配置（可选；nil 或 Enabled=false 时不注册 /tp/ 路由）。
 	// 与 CodeBuddy 链路完全隔离：不进账号池、不套用冷却/脱敏/提示词改写。
 	// 定义在 internal/thirdparty（独立包），实现见 thirdparty.go（同包）。
@@ -134,6 +138,9 @@ type Handler struct {
 	// responses Responses 端点配置（运行期可原子替换：面板保存 responses.json 后
 	// 热重载，无需重启）。nil 或 Enabled=false 时 /v1/responses 返回 404。
 	responsesCfg atomic.Pointer[ResponsesConfig]
+	// anthropicCfg Anthropic Messages 端点配置（运行期可原子替换：面板保存
+	// anthropic.json 后热重载）。nil 或 Enabled=false 时 /v1/messages 返回 404。
+	anthropicCfg atomic.Pointer[AnthropicConfig]
 	// thirdpartyCfg 第三方上游配置（运行期可原子替换：面板保存 third_party.json 后
 	// 热重载，无需重启）。nil 或 Enabled=false 时 /tp/v1/* 返回 404。
 	thirdpartyCfg atomic.Pointer[thirdparty.Config]
@@ -164,6 +171,7 @@ func NewHandler(cfg Config) *Handler {
 		h.traeCool = trae.NewCooldowns()
 	}
 	h.responsesCfg.Store(cfg.Responses)
+	h.anthropicCfg.Store(cfg.Anthropic)
 	h.thirdpartyCfg.Store(cfg.ThirdParty)
 	h.traeCfg.Store(cfg.Trae)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
@@ -171,6 +179,12 @@ func NewHandler(cfg Config) *Handler {
 	// 以便面板热切换启用/禁用；disabled 时返回 404）。
 	if cfg.Responses != nil {
 		h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
+	}
+	// Anthropic Messages（/v1/messages，Claude Code）：同 Responses 模式——
+	// 注入配置即注册路由，enabled 开关运行期判断。
+	// 鉴权用 withAuthAnthropic（CC 发 x-api-key 而非 Authorization Bearer）。
+	if cfg.Anthropic != nil {
+		h.mux.HandleFunc("POST /v1/messages", h.withAuthAnthropic(h.anthropicMessages))
 	}
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -204,6 +218,11 @@ func (h *Handler) SetResponsesConfig(cfg *ResponsesConfig) {
 		cfg.Store = old.Store
 	}
 	h.responsesCfg.Store(cfg)
+}
+
+// SetAnthropicConfig 运行期替换 Anthropic Messages 配置（面板保存 anthropic.json 后热重载）。
+func (h *Handler) SetAnthropicConfig(cfg *AnthropicConfig) {
+	h.anthropicCfg.Store(cfg)
 }
 
 // SetThirdPartyConfig 运行期替换第三方上游配置（面板保存 third_party.json 后热重载）。
@@ -241,6 +260,19 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return
+		}
+		next(w, r)
+	}
+}
+
+// withAuthAnthropic Anthropic 端点的鉴权中间件：CC 客户端发 x-api-key
+// （不发 Authorization），两者任一命中即放行（httpauth.VerifyAnthropic）。
+func (h *Handler) withAuthAnthropic(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !httpauth.VerifyAnthropic(r, h.loadLive().APIKey) {
+			// Anthropic 鉴权错误形状（{"type":"error",...}），非 OpenAI 形状。
+			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key")
 			return
 		}
 		next(w, r)

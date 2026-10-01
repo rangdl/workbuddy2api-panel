@@ -350,6 +350,9 @@ func main() {
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 		Responses:     loadResponsesConfig(*cfgPath),
+		// Anthropic Messages（/v1/messages，Claude Code）：默认禁用（anthropic.json
+		// 不存在即不注册路由），与 Responses 的默认启用相反——新增能力不改变既有部署行为面。
+		Anthropic: loadAnthropicConfig(*cfgPath),
 		// 第三方上游（/tp/v1/*）：独立于账号池链路。客户端非 nil 即注册路由，
 		// enabled 开关由 handler 运行期判断（面板可热启用，无需重启）。
 		ThirdParty:       tpCfg,
