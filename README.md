@@ -586,11 +586,13 @@ http://127.0.0.1:7863/panel/
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/messages` | `x-api-key` / Bearer | **Anthropic Messages 协议接入**（Claude Code）：Anthropic → Chat 转发，回程投影回 Anthropic（含工具/思考块/SSE 六事件族）；仅在启用时可用（见「Anthropic / Claude Code 接入」，默认禁用） |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 | `POST /tp/v1/chat/completions` | Bearer | **第三方上游**（OpenAI 兼容）转发；流式/非流式；仅在启用第三方时可用（否则 404） |
 | `POST /tp/v1/responses` | Bearer | 第三方上游的 Responses 协议接入（内部转为 Chat 转发，回程投影回 Responses） |
+| `POST /tp/v1/messages` | `x-api-key` / Bearer | 第三方上游的 Anthropic Messages 协议接入（Claude Code 直连第三方；内部转为 Chat 转发，回程投影回 Anthropic） |
 | `GET /tp/v1/models` | Bearer | 第三方上游模型列表（来自 `third_party.json` 的 `models` 声明） |
 | `POST /trae/v1/chat/completions` | Bearer | **Trae 上游**：OpenAI Chat → `llm_utils_chat`，回程 SOLO SSE → OpenAI |
 | `POST /trae/v1/responses` | Bearer | Trae 上游的 Responses 协议接入（Chat 中转 + 回程投影） |
@@ -713,6 +715,52 @@ http://127.0.0.1:7863/panel/
 ### 面板
 
 「上游接入」页支持增删改上游、启用开关、逐条「测试连接」（向该上游发一条 `max_tokens=16` 的最小请求），保存后**热生效**，无需重启。
+
+## 🤖 Anthropic / Claude Code 接入
+
+Claude Code CLI / Claude Desktop 讲 Anthropic Messages 协议（`/v1/messages`），与 OpenAI 系协议不互通。网关内置双向转换（Anthropic → Chat 转发，回程投影回 Anthropic），支持：
+
+- 纯文本对话（流式/非流式）、多模态图片（base64/URL）；
+- 工具全链路：`tools` 声明、assistant `tool_use` ↔ Chat `tool_calls`、`tool_result` → tool 消息（并行回喂）、`tool_choice` 四态；
+- 思维链：`thinking` 块 ↔ `reasoning_content`（含 `redacted_thinking` 占位）、`thinking.budget_tokens` → `reasoning_effort`；
+- Anthropic SSE 六事件族（`message_start` → `content_block_*` → `message_delta` → `message_stop`），`message_delta` 严格单发（重复会导致 Claude Code 中断连接）；
+- usage 缓存桶换算（`input = prompt − cached − cache_write`，防双计）。
+
+### 配置（`anthropic.json`，与 `config.json` 同目录）
+
+```json
+{
+  "enabled": true,
+  "model_map": {
+    "claude-sonnet-4-5": "glm-5.2"
+  },
+  "default_model": ""
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `enabled` | 是否响应 `/v1/messages`。**默认禁用**（文件不存在即不注册路由，不影响既有部署；也可用环境变量 `WB2A_ANTHROPIC_ENABLED=true`） |
+| `model_map` | Claude 客户端模型名 → 上游模型名（与 `responses.json` 的 `model_map` 同机制） |
+| `default_model` | 未命中映射时的回落模型（空 = 不改写） |
+
+### Claude Code 接入步骤
+
+```bash
+export ANTHROPIC_BASE_URL="http://<主机>:<端口>"   # 根路径即可（/v1/messages 由网关路由）
+export ANTHROPIC_API_KEY="<网关 api_key>"          # 走 x-api-key 头，也兼容 Bearer
+export ANTHROPIC_MODEL="claude-sonnet-4-5"        # 需在 model_map 里映射到上游模型
+claude
+```
+
+第三方上游场景：把 `ANTHROPIC_BASE_URL` 指向 `http://<主机>:<端口>/tp` 即走 `/tp/v1/messages`（直连第三方 provider，模型映射同上）。
+
+### 行为边界
+
+- 上游 server 工具（`web_search_*` 等 Anthropic 托管工具）会被丢弃——Chat 上游无法执行服务端工具（与 Responses 侧 web_search 同口径）；
+- `document`（PDF）块暂不支持（CodeBuddy 未验证 file 形态）；
+- `cache_control` 块级标记被剥离（Chat 上游无对应语义；prompt cache 由上游自动管理）；
+- CC 会话粘性（`metadata.user_id` 提取）为后续增强项。
 
 ## 🚂 Trae 上游（协议层已实现）
 
