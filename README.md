@@ -561,7 +561,7 @@ http://127.0.0.1:7863/panel/
 | **添加账号**（顶部按钮） | 浏览器内完成 OAuth 设备授权（显示授权链接 + 自动轮询），登录后凭证落盘并**热加载进池，免重启** |
 | **积分任务**（账号行内「任务」按钮） | 展示全部任务（进度 / 奖励分数与能量 / 状态）；「全部接受」批量报名；「一键完成」覆盖 **17 个任务**（推进进度 + 异步计分等待 + **自动领奖**，幂等可重复点）；其余任务展示操作指引 |
 | **模型与档位** | 实时查询上游：每模型的积分倍率、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；若存在探测数据，最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」） |
-| **配置** | 在线编辑 config.json：API 密钥、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关；同页含 **Responses / Codex 接入**（独立 `responses.json`） |
+| **配置** | 在线编辑 config.json：API 密钥、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关；同页含 **Responses / Codex 接入**（独立 `responses.json`）与 **Anthropic / Claude Code 接入**（独立 `anthropic.json`） |
 | **上游接入** | 第三方 OpenAI 兼容上游的增删改（名称 / 接口地址 / API Key / 模型列表 / 超时）、启用开关、逐条「测试连接」；保存后热生效。同页展示 Trae 接入的规划状态 |
 | **运行日志** | 最近 500 行服务日志 + 请求表格日志（可开关自动滚动） |
 
@@ -726,7 +726,9 @@ Claude Code CLI / Claude Desktop 讲 Anthropic Messages 协议（`/v1/messages`�
 - Anthropic SSE 六事件族（`message_start` → `content_block_*` → `message_delta` → `message_stop`），`message_delta` 严格单发（重复会导致 Claude Code 中断连接）；
 - usage 缓存桶换算（`input = prompt − cached − cache_write`，防双计）。
 
-### 配置（`anthropic.json`，与 `config.json` 同目录）
+### 配置（`anthropic.json`，与 `config.json` 同目录；推荐直接用面板「配置」页）
+
+面板「配置」页含 **Anthropic / Claude Code 接入** 卡片（与 Responses / Codex 接入同款交互：启用开关 + 模型映射拖拽排序 + 默认模型），保存后**热生效**，无需重启。
 
 ```json
 {
@@ -740,7 +742,7 @@ Claude Code CLI / Claude Desktop 讲 Anthropic Messages 协议（`/v1/messages`�
 
 | 字段 | 说明 |
 |---|---|
-| `enabled` | 是否响应 `/v1/messages`。**默认禁用**（文件不存在即不注册路由，不影响既有部署；也可用环境变量 `WB2A_ANTHROPIC_ENABLED=true`） |
+| `enabled` | 是否响应 `/v1/messages`。**默认禁用**（面板开关或环境变量 `WB2A_ANTHROPIC_ENABLED=true` 可启用） |
 | `model_map` | Claude 客户端模型名 → 上游模型名（与 `responses.json` 的 `model_map` 同机制） |
 | `default_model` | 未命中映射时的回落模型（空 = 不改写） |
 

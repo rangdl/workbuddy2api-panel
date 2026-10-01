@@ -924,6 +924,28 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </div>
         </div>
 
+        <div class="box" id="anthBox">
+          <header><h3>Anthropic / Claude Code 接入</h3><span class="grow"></span><span class="note" id="anthPath"></span></header>
+          <div class="pad">
+            <div class="switch"><span class="lb">启用 /v1/messages</span>
+              <input type="checkbox" id="anthEnabled"></div>
+            <div class="fld"><span class="lb">默认模型（未命中映射时回落）</span>
+              <input id="anthDefaultModel" placeholder="留空 = 不改写模型名">
+              <span class="hint">Claude Code 未在映射里的模型名走此项；留空则原样透传</span></div>
+            <div class="fld"><span class="lb">模型映射（左：Claude 模型名 → 右：上游模型名）</span>
+              <div id="anthMapRows" style="display:flex;flex-direction:column;gap:6px;margin:6px 0"></div>
+              <button type="button" class="xs" id="btnAnthAddRow">+ 添加映射</button>
+              <span class="hint">右侧留空 = 不改写该模型；已默认列出 Claude Code 常用模型</span></div>
+            <div class="hint" style="margin-top:10px">CC 侧设置 ANTHROPIC_BASE_URL=http://&lt;主机&gt;:&lt;端口&gt;、ANTHROPIC_API_KEY=网关密钥。保存后立即生效（热重载，无需重启）。</div>
+          </div>
+          <div class="savebar">
+            <span class="grow"></span>
+            <span class="restart-note" id="anthNote"></span>
+            <button type="button" id="btnAnthReload">放弃修改</button>
+            <button type="button" class="primary" id="btnAnthSave">保存 Anthropic 配置</button>
+          </div>
+        </div>
+
         <div class="savebar">
           <span class="grow"></span>
           <span class="restart-note" id="cfgNote"></span>

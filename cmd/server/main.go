@@ -289,12 +289,22 @@ func main() {
 		ConfigPath: *cfgPath,
 		// Responses / Codex 接入配置页：读写独立的 responses.json。
 		ResponsesPath: responsesConfigPath(*cfgPath),
+		// Anthropic / Claude Code 接入配置页：读写独立的 anthropic.json。
+		AnthropicPath: anthropicConfigPath(*cfgPath),
 		// 保存后热重载：重读文件并原子替换 handler 的 Responses 配置（无需重启）。
 		ReloadResponses: func() error {
 			if handlerRef == nil {
 				return nil
 			}
 			handlerRef.SetResponsesConfig(loadResponsesConfig(*cfgPath))
+			return nil
+		},
+		// Anthropic 配置热重载（同 Responses 模式）。
+		ReloadAnthropic: func() error {
+			if handlerRef == nil {
+				return nil
+			}
+			handlerRef.SetAnthropicConfig(loadAnthropicConfig(*cfgPath))
 			return nil
 		},
 		// 第三方上游「上游接入」页：读写独立的 third_party.json。

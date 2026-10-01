@@ -74,6 +74,13 @@ type Config struct {
 	// 原子替换 handler 的 Responses 配置）。nil = 不热重载（需重启生效）。
 	ReloadResponses func() error
 
+	// AnthropicPath anthropic.json 路径（面板「Anthropic / Claude Code 接入」配置页
+	// 读写用；空 = 不提供该接口）。
+	AnthropicPath string
+	// ReloadAnthropic 保存 anthropic.json 后触发热重载（由 main 注入：重读文件并
+	// 原子替换 handler 的 Anthropic 配置）。nil = 不热重载（需重启生效）。
+	ReloadAnthropic func() error
+
 	// ThirdPartyPath third_party.json 路径（面板「上游接入」页读写用；
 	// 空 = 不提供该接口）。独立于 ConfigPath，不并入主配置表单。
 	ThirdPartyPath string
@@ -216,6 +223,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 	p.mux.HandleFunc("GET /panel/api/responses_config", p.withAuth(p.getResponsesConfig))
 	p.mux.HandleFunc("POST /panel/api/responses_config", p.withAuth(p.saveResponsesConfig))
+	p.mux.HandleFunc("GET /panel/api/anthropic_config", p.withAuth(p.getAnthropicConfig))
+	p.mux.HandleFunc("POST /panel/api/anthropic_config", p.withAuth(p.saveAnthropicConfig))
 	p.mux.HandleFunc("GET /panel/api/thirdparty_config", p.withAuth(p.getThirdPartyConfig))
 	p.mux.HandleFunc("POST /panel/api/thirdparty_config", p.withAuth(p.saveThirdPartyConfig))
 	p.mux.HandleFunc("POST /panel/api/thirdparty_test", p.withAuth(p.testThirdPartyProvider))

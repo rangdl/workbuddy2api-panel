@@ -179,7 +179,7 @@ function go(v) {
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
-  if (v === 'config') { loadConfig(); loadResponsesConfig(); }
+  if (v === 'config') { loadConfig(); loadResponsesConfig(); loadAnthropicConfig(); }
   if (v === 'upstream') { loadThirdPartyConfig(); loadTraeConfig(); }
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
@@ -2496,3 +2496,57 @@ async function loadPackages() {
 }
 
 if ($('btnPk')) $('btnPk').onclick = loadPackages;
+
+/* ── Anthropic / Claude Code 接入（独立 anthropic.json，模式同 Responses 配置） ── */
+async function loadAnthropicConfig() {
+  try {
+    const d = await api('anthropic_config');
+    const c = d.config || {};
+    $('anthPath').textContent = d.path || '';
+    $('anthEnabled').checked = c.enabled === true; // 默认禁用（与 Responses 相反）
+    $('anthDefaultModel').value = c.default_model || '';
+    renderAnthMapRows(c.model_map || {}, d.claude_models || []);
+    $('anthNote').textContent = '';
+  } catch (e) { /* 后端未提供该接口时静默 */ }
+}
+/* 模型映射行：与 Responses 页同一套拖拽行组件（respMapRow），仅容器与占位符不同。 */
+function renderAnthMapRows(modelMap, claudeModels) {
+  const box = $('anthMapRows');
+  box.innerHTML = '';
+  const entries = Object.entries(modelMap);
+  if (entries.length === 0) {
+    for (const m of claudeModels) box.append(respMapRow(m, ''));
+  } else {
+    for (const [k, v] of entries) box.append(respMapRow(k, v));
+  }
+  // respMapRow 的占位符面向 codex 场景；Anthropic 行覆写占位提示。
+  for (const row of box.children) {
+    const k = row.querySelector('.resp-map-key');
+    const v = row.querySelector('.resp-map-val');
+    if (k) k.placeholder = 'Claude 模型名（如 claude-sonnet-4-5）';
+    if (v) v.placeholder = '上游模型名（如 glm-5.2）';
+  }
+}
+function collectAnthModelMap() {
+  const map = {};
+  for (const row of $('anthMapRows').children) {
+    const k = row.querySelector('.resp-map-key').value.trim();
+    const v = row.querySelector('.resp-map-val').value.trim();
+    if (k && v) map[k] = v;
+  }
+  return map;
+}
+$('btnAnthAddRow').onclick = () => $('anthMapRows').append(respMapRow('', ''));
+$('btnAnthReload').onclick = loadAnthropicConfig;
+$('btnAnthSave').onclick = async () => {
+  const btn = $('btnAnthSave');
+  const cfg = { enabled: $('anthEnabled').checked, model_map: collectAnthModelMap(), default_model: $('anthDefaultModel').value.trim() };
+  btn.disabled = true; btn.textContent = '保存中…';
+  try {
+    const r = await api('anthropic_config', { method: 'POST', body: JSON.stringify(cfg) });
+    const n = (r.restart_required || []).length;
+    toast(n ? 'Anthropic 配置已保存，部分项需重启生效' : 'Anthropic 配置已保存并立即生效', 'ok');
+    loadAnthropicConfig();
+  } catch (e) { toast('保存失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '保存 Anthropic 配置'; }
+};
