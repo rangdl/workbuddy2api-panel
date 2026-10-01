@@ -752,7 +752,9 @@ Claude Code CLI / Claude Desktop 讲 Anthropic Messages 协议（`/v1/messages`�
 ### Claude Code 接入步骤
 
 ```bash
-export ANTHROPIC_BASE_URL="http://<主机>:<端口>"   # 根路径即可（/v1/messages 由网关路由）
+export ANTHROPIC_BASE_URL="http://<主机>:<端口>"   # 不要带 /v1 结尾！CC 会自己拼 /v1/messages，
+                                                  # 带 /v1 会双拼成 /v1/v1/messages（网关已容错，
+                                                  # 但第三方直连 /tp 场景需对应写 /tp）
 export ANTHROPIC_API_KEY="<网关 api_key>"          # 走 x-api-key 头，也兼容 Bearer
 export ANTHROPIC_MODEL="claude-sonnet-4-5"        # 需在 model_map 里映射到上游模型
 claude

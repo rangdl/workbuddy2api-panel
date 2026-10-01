@@ -189,8 +189,13 @@ func NewHandler(cfg Config) *Handler {
 	// Anthropic Messages（/v1/messages，Claude Code）：同 Responses 模式——
 	// 注入配置即注册路由，enabled 开关运行期判断。
 	// 鉴权用 withAuthAnthropic（CC 发 x-api-key 而非 Authorization Bearer）。
+	// /v1/v1/messages 是 CC 把 base_url 配成带 /v1 结尾时的双拼路径
+	// （CC 恒在 base_url 后追加 /v1/messages；实测 2.1.286 确认）——注册同
+	// handler 容错，避免这类配置报 404 page not found 且 CC 显示为
+	// model_not_found 误导排障。
 	if cfg.Anthropic != nil {
 		h.mux.HandleFunc("POST /v1/messages", h.withAuthAnthropic(h.anthropicMessages))
+		h.mux.HandleFunc("POST /v1/v1/messages", h.withAuthAnthropic(h.anthropicMessages))
 	}
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))

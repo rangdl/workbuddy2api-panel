@@ -212,3 +212,23 @@ func TestAnthropicUpstreamError(t *testing.T) {
 		t.Errorf("message=%v", errObj["message"])
 	}
 }
+
+// 双拼路径容错：CC 把 base_url 配成带 /v1 结尾时实际请求 /v1/v1/messages
+// （CC 恒在 base_url 后追加 /v1/messages，2.1.286 实测）。同 handler 响应，
+// 避免 404 page not found 被 CC 显示为 model_not_found 误导排障。
+func TestAnthropicDoubleSlashRoute(t *testing.T) {
+	h := anthropicTestHandler(t, func(authz string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	req := httptest.NewRequest("POST", "/v1/v1/messages", strings.NewReader(anthropicRequestBody))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var resp map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp["type"] != "message" {
+		t.Errorf("envelope=%v", resp)
+	}
+}
