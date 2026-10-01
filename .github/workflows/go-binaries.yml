@@ -35,7 +35,20 @@ jobs:
         with:
           go-version-file: go.mod
       # ubuntu runner 自带 node → panel 包的 JS 运行时冒烟测试（TestAppJSTopLevelSmoke）会真实执行
-      - run: go test ./...
+      # 质量门禁三件套：vet（静态缺陷）→ gofmt（格式漂移即失败）→ -race
+      # （本项目历史缺陷首类是并发竞态，race 检测器必须常开；纯 CI 时长换正确性）。
+      - name: go vet
+        run: go vet ./...
+      - name: gofmt check
+        run: |
+          UNFMT=$(gofmt -l . | grep -v -e '^third_party' -e '^vendor' || true)
+          if [ -n "$UNFMT" ]; then
+            echo "::error::gofmt drift in: $UNFMT"
+            echo "$UNFMT" | while read -r f; do gofmt -d "$f"; done
+            exit 1
+          fi
+      - name: go test (race)
+        run: go test -race ./...
 
   build:
     needs: test
