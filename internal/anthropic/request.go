@@ -55,6 +55,16 @@ func ToChat(body []byte) ([]byte, error) {
 	// thinking → reasoning_effort（见 applyThinking）。
 	applyThinking(out, req)
 
+	// tools / tool_choice（A2；映射规则见 toolsToChat / toolChoiceToChat）。
+	if tools, ok := req["tools"].([]any); ok {
+		if chatTools := toolsToChat(tools); len(chatTools) > 0 {
+			out["tools"] = chatTools
+		}
+	}
+	if tc, ok := req["tool_choice"]; ok {
+		out["tool_choice"] = toolChoiceToChat(tc)
+	}
+
 	// 其余 Anthropic 专有字段**有意忽略**（Chat 上游无对应语义）：
 	//   - metadata.user_id —— 会话标识（粘性接入为 P2，见方案 §6.4）；
 	//   - top_k —— CodeBuddy 未实测，丢弃防 400；
@@ -141,7 +151,7 @@ func messagesToChat(msgs []any) ([]any, error) {
 			}
 			out = append(out, map[string]any{"role": role, "content": c})
 		case []any:
-			out = append(out, blocksToChatMessage(role, c)...)
+			out = append(out, blocksToChatMessages(role, c)...)
 		case nil:
 			// content=null 仅在 assistant 带 tool_calls 时合法（A2）；A1 跳过空消息。
 			continue
@@ -159,14 +169,20 @@ func anthropicRoleToChatRole(role string) string {
 	return "user"
 }
 
-// blocksToChatMessage 把一个 Anthropic message 的 blocks 数组转成 0..n 条 Chat 消息。
-// n>1 的场景：tool_result 块必须拆成独立的 tool 消息（A2）；A1 只产出文本/图片消息。
-func blocksToChatMessage(role string, blocks []any) []any {
+// blocksToChatMessages 把一个 Anthropic message 的 blocks 数组转成 1..n 条 Chat 消息。
+// n>1 的场景：user 消息里的 tool_result 块（CC 并行工具回喂）必须拆成独立的
+// role:tool 消息，且紧跟所属 assistant 的 tool_calls 之后——与本网关
+// repackToolResultBlocks 的「同批结果连续」预期一致，cleanupOrphanToolCalls 兜底配对。
+// assistant 消息的 tool_use 块累积为该消息的 tool_calls；纯 tool_use 时 content=null
+// （Chat 规范形态，空串会被严格上游 400）。
+func blocksToChatMessages(role string, blocks []any) []any {
 	// assistant 的 thinking 块提取为 reasoning_content（DeepSeek 多轮一致性管线消费；
 	// 其他上游由 payload.go 既有管线决定去留）。
 	var reasoning strings.Builder
 	var textParts []string
 	var chatParts []any // 含图片时保留数组形态
+	var toolCalls []any // assistant: tool_use 块累积
+	var toolMsgs []any  // user: tool_result 块生成的独立 tool 消息
 	hasImage := false
 
 	for _, raw := range blocks {
@@ -194,24 +210,101 @@ func blocksToChatMessage(role string, blocks []any) []any {
 			// 非空占位（DeepSeek 对 thinking 形态校验 len>0，见 upstream/thinking.go），
 			// 占位对模型上下文无语义影响。
 			reasoning.WriteString(joinReasoning(reasoning.String(), "[redacted thinking]"))
-		case "tool_use", "tool_result", "document":
-			// A2 处理 tool_use / tool_result；document（PDF）CodeBuddy 未验证，忽略。
-			// A1 阶段遇到时静默跳过（不留残块）。
+		case "tool_use":
+			// assistant 发起的调用：累积为 tool_calls（蓝本 transform.rs:387-398）。
+			id := stringField(block, "id")
+			name := stringField(block, "name")
+			if id == "" || name == "" {
+				continue // 缺 id/name 的调用无法配对，丢弃（畸形防御）
+			}
+			toolCalls = append(toolCalls, map[string]any{
+				"id":   id,
+				"type": "function",
+				"function": map[string]any{
+					"name":      name,
+					"arguments": canonicalizeToolArguments(block["input"]),
+				},
+			})
+		case "tool_result":
+			// 工具结果：独立 tool 消息（蓝本 transform.rs:400-431）。
+			// content 三形态：字符串原样 / blocks 数组合并文本 / 对象 JSON 序列化。
+			callID := stringField(block, "tool_use_id")
+			if callID == "" {
+				continue
+			}
+			toolMsgs = append(toolMsgs, map[string]any{
+				"role":         "tool",
+				"tool_call_id": callID,
+				"content":      toolResultContent(block["content"]),
+			})
+		case "document":
+			// PDF 块：CodeBuddy 未验证 file 形态，忽略（不留残块）。
 		}
 	}
 
+	// 组装主体消息（assistant 带 tool_calls 时 content=null）。
+	var main map[string]any
 	content := chatContentOf(hasImage, chatParts, textParts)
-	if content == nil && reasoning.Len() == 0 {
-		return nil
+	if content == nil && len(toolCalls) == 0 && reasoning.Len() == 0 {
+		// 全空消息（如 assistant 只有空块）：跳过。
+	} else {
+		main = map[string]any{"role": role}
+		// assistant 带 tool_calls 时 content=null；文本/图片正常放。
+		if role == "assistant" && len(toolCalls) > 0 {
+			if content != nil {
+				main["content"] = content
+			} else {
+				main["content"] = nil
+			}
+		} else if content != nil {
+			main["content"] = content
+		}
+		if reasoning.Len() > 0 {
+			main["reasoning_content"] = reasoning.String()
+		}
+		if len(toolCalls) > 0 {
+			main["tool_calls"] = toolCalls
+		}
 	}
-	msg := map[string]any{"role": role}
-	if content != nil {
-		msg["content"] = content
+
+	var out []any
+	if main != nil {
+		out = append(out, main)
 	}
-	if reasoning.Len() > 0 {
-		msg["reasoning_content"] = reasoning.String()
+	// tool 结果消息跟在主体之后（顺序即 wire 顺序）。
+	out = append(out, toolMsgs...)
+	return out
+}
+
+// toolResultContent 把 Anthropic tool_result.content 转成 Chat tool 消息的字符串形态：
+// 字符串原样；blocks 数组提取 text 部分合并；其他值 JSON 序列化。
+// （媒体块剥离为后续增强，与 responses 包 media.go 同思路；第一阶段文本化。）
+func toolResultContent(v any) string {
+	switch c := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return c
+	case []any:
+		var texts []string
+		for _, raw := range c {
+			block, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch stringField(block, "type") {
+			case "text":
+				if t := rawString(block, "text"); t != "" {
+					texts = append(texts, t)
+				}
+			case "image":
+				texts = append(texts, "[image omitted]")
+			}
+		}
+		return strings.Join(texts, "\n")
+	default:
+		return canonicalJSONStringOf(v)
 	}
-	return []any{msg}
 }
 
 // chatContentOf 依图片有无决定 content 形态：纯文本合并为字符串（prompt cache 友好），
@@ -283,5 +376,86 @@ func applyThinking(out, req map[string]any) {
 		out["reasoning_effort"] = "high"
 	} else {
 		out["reasoning_effort"] = "medium"
+	}
+}
+
+// toolsToChat 把 Anthropic tools 数组转成 Chat tools。
+//
+// 蓝本：cc-switch transform.rs:246-272。
+//   - 扁平 function 工具：input_schema → parameters；description 缺失时省略字段
+//     而非 null（严格上游收到 null 会 400 "expected string, received null"）；
+//   - server 工具（web_search_* 等）与 BatchTool：Chat 上游无法执行，丢弃
+//     （与 Responses 侧 web_search 同口径——保留会让严格上游 400）。
+func toolsToChat(tools []any) []any {
+	out := make([]any, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		// server 工具（web_search_*/web_search_*_20xx/code_execution_*/computer_* 等）
+		// 与 BatchTool：type 不是省略或缺省的 "custom" 语义时丢弃。Anthropic 里
+		// 自定义 function 工具没有 type 字段（或 type="custom"），server 工具的
+		// type 是 "名字_日期" 形态。Chat 上游无法执行服务端工具，保留会让严格上游 400。
+		if typ := stringField(tool, "type"); typ != "" && typ != "custom" {
+			continue
+		}
+		name := stringField(tool, "name")
+		if name == "" {
+			continue
+		}
+		fn := map[string]any{"name": name}
+		if desc, ok := tool["description"]; ok && desc != nil {
+			fn["description"] = desc
+		}
+		fn["parameters"] = normalizeParameters(tool["input_schema"])
+		out = append(out, map[string]any{"type": "function", "function": fn})
+	}
+	return out
+}
+
+// normalizeParameters 保证 parameters.type 恒为 "object"（严格 OpenAI 兼容上游要求；
+// 与 responses 包 normalizeFunctionParameters 同口径）。
+func normalizeParameters(params any) map[string]any {
+	obj, ok := params.(map[string]any)
+	if !ok {
+		return map[string]any{"type": "object", "properties": map[string]any{}}
+	}
+	out := make(map[string]any, len(obj))
+	for k, v := range obj {
+		out[k] = v
+	}
+	if s, _ := out["type"].(string); s != "object" {
+		out["type"] = "object"
+	}
+	return out
+}
+
+// toolChoiceToChat 把 Anthropic tool_choice 转成 Chat 形态（蓝本 transform.rs map_tool_choice_to_chat）。
+//
+//	{"type":"auto"}  → "auto"
+//	{"type":"any"}   → "required"
+//	{"type":"none"}  → "none"（本网关 payload.go 会同时删 tools——语义正确）
+//	{"type":"tool","name":N} → {"type":"function","function":{"name":N}}
+func toolChoiceToChat(v any) any {
+	obj, ok := v.(map[string]any)
+	if !ok {
+		return v
+	}
+	switch stringField(obj, "type") {
+	case "auto":
+		return "auto"
+	case "any":
+		return "required"
+	case "none":
+		return "none"
+	case "tool":
+		name := stringField(obj, "name")
+		if name == "" {
+			return "auto"
+		}
+		return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+	default:
+		return "auto"
 	}
 }

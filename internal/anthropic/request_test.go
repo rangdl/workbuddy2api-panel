@@ -361,3 +361,141 @@ func toLower(s string) string {
 	}
 	return string(b)
 }
+
+// ---- A2：工具全链路 ----
+
+// tools → Chat tools：input_schema→parameters、description 缺失省略（非 null）。
+func TestToolsToChat(t *testing.T) {
+	out := mustToChat(t, `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}],
+		"tools":[
+			{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}},
+			{"name":"no_desc","input_schema":{"type":"object"}},
+			{"type":"web_search_20250305","name":"server_search","max_uses":3}
+		]}`)
+	tools, _ := out["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools=%v (server tool must be dropped)", tools)
+	}
+	first, _ := tools[0].(map[string]any)
+	fn, _ := first["function"].(map[string]any)
+	if fn["name"] != "get_weather" {
+		t.Errorf("name=%v", fn["name"])
+	}
+	params, _ := fn["parameters"].(map[string]any)
+	if params["type"] != "object" {
+		t.Errorf("parameters=%v", params)
+	}
+	second, _ := tools[1].(map[string]any)
+	fn2, _ := second["function"].(map[string]any)
+	if _, has := fn2["description"]; has {
+		t.Errorf("missing description must be omitted (not null): %v", fn2)
+	}
+	raw, _ := json.Marshal(out)
+	if contains(string(raw), "web_search") {
+		t.Error("server tool leaked to chat body")
+	}
+}
+
+// tool_choice 四态映射。
+func TestToolChoiceMapping(t *testing.T) {
+	cases := []struct {
+		in   string
+		want any
+	}{
+		{`{"type":"auto"}`, "auto"},
+		{`{"type":"any"}`, "required"},
+		{`{"type":"none"}`, "none"},
+	}
+	for _, c := range cases {
+		out := mustToChat(t, `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}],"tool_choice":` + c.in + `}`)
+		if out["tool_choice"] != c.want {
+			t.Errorf("%s → %v, want %v", c.in, out["tool_choice"], c.want)
+		}
+	}
+	out := mustToChat(t, `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}],"tool_choice":{"type":"tool","name":"shell"}}`)
+	tc, _ := out["tool_choice"].(map[string]any)
+	fn, _ := tc["function"].(map[string]any)
+	if fn["name"] != "shell" {
+		t.Errorf("tool choice=%v", out["tool_choice"])
+	}
+}
+
+// assistant tool_use 块 → tool_calls（input 对象→规范化字符串）；后续 user 的
+// tool_result 块 → 独立 tool 消息（并行回喂形态）。
+func TestToolUseResultRoundTrip(t *testing.T) {
+	out := mustToChat(t, `{"model":"m","max_tokens":1,"messages":[
+		{"role":"user","content":"run both"},
+		{"role":"assistant","content":[
+			{"type":"tool_use","id":"toolu_1","name":"shell","input":{"cmd":"ls"}},
+			{"type":"tool_use","id":"toolu_2","name":"shell","input":{"cmd":"pwd"}}]},
+		{"role":"user","content":[
+			{"type":"tool_result","tool_use_id":"toolu_1","content":"dir-a"},
+			{"type":"tool_result","tool_use_id":"toolu_2","content":"dir-b"}]}]}`)
+	msgs, _ := out["messages"].([]any)
+	if len(msgs) != 4 {
+		t.Fatalf("messages len=%d: %v", len(msgs), msgs)
+	}
+	// assistant 带 tool_calls 且 content=null（规范形态）
+	a, _ := msgs[1].(map[string]any)
+	if a["role"] != "assistant" {
+		t.Fatalf("msgs[1]=%v", a)
+	}
+	tcs, _ := a["tool_calls"].([]any)
+	if len(tcs) != 2 {
+		t.Fatalf("tool_calls=%v", a["tool_calls"])
+	}
+	tc1, _ := tcs[0].(map[string]any)
+	if tc1["id"] != "toolu_1" {
+		t.Errorf("call id=%v", tc1["id"])
+	}
+	fn, _ := tc1["function"].(map[string]any)
+	if fn["name"] != "shell" || fn["arguments"] != `{"cmd":"ls"}` {
+		t.Errorf("function=%v", fn)
+	}
+	if v, has := a["content"]; has && v != nil {
+		t.Errorf("assistant content should be null with tool_calls, got %v", v)
+	}
+	// 两个独立 tool 消息
+	t1, _ := msgs[2].(map[string]any)
+	t2, _ := msgs[3].(map[string]any)
+	if t1["role"] != "tool" || t1["tool_call_id"] != "toolu_1" || t1["content"] != "dir-a" {
+		t.Errorf("tool msg1=%v", t1)
+	}
+	if t2["role"] != "tool" || t2["tool_call_id"] != "toolu_2" || t2["content"] != "dir-b" {
+		t.Errorf("tool msg2=%v", t2)
+	}
+}
+
+// tool_result 的 blocks 数组 content 提取 text 合并；image 占位。
+func TestToolResultBlocksContent(t *testing.T) {
+	out := mustToChat(t, `{"model":"m","max_tokens":1,"messages":[
+		{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"f","input":{}}]},
+		{"role":"user","content":[
+			{"type":"tool_result","tool_use_id":"t1","content":[
+				{"type":"text","text":"result line"},
+				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"x"}}]}]}]}`)
+	msgs, _ := out["messages"].([]any)
+	toolMsg, _ := msgs[1].(map[string]any)
+	if toolMsg["content"] != "result line\n[image omitted]" {
+		t.Errorf("tool content=%v", toolMsg["content"])
+	}
+}
+
+// 缺 id/name 的 tool_use 丢弃；缺 tool_use_id 的 tool_result 丢弃（畸形防御）。
+func TestMalformedToolBlocksDropped(t *testing.T) {
+	out := mustToChat(t, `{"model":"m","max_tokens":1,"messages":[
+		{"role":"assistant","content":[
+			{"type":"tool_use","name":"no_id","input":{}},
+			{"type":"tool_use","id":"ok1","name":"f","input":{}}]},
+		{"role":"user","content":[
+			{"type":"tool_result","content":"orphan"}]}]}`)
+	msgs, _ := out["messages"].([]any)
+	// assistant 保留（有合法调用）；orphan result 丢弃后 user 消息全空 → 整条消失。
+	if len(msgs) != 1 {
+		t.Fatalf("messages=%v", msgs)
+	}
+	a, _ := msgs[0].(map[string]any)
+	if tcs, _ := a["tool_calls"].([]any); len(tcs) != 1 {
+		t.Errorf("only the valid call should survive: %v", a["tool_calls"])
+	}
+}
