@@ -728,7 +728,7 @@ Claude Code CLI / Claude Desktop 讲 Anthropic Messages 协议（`/v1/messages`�
 
 ### 配置（`anthropic.json`，与 `config.json` 同目录；推荐直接用面板「配置」页）
 
-面板「配置」页含 **Anthropic / Claude Code 接入** 卡片（与 Responses / Codex 接入同款交互：启用开关 + 模型映射拖拽排序 + 默认模型），保存后**热生效**，无需重启。
+面板「配置」页含 **Anthropic / Claude Code 接入** 卡片（与 Responses / Codex 接入同款交互：启用开关 + 模型映射拖拽排序 + 默认模型），保存后**热生效**，无需重启。手写配置可从 **`anthropic.example.json`** 复制起步（已内置一套合理的默认映射）。
 
 ```json
 {

@@ -21,6 +21,8 @@ config.json
 third_party.json
 # Trae 上游配置含 access_token / refresh_token / 设备私钥
 trae.json
+# Anthropic 接入配置（用 anthropic.example.json；映射本身不含密钥，防手滑写密钥）
+anthropic.json
 
 # Build artifacts
 *.tmp
