@@ -344,7 +344,10 @@ type requestTraceKey struct{}
 type requestTrace struct {
 	id    string
 	start time.Time
-	stat  *chatStat
+	// path 实际请求端点（/v1/chat/completions、/v1/responses、/v1/messages 等）：
+	// 归档事件的 Path 记真实入口，而不是转发后的 chat 端点。空串回落 chat 端点。
+	path string
+	stat *chatStat
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
@@ -397,10 +400,14 @@ func requestTraceFrom(r *http.Request) *requestTrace {
 }
 
 func (t *requestTrace) event(status int) reqlog.Event {
+	path := t.path
+	if path == "" {
+		path = "/v1/chat/completions"
+	}
 	e := reqlog.Event{
 		Time:      t.start,
 		RequestID: t.id,
-		Path:      "/v1/chat/completions",
+		Path:      path,
 		Status:    status,
 	}
 	duration := time.Since(t.start)

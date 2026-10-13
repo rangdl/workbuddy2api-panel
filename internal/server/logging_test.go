@@ -11,6 +11,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/responsesstore"
 )
 
 // captureStdout 重定向 os.Stdout（连同 chatLogOut，见 SetChatLogOutput 的注入点）
@@ -138,6 +139,64 @@ func TestRequestMetricsRecordsStream(t *testing.T) {
 	e := s.Recent[0]
 	if e.Outcome != reqlog.OutcomeSuccess || e.Status != http.StatusOK || !e.OK || e.Model != "glm-5.2" || e.TotalTokens != 2 || e.Attempts != 1 {
 		t.Fatalf("event = %+v", e)
+	}
+}
+
+// /v1/responses（Codex）与 /v1/messages（Claude Code，含 /v1/v1/messages 双拼容错）
+// 复用 chatCompletions 链路：请求日志必须同样记账（此前只包 /v1/chat/completions，
+// 造成「面板请求记录有时候不更新」——取决于客户端打的端点）。Path 记真实入口端点。
+func TestRequestMetricsRecordsResponsesAndMessages(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	reqLog := reqlog.New(reqlog.Config{})
+	h := NewHandler(Config{
+		Pool:       testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:   up,
+		RequestLog: reqLog,
+		Responses:  &ResponsesConfig{Enabled: true, Store: responsesstore.NewMemoryStore(0)},
+		Anthropic:  &AnthropicConfig{Enabled: true},
+	})
+
+	cases := []struct {
+		path string
+		body string
+		key  string // auth header 名（responses 用 Authorization，messages 用 x-api-key）
+		val  string
+	}{
+		{"/v1/responses", `{"model":"glm-5.2","input":"hi"}`, "Authorization", "Bearer k"},
+		{"/v1/messages", anthropicRequestBody, "x-api-key", "k"},
+		{"/v1/v1/messages", anthropicRequestBody, "x-api-key", "k"},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest("POST", tc.path, strings.NewReader(tc.body))
+		req.Header.Set(tc.key, tc.val)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: code=%d body=%s", tc.path, rec.Code, rec.Body)
+		}
+	}
+
+	s := reqLog.Snapshot()
+	if s.Completed != 3 {
+		t.Fatalf("completed=%d, want 3", s.Completed)
+	}
+	wantPaths := map[string]bool{"/v1/responses": false, "/v1/messages": false, "/v1/v1/messages": false}
+	for _, e := range s.Recent {
+		if _, ok := wantPaths[e.Path]; !ok {
+			t.Errorf("unexpected Path %q", e.Path)
+			continue
+		}
+		wantPaths[e.Path] = true
+		if e.Outcome != reqlog.OutcomeSuccess || e.Model != "glm-5.2" || e.Account == "" {
+			t.Errorf("%s: event = %+v", e.Path, e)
+		}
+	}
+	for p, seen := range wantPaths {
+		if !seen {
+			t.Errorf("Path %q not recorded", p)
+		}
 	}
 }
 

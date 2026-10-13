@@ -251,9 +251,22 @@ func (h *Handler) SetTraeConfig(cfg *trae.Config) {
 	h.traeCfg.Store(cfg)
 }
 
+// requestLogPaths 需要记入请求日志的端点（POST）：/v1/chat/completions 之外的
+// /v1/responses（Codex）与 /v1/messages（Claude Code，含 /v1/v1/messages 双拼容错别名）
+// 都复用 h.chatCompletions 链路（responses.go / anthropic.go），requestTrace 会随
+// context 自动填充，因此只要在 ServeHTTP 入口建 trace，账号/模型/token 统计全量可得。
+// /tp/v1/* 与 /trae/v1/* 是独立转发路径（不经 chatCompletions，无 chatStat 可挂），
+// 暂不接入记账。
+var requestLogPaths = map[string]bool{
+	"/v1/chat/completions": true,
+	"/v1/responses":        true,
+	"/v1/messages":         true,
+	"/v1/v1/messages":      true, // CC 把 base_url 配成带 /v1 结尾时的双拼路径（见 NewHandler 注释）
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
-		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && requestLogPaths[r.URL.Path] {
+		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
 		}
