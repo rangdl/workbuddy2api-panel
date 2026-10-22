@@ -29,8 +29,8 @@ func (s *Scheduler) RunStreakBonusNow() {
 		if a.IsGlobal() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
-		if a.IsEnterprise() {
-			continue // 企业版门控：无成长体系（/activity/growth/streak 上游一律 403）
+		if a.IsEnterpriseSession() {
+			continue // 企业版 / 企业切换会话门控：无成长体系（/activity/growth/streak 企业号 403；切换会话 200 但不计分）
 		}
 		s.streakBonusAccount(a)
 	}
@@ -44,9 +44,7 @@ func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 	if credit, err := s.cfg.Upstream.ClaimGift(a); err == nil {
 		log.Printf("streak-bonus %s: 🎊 新手礼包 +%dc", logfmt.Label(a.UID, a.NicknameValue()), credit)
 	}
-	if credit, err := s.cfg.Upstream.ClaimCompensation(a); err == nil {
-		log.Printf("streak-bonus %s: 🎊 补偿领取 +%dc", logfmt.Label(a.UID, a.NicknameValue()), credit)
-	}
+	s.claimCompensationQuiet(a)
 
 	full, err := s.cfg.Upstream.GrowthStreakFull(a)
 	if err != nil {
