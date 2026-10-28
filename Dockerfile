@@ -1,4 +1,5 @@
 FROM golang:1.23-alpine AS build
+ENV GOPROXY=https://goproxy.cn,direct
 WORKDIR /src
 COPY go.mod ./
 # 防止因为直接使用官方源导致下载失败
