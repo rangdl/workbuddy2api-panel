@@ -340,6 +340,9 @@ $('btnKey').onclick = async () => {
   } catch (e) { $('keyErr').hidden = false; }
 };
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
+// CSP 禁止内联事件处理器（index.html 原写法 onsubmit="return false" 被拦截，
+// 回车触发表单默认提交导致整页刷新、密钥丢失），改为这里统一监听。
+if ($('keyForm')) $('keyForm').onsubmit = e => e.preventDefault();
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
 /* 积分包明细共享缓存：「积分构成」视图与首页「积分到期提醒」卡片共用同一份

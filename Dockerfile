@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/serve
 FROM alpine:3.20
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
 RUN apk add --no-cache wget ca-certificates tzdata python3 bash \
- && adduser -D -u 10001 app \
+ && adduser -D -u 1000 app \
  && mkdir -p /app/auths /app/data \
  && chown -R app:app /app
 WORKDIR /app
