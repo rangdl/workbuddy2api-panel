@@ -687,6 +687,14 @@ func Classify(status int, body string) ErrKind {
 		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
 			return ErrBadParams
 		}
+		// 11148 tool_call_sequence_broken（tool calls and tool results do not match）：
+		// 消息历史里 tool_call 与 tool 结果配对断裂，属于**请求级**错误。换号必然
+		// 同样失败（tool_pairing.go 记录的 2026-09-20 实测：同一 body 换号无效），
+		// 落通用 ErrClient 会让网关把健康号轮转一遍、并对它们喂连败计数。归
+		// ErrBadParams 同语义：不冷却/不熔断/不计错/不轮转，末端 400 透传原文。
+		if codeMarker(lower, "11148") || strings.Contains(lower, "tool calls and tool results do not match") {
+			return ErrBadParams
+		}
 		return ErrClient
 	}
 	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。

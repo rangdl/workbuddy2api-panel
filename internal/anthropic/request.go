@@ -267,11 +267,27 @@ func blocksToChatMessages(role string, blocks []any) []any {
 		}
 	}
 
+	// 顺序即 wire 顺序，必须与参考实现（cc-switch transform.rs）一致：user 消息里的
+	// tool_result 先出，同一条消息里的正文文本后出。
+	//
+	// 2026-10-28 线上 11148 根因：Claude Code 中断工具调用 / 往当前会话插入消息时，
+	// 同一条 user 消息会同时带 tool_result 与 text。此前固定「主体先、tool 后」，
+	// 出站长成 assistant(tool_calls) → user(text) → tool(id)，结果被正文隔断，上游
+	// deepseek 系判 11148（tool calls and tool results do not match）并顶死整条会话；
+	// upstream.repackToolResultBlocks 在「assistant 后第一条不是 tool」时立即 break，
+	// 兜不住这个形态（cleanupOrphanToolCalls 只删孤儿、不重排）。参考实现在遍历
+	// blocks 时按原序推入 tool 消息、最后才追加主体，这里对齐。
 	var out []any
+	if role == "user" {
+		out = append(out, toolMsgs...)
+		if main != nil {
+			out = append(out, main)
+		}
+		return out
+	}
 	if main != nil {
 		out = append(out, main)
 	}
-	// tool 结果消息跟在主体之后（顺序即 wire 顺序）。
 	out = append(out, toolMsgs...)
 	return out
 }

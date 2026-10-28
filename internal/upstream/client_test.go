@@ -60,6 +60,11 @@ func TestClassify(t *testing.T) {
 		{400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, ErrBadParams},
 		{400, `Unmarshal chat params failed`, ErrBadParams},
 		{400, `{"code":11101,"msg":"x"}`, ErrBadParams},
+		// 11148 tool_call_sequence_broken：消息历史配对断裂，换号无效 → 请求级错误。
+		{400, `{"code":11148,"msg":"tool calls and tool results do not match, please start a new conversation and retry"}`, ErrBadParams},
+		{400, `{"code": 11148, "msg":"tool_call_sequence_broken"}`, ErrBadParams},
+		// 信封路径（Classify 只拿到 msg）：文案兜底同样命中。
+		{400, `tool calls and tool results do not match`, ErrBadParams},
 		// 图片格式/数据错误是确定性请求错误，分类后不轮转、不罚号。
 		{400, `{"code":11101,"msg":"Parse message failed: invalid image_url content at index 2: json: cannot unmarshal string into Go value of type v2.ImageContent"}`, ErrImageInvalid},
 		{400, `{"code":11135,"msg":"invalid_image_data"}`, ErrImageInvalid},

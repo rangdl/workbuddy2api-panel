@@ -514,6 +514,33 @@ func TestToolUseResultRoundTrip(t *testing.T) {
 	}
 }
 
+// Claude Code 中断工具调用 / 往当前会话插入消息时，同一条 user 消息会同时带
+// tool_result 与 text。出站顺序必须是 assistant(tool_calls) → tool → user(text)：
+// 结果被正文隔断会被 deepseek 系上游判 11148（tool calls and tool results do not
+// match）并顶死整条会话，且 repackToolResultBlocks 兜不住（首条非 tool 即 break）。
+func TestToolResultBeforeTextInSameUserMessage(t *testing.T) {
+	out := mustToChat(t, `{"model":"m","max_tokens":1,"messages":[
+		{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"shell","input":{}}]},
+		{"role":"user","content":[
+			{"type":"tool_result","tool_use_id":"toolu_1","content":"interrupted"},
+			{"type":"text","text":"继续"}]}]}`)
+	msgs, _ := out["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages len=%d: %v", len(msgs), msgs)
+	}
+	if a, _ := msgs[0].(map[string]any); a["role"] != "assistant" {
+		t.Fatalf("msgs[0]=%v", a)
+	}
+	toolMsg, _ := msgs[1].(map[string]any)
+	if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "toolu_1" {
+		t.Fatalf("tool 结果必须紧跟 assistant，msgs[1]=%v", toolMsg)
+	}
+	u, _ := msgs[2].(map[string]any)
+	if u["role"] != "user" || u["content"] != "继续" {
+		t.Errorf("正文应排在 tool 结果之后，msgs[2]=%v", u)
+	}
+}
+
 // tool_result 的 blocks 数组 content 提取 text 合并；image 占位。
 func TestToolResultBlocksContent(t *testing.T) {
 	out := mustToChat(t, `{"model":"m","max_tokens":1,"messages":[
