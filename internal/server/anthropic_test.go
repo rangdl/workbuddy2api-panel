@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
+	"log"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -187,6 +189,37 @@ func TestAnthropicModelMap(t *testing.T) {
 	json.Unmarshal(rec.Body.Bytes(), &resp)
 	if resp["model"] != "glm-5.2" {
 		t.Errorf("model=%v, want mapped glm-5.2 echoed back", resp["model"])
+	}
+}
+
+// 未命中 model_map 时回落到 default_model，并留下一条「请求名 → 默认名」日志。
+func TestAnthropicModelMapDefaultFallback(t *testing.T) {
+	var buf bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(old)
+
+	cfg := &AnthropicConfig{
+		ModelMap:     map[string]string{"claude-sonnet-4-5": "glm-5.2"},
+		DefaultModel: "glm-5.3",
+	}
+	out := applyAnthropicModelMap([]byte(`{"model":"claude-opus-4-1","messages":[]}`), cfg)
+	var req map[string]any
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req["model"] != "glm-5.3" {
+		t.Fatalf("model=%v, want default glm-5.3", req["model"])
+	}
+	if !strings.Contains(buf.String(), `requested="claude-opus-4-1" -> default="glm-5.3"`) {
+		t.Errorf("缺少回落日志: %q", buf.String())
+	}
+
+	// 命中 model_map 时不写回落日志（避免噪音）。
+	buf.Reset()
+	applyAnthropicModelMap([]byte(`{"model":"claude-sonnet-4-5"}`), cfg)
+	if strings.Contains(buf.String(), "model fallback") {
+		t.Errorf("命中映射不应记录回落日志: %q", buf.String())
 	}
 }
 

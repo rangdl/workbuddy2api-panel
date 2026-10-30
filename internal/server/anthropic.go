@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -79,6 +80,12 @@ func applyAnthropicModelMap(body []byte, cfg *AnthropicConfig) []byte {
 		mapped = m
 	} else if cfg.DefaultModel != "" {
 		mapped = cfg.DefaultModel
+		// 回落记录：客户端请求的模型不在 model_map 里，实际按默认模型出站。
+		// 排障时最常见的问题是「以为在用 A，上游其实收到 B」，这条日志把
+		// 请求名与实际出站名一次说清（落在面板「运行日志」里）。
+		if mapped != model {
+			log.Printf("INFO: [anthropic] model fallback: requested=%q -> default=%q", model, mapped)
+		}
 	}
 	if mapped == "" || mapped == model {
 		return body
