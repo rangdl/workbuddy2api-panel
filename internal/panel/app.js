@@ -263,6 +263,9 @@ function rateLimitMeta(row, now) {
       title: model + '\n模型当前不可用' + (deadline ? '\n最早重试：' + fmtLocalDateTime(deadline) : ''),
     };
   }
+  // 'use strict' 下未声明赋值会抛 ReferenceError（20c3997 引入）：只要账号带
+  // rate_limited_models，renderAccounts 整体中断 → 统计有数字、账号表空白。
+  let detail;
   const title = [model, resetAt ? '上游重置：' + fmtLocalDateTime(resetAt) : '上游重置：时间未知'];
   if (until && resetAt && until < resetAt) {
     // 双时钟（issue #171 问题二）：黄框出现/消失由 until 决定（网关为防超长
