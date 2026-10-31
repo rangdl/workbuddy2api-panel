@@ -3,6 +3,7 @@ package responses
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 )
 
@@ -48,6 +49,18 @@ func ToChat(body []byte) ([]byte, *ToolContext, error) {
 	if len(chatTools) > 0 {
 		messages = append(messages, map[string]any{"role": "system", "content": toolRosterHint(chatTools)})
 	}
+	// 非法历史工具调用降级为文本（对齐 cc-switch #8241）：arguments 不是合法
+	// JSON 对象时，严格 Chat 上游会对之后每次重放都 400，整条会话报废。
+	var recovered int
+	messages, recovered = preserveInvalidToolCallsAsText(messages)
+	if recovered > 0 {
+		log.Printf("WARN: [responses] preserved %d malformed historical tool call(s) as text", recovered)
+	}
+	// DeepSeek 严格校验 tool 结果与发起调用的 assistant 相邻：把夹在中间的
+	// 回放正文/思考合并回该 assistant（其他模型不动，避免破坏 prompt cache）。
+	if model, _ := req["model"].(string); isDeepSeekChatModel(model) {
+		messages = coalesceReplayedToolTurnMessages(messages)
+	}
 	out["messages"] = collapseSystemMessages(messages)
 
 	// 输出上限：max_output_tokens → max_tokens（项目出站管线会再做一次别名翻译）。
@@ -62,11 +75,13 @@ func ToChat(body []byte) ([]byte, *ToolContext, error) {
 
 	applyReasoning(out, req)
 
+	// tool_choice 只在确有工具时下发：没有 tools 却带 tool_choice，严格上游
+	// 会直接 400（对齐 cc-switch #3640）。
 	if tools := toolCtx.ChatTools(); len(tools) > 0 {
 		out["tools"] = tools
-	}
-	if tc, ok := req["tool_choice"]; ok {
-		out["tool_choice"] = responsesToolChoiceToChat(tc, toolCtx)
+		if tc, ok := req["tool_choice"]; ok {
+			out["tool_choice"] = responsesToolChoiceToChat(tc, toolCtx)
+		}
 	}
 
 	for _, k := range extraChatPassthroughFields {
@@ -134,6 +149,7 @@ func appendResponsesItems(items []any, ctx *ToolContext) []any {
 	var pendingCalls []any
 	var pendingReasoning string
 	var pendingMedia []any
+	seenCalls := map[string]bool{} // 已声明过调用的 call_id（孤儿结果判定）
 	lastAssistant := -1
 
 	flushCalls := func() {
@@ -189,14 +205,23 @@ func appendResponsesItems(items []any, ctx *ToolContext) []any {
 		case "function_call":
 			flushMedia()
 			pendingReasoning = joinReasoningUnique(pendingReasoning, responsesItemReasoning(item))
+			if id := responseItemCallID(item); id != "" {
+				seenCalls[id] = true
+			}
 			pendingCalls = append(pendingCalls, responsesFunctionCallToChatToolCall(item, ctx))
 		case "custom_tool_call":
 			flushMedia()
 			pendingReasoning = joinReasoningUnique(pendingReasoning, responsesItemReasoning(item))
+			if id := responseItemCallID(item); id != "" {
+				seenCalls[id] = true
+			}
 			pendingCalls = append(pendingCalls, responsesCustomToolCallToChatToolCall(item))
 		case "tool_search_call":
 			flushMedia()
 			pendingReasoning = joinReasoningUnique(pendingReasoning, responsesItemReasoning(item))
+			if id := responseItemCallID(item); id != "" {
+				seenCalls[id] = true
+			}
 			pendingCalls = append(pendingCalls, responsesToolSearchCallToChatToolCall(item))
 		case "function_call_output", "custom_tool_call_output", "tool_search_output":
 			flushCalls()
@@ -205,6 +230,17 @@ func appendResponsesItems(items []any, ctx *ToolContext) []any {
 			// 收集到 pendingMedia，稍后作为合成 user 消息投递。
 			toolContent, media := planToolOutputMedia(item["output"])
 			queueToolMedia(&pendingMedia, callID, media)
+			if callID == "" || !seenCalls[callID] {
+				// 孤儿结果：历史里没有对应的工具调用（客户端压缩/截断历史、
+				// 或输出先于调用出现）。Chat 要求 role:tool 必须有前置调用，
+				// 严格上游会 400，且之后每次重放都失败——转成 user 文本保留
+				// 上下文（对齐 cc-switch #8136）。
+				messages = append(messages, map[string]any{
+					"role":    "user",
+					"content": orphanToolOutputText(callID, toolContent),
+				})
+				continue
+			}
 			messages = append(messages, map[string]any{
 				"role":         "tool",
 				"tool_call_id": callID,
@@ -221,6 +257,12 @@ func appendResponsesItems(items []any, ctx *ToolContext) []any {
 				flushMedia()
 				msg := responsesMessageToChatMessage(item)
 				if msg["role"] == "assistant" {
+					// message item 自身也可能带 reasoning（客户端回放历史时把思考
+					// 挂在 assistant message 上，对齐 cc-switch responses_message_
+					// item_to_chat_message）：先收自身，再并入 pending。
+					if own := responsesItemReasoning(item); own != "" {
+						msg["reasoning_content"] = joinReasoningUnique(rawString(msg, "reasoning_content"), own)
+					}
 					if pendingReasoning != "" {
 						msg["reasoning_content"] = joinReasoning(rawString(msg, "reasoning_content"), pendingReasoning)
 						pendingReasoning = ""

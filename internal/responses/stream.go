@@ -44,6 +44,9 @@ type StreamState struct {
 	nextToolIndexToAdd int
 	// droppedToolCalls 因缺函数名而被丢弃的工具调用数（用于「答一句就停」防御）。
 	droppedToolCalls int
+	// think 跨 chunk 剥离正文开头的内联思考块（<think>/<thinking>），
+	// 见 inline_think.go：上游把思考内联进 content 时不能当正文透给 Codex。
+	think inlineThinkSplitter
 
 	toolCtx *ToolContext
 
@@ -105,9 +108,16 @@ func (s *StreamState) HandleChunk(chunk map[string]any) []byte {
 			s.pushReasoning(&out, reasoning)
 		}
 		if content := rawString(delta, "content"); content != "" {
-			s.pushText(&out, content)
+			thinking, text := s.think.push(content)
+			if thinking != "" {
+				s.pushReasoning(&out, thinking)
+			}
+			if text != "" {
+				s.pushText(&out, text)
+			}
 		}
 		if tcs, ok := delta["tool_calls"].([]any); ok {
+			s.flushInlineThink(&out)
 			s.finalizeReasoning(&out)
 			for _, raw := range tcs {
 				if tc, ok := raw.(map[string]any); ok {
@@ -117,6 +127,7 @@ func (s *StreamState) HandleChunk(chunk map[string]any) []byte {
 		}
 	}
 	if fr := rawString(choice, "finish_reason"); fr != "" {
+		s.flushInlineThink(&out)
 		s.finishReason = fr
 		s.sawTerminalSource = true
 	}
@@ -135,6 +146,7 @@ func (s *StreamState) Finalize() []byte {
 	}
 	var out bytes.Buffer
 	s.ensureStarted(&out)
+	s.flushInlineThink(&out)
 	s.finalizeReasoning(&out)
 	s.finalizeText(&out)
 	s.finalizeTools(&out)
@@ -178,6 +190,7 @@ func (s *StreamState) Failed(message, errType string) []byte {
 	}
 	var out bytes.Buffer
 	s.ensureStarted(&out)
+	s.flushInlineThink(&out)
 	s.finalizeReasoning(&out)
 	s.finalizeText(&out)
 	s.finalizeTools(&out)
@@ -352,6 +365,18 @@ func (s *StreamState) finalizeReasoning(out *bytes.Buffer) {
 	}
 	out.Write(sseEvent("response.output_item.done", map[string]any{"output_index": s.reasoningIndex, "item": item}))
 	s.outputItems = append(s.outputItems, item)
+}
+
+// flushInlineThink 冲刷内联思考分裂器的残留（幂等）：未闭合的 think 块按
+// 思考内容下发，尚在 Detecting 的缓冲按正文下发。
+func (s *StreamState) flushInlineThink(out *bytes.Buffer) {
+	thinking, text := s.think.flush()
+	if thinking != "" {
+		s.pushReasoning(out, thinking)
+	}
+	if text != "" {
+		s.pushText(out, text)
+	}
 }
 
 func (s *StreamState) finalizeText(out *bytes.Buffer) {

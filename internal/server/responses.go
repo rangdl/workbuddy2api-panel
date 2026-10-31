@@ -56,6 +56,8 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 
 	// 3. 模型名映射（Codex 发 gpt-5-codex，上游只认 CodeBuddy 模型名）。
 	chatBody = applyResponsesModelMap(chatBody, cfg)
+	// 3.1 映射后按最终上游模型补跑模型相关修正（DeepSeek 回放合并等；幂等）。
+	chatBody = responses.ApplyUpstreamModelFixes(chatBody)
 
 	// 4. 构造等价 Chat 请求（复制 header，替换 body），走既有链路。
 	nr := r.Clone(r.Context())

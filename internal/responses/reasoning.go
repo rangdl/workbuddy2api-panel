@@ -2,11 +2,6 @@ package responses
 
 import "strings"
 
-const (
-	thinkOpenTag  = "\x3cthink\x3e"
-	thinkCloseTag = "\x3c/think\x3e"
-)
-
 // extractReasoningFieldText 穷举上游 reasoning 回传字段，优先级：
 // reasoning_content > reasoning(字符串/对象) > reasoning_details。
 // 不依赖供应商声明，对各家 Chat 兼容接口都能兜底提取。
@@ -99,19 +94,19 @@ func extractReasoningSummaryText(summary any) string {
 	}
 }
 
-// splitLeadingThinkBlock 拆分文本开头的  thinking...<｜end▁of▁thinking｜> 块。
-// 返回 (reasoning, answer, found)；无 think 块时 found=false。
+// splitLeadingThinkBlock 拆分文本开头的内联思考块（<think> / <thinking>）。
+// 返回 (reasoning, answer, found)；无 think 块或块未闭合时 found=false。
+// 与流式 inlineThinkSplitter 共用标签识别与容错（允许开闭标签不配对）。
 func splitLeadingThinkBlock(text string) (string, string, bool) {
-	afterWS := strings.TrimLeft(text, " \t\r\n")
-	if !strings.HasPrefix(afterWS, thinkOpenTag) {
+	body, ok := stripLeadingThinkOpenTag(text)
+	if !ok {
 		return "", text, false
 	}
-	body := afterWS[len(thinkOpenTag):]
-	closeIdx := strings.Index(body, thinkCloseTag)
-	if closeIdx < 0 {
+	closeIdx, closeTag, ok := findThinkCloseTag(body)
+	if !ok {
 		return "", text, false
 	}
-	reasoning := strings.TrimSpace(body[:closeIdx])
-	answer := strings.TrimLeft(body[closeIdx+len(thinkCloseTag):], " \t\r\n")
+	reasoning := strings.Trim(body[:closeIdx], thinkSeparators)
+	answer := strings.TrimLeft(body[closeIdx+len(closeTag):], thinkSeparators)
 	return reasoning, answer, true
 }

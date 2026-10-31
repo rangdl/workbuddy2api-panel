@@ -17,6 +17,25 @@ func decode(t *testing.T, raw []byte) map[string]any {
 	return out
 }
 
+// 没有 tools 时不得下发 tool_choice（严格上游直接 400，对齐 cc-switch #3640）。
+func TestToChatDropsToolChoiceWithoutTools(t *testing.T) {
+	raw, _, err := ToChat([]byte(`{
+	  "model":"gpt-5.5",
+	  "tool_choice":"auto",
+	  "input":[{"type":"message","role":"user","content":"hi"}]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := decode(t, raw)
+	if _, has := out["tool_choice"]; has {
+		t.Errorf("无 tools 时不应下发 tool_choice: %v", out["tool_choice"])
+	}
+	if _, has := out["tools"]; has {
+		t.Errorf("无工具时不应下发空 tools: %v", out["tools"])
+	}
+}
+
 func TestToChatInstructionsAndInput(t *testing.T) {
 	body := []byte(`{
 		"model": "gpt-5-codex",
