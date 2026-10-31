@@ -633,6 +633,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#upstream" data-view="upstream">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 5.5h5M11.5 5.5h2M2.5 10.5h2M8.5 10.5h5"/><circle cx="9.5" cy="5.5" r="1.6"/><circle cx="5.5" cy="10.5" r="1.6"/></svg>
         上游接入</a></li>
+      <li><a href="#clients" data-view="clients">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M6 2.5 3.5 5 6 7.5M10 8.5 12.5 11 10 13.5"/><path d="M9 2.5 7 13.5"/></svg>
+        协议接入</a></li>
       <li><a href="#config" data-view="config">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
         配置</a></li>
@@ -1152,54 +1155,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </div>
         </div>
 
-        <div class="box" id="respBox">
-          <header><h3>Responses / Codex 接入</h3><span class="grow"></span><span class="note" id="respPath"></span></header>
-          <div class="pad">
-            <div class="switch"><span class="lb">启用 /v1/responses</span>
-              <input type="checkbox" id="respEnabled"></div>
-            <div class="grid2">
-              <label class="fld"><span class="lb">默认模型（未命中映射时回落）</span>
-                <input id="respDefaultModel" placeholder="留空 = 不改写模型名">
-                <span class="hint">Codex 发 cn:hy3 这类名字时无需填</span></label>
-              <label class="fld"><span class="lb">增量缓存条数</span>
-                <input id="respMaxCache" type="number" min="0" placeholder="512">
-                <span class="hint">进程内 LRU 上限</span></label>
-            </div>
-            <div class="fld"><span class="lb">模型映射（左：客户端模型名 → 右：上游模型名）</span>
-              <div id="respMapRows" style="display:flex;flex-direction:column;gap:6px;margin:6px 0"></div>
-              <button type="button" class="xs" id="btnRespAddRow">+ 添加映射</button>
-              <span class="hint">右侧留空 = 不改写该模型；已默认列出 codex 支持的模型</span></div>
-            <div class="hint" style="margin-top:10px">保存后立即生效（模型映射 / 默认模型 / 启用开关热重载；增量缓存条数需重启）。</div>
-          </div>
-          <div class="savebar">
-            <span class="grow"></span>
-            <span class="restart-note" id="respNote"></span>
-            <button type="button" id="btnRespReload">放弃修改</button>
-            <button type="button" class="primary" id="btnRespSave">保存 Responses 配置</button>
-          </div>
-        </div>
-
-        <div class="box" id="anthBox">
-          <header><h3>Anthropic / Claude Code 接入</h3><span class="grow"></span><span class="note" id="anthPath"></span></header>          <div class="pad">
-            <div class="switch"><span class="lb">启用 /v1/messages</span>
-              <input type="checkbox" id="anthEnabled"></div>
-            <div class="fld"><span class="lb">默认模型（未命中映射时回落）</span>
-              <input id="anthDefaultModel" placeholder="留空 = 不改写模型名">
-              <span class="hint">Claude Code 未在映射里的模型名走此项；留空则原样透传</span></div>
-            <div class="fld"><span class="lb">模型映射（左：Claude 模型名 → 右：上游模型名）</span>
-              <div id="anthMapRows" style="display:flex;flex-direction:column;gap:6px;margin:6px 0"></div>
-              <button type="button" class="xs" id="btnAnthAddRow">+ 添加映射</button>
-              <span class="hint">右侧留空 = 不改写该模型；已默认列出 Claude Code 常用模型</span></div>
-            <div class="hint" style="margin-top:10px">CC 侧设置 ANTHROPIC_BASE_URL=http://&lt;主机&gt;:&lt;端口&gt;、ANTHROPIC_API_KEY=网关密钥。保存后立即生效（热重载，无需重启）。</div>
-          </div>
-          <div class="savebar">
-            <span class="grow"></span>
-            <span class="restart-note" id="anthNote"></span>
-            <button type="button" id="btnAnthReload">放弃修改</button>
-            <button type="button" class="primary" id="btnAnthSave">保存 Anthropic 配置</button>
-          </div>
-        </div>
-
         <div class="savebar">
           <span class="grow"></span>
           <span class="restart-note" id="cfgNote"></span>
@@ -1286,6 +1241,57 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="restart-note" id="traeNote"></span>
           <button type="button" id="btnTraeReload">放弃修改</button>
           <button type="button" class="primary" id="btnTraeSave">保存 Trae 配置</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 协议接入：Codex（Responses）/ Claude Code（Anthropic）客户端协议 -->
+    <section class="view" id="view-clients" hidden>
+      <div class="box" id="respBox">
+        <header><h3>Responses / Codex 接入</h3><span class="grow"></span><span class="note" id="respPath"></span></header>
+        <div class="pad">
+          <div class="switch"><span class="lb">启用 /v1/responses</span>
+            <input type="checkbox" id="respEnabled"></div>
+          <div class="grid2">
+            <label class="fld"><span class="lb">默认模型（未命中映射时回落）</span>
+              <input id="respDefaultModel" placeholder="留空 = 不改写模型名">
+              <span class="hint">Codex 发 cn:hy3 这类名字时无需填</span></label>
+            <label class="fld"><span class="lb">增量缓存条数</span>
+              <input id="respMaxCache" type="number" min="0" placeholder="512">
+              <span class="hint">进程内 LRU 上限</span></label>
+          </div>
+          <div class="fld"><span class="lb">模型映射（左：客户端模型名 → 右：上游模型名）</span>
+            <div id="respMapRows" style="display:flex;flex-direction:column;gap:6px;margin:6px 0"></div>
+            <button type="button" class="xs" id="btnRespAddRow">+ 添加映射</button>
+            <span class="hint">右侧留空 = 不改写该模型；已默认列出 codex 支持的模型</span></div>
+          <div class="hint" style="margin-top:10px">保存后立即生效（模型映射 / 默认模型 / 启用开关热重载；增量缓存条数需重启）。</div>
+        </div>
+        <div class="savebar">
+          <span class="grow"></span>
+          <span class="restart-note" id="respNote"></span>
+          <button type="button" id="btnRespReload">放弃修改</button>
+          <button type="button" class="primary" id="btnRespSave">保存 Responses 配置</button>
+        </div>
+      </div>
+
+      <div class="box" id="anthBox">
+        <header><h3>Anthropic / Claude Code 接入</h3><span class="grow"></span><span class="note" id="anthPath"></span></header>          <div class="pad">
+          <div class="switch"><span class="lb">启用 /v1/messages</span>
+            <input type="checkbox" id="anthEnabled"></div>
+          <div class="fld"><span class="lb">默认模型（未命中映射时回落）</span>
+            <input id="anthDefaultModel" placeholder="留空 = 不改写模型名">
+            <span class="hint">Claude Code 未在映射里的模型名走此项；留空则原样透传</span></div>
+          <div class="fld"><span class="lb">模型映射（左：Claude 模型名 → 右：上游模型名）</span>
+            <div id="anthMapRows" style="display:flex;flex-direction:column;gap:6px;margin:6px 0"></div>
+            <button type="button" class="xs" id="btnAnthAddRow">+ 添加映射</button>
+            <span class="hint">右侧留空 = 不改写该模型；已默认列出 Claude Code 常用模型</span></div>
+          <div class="hint" style="margin-top:10px">CC 侧设置 ANTHROPIC_BASE_URL=http://&lt;主机&gt;:&lt;端口&gt;、ANTHROPIC_API_KEY=网关密钥。保存后立即生效（热重载，无需重启）。</div>
+        </div>
+        <div class="savebar">
+          <span class="grow"></span>
+          <span class="restart-note" id="anthNote"></span>
+          <button type="button" id="btnAnthReload">放弃修改</button>
+          <button type="button" class="primary" id="btnAnthSave">保存 Anthropic 配置</button>
         </div>
       </div>
     </section>
