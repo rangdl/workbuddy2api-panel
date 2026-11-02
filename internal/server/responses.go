@@ -199,18 +199,23 @@ func (w *responsesWriter) handleSSEBlock(block string) error {
 		return nil
 	}
 	if data == "[DONE]" {
+		// 显式结束标记：与 finish_reason 一样视为终态（参考实现同口径）。
+		w.sseState.MarkDone()
 		return w.writeOut(w.sseState.Finalize())
 	}
 	var chunk map[string]any
 	if json.Unmarshal([]byte(data), &chunk) != nil {
 		return nil
 	}
-	if errObj, ok := chunk["error"].(map[string]any); ok {
-		msg, _ := errObj["message"].(string)
-		if msg == "" {
-			msg = "upstream error"
+	// 流内错误帧：`event: error` 或 chunk 带 error（对象或字符串）。
+	if _, hasErr := chunk["error"]; hasErr || blockHasEvent(block, "error") {
+		raw, _ := json.Marshal(chunk)
+		normalized := responses.ErrorToResponses(raw)
+		errObj, _ := normalized["error"].(map[string]any)
+		if errObj == nil {
+			errObj = map[string]any{"message": "upstream error", "type": "upstream_error"}
 		}
-		return w.writeOut(w.sseState.Failed(msg, "upstream_error"))
+		return w.writeOut(w.sseState.FailedWithError(errObj))
 	}
 	return w.writeOut(w.sseState.HandleChunk(chunk))
 }
@@ -250,8 +255,13 @@ func (w *responsesWriter) finalizeNonStream() {
 		writeResponsesError(w.dst, status, "upstream_error", string(body))
 		return
 	}
-	if _, hasErr := parsed["error"]; hasErr {
-		writeJSON(w.dst, status, responses.ErrorToResponses(body))
+	// 部分中转把 Chat completion 包在 {"data":{...}} 里（对齐参考 #5658）。
+	if wrapped, ok := parsed["data"].(map[string]any); ok {
+		parsed = wrapped
+	}
+	if _, hasErr := parsed["error"]; hasErr || responses.LooksLikeError(parsed) {
+		raw, _ := json.Marshal(parsed)
+		writeJSON(w.dst, status, responses.ErrorToResponses(raw))
 		return
 	}
 	resp, err := responses.FromChat(parsed, w.toolCtx)
@@ -301,16 +311,27 @@ func takeSSEBlock(buf *bytes.Buffer) (string, bool) {
 	return block, true
 }
 
-// extractDataLine 取 SSE 块的 data 行内容。
+// extractDataLine 取 SSE 块的 data 行内容：兼容 `data:foo`（冒号后无空格）
+// 与规范允许的多行 data（按 SSE 规则用换行连接）。
 func extractDataLine(block string) string {
+	var parts []string
 	for _, line := range strings.Split(block, "\n") {
 		line = strings.TrimRight(line, "\r")
-		if strings.HasPrefix(line, "data: ") {
-			return strings.TrimPrefix(line, "data: ")
+		if !strings.HasPrefix(line, "data:") {
+			continue
 		}
-		if line == "data:" {
-			return ""
+		parts = append(parts, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+	}
+	return strings.Join(parts, "\n")
+}
+
+// blockHasEvent 报告 SSE 块的 event 字段是否等于给定值。
+func blockHasEvent(block, want string) bool {
+	for _, line := range strings.Split(block, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if strings.HasPrefix(line, "event:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "event:")) == want
 		}
 	}
-	return ""
+	return false
 }

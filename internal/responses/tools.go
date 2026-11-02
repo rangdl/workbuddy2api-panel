@@ -12,6 +12,8 @@ import (
 // 最后按别名表注入别名工具（见 legacyAliasTools）。
 func buildToolContext(body map[string]any) *ToolContext {
 	ctx := NewToolContext()
+	// Codex 远程压缩回合：不下发工具，响应必须是单个 compaction item。
+	ctx.SetCompaction(compactionRequested(body["input"]))
 	if tools, ok := body["tools"].([]any); ok {
 		for _, raw := range tools {
 			ctx.addResponseTool(raw)

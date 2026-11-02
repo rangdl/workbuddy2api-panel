@@ -41,12 +41,12 @@ func ToChat(body []byte) ([]byte, *ToolContext, error) {
 		messages = append(messages, msgs...)
 	}
 
-	// 工具名单提示（见 toolRosterHint）：插在头部 system 区末尾（instructions 之后、
-	// 首条对话消息之前）。位置对齐 TraeWorkAssistant wb_toolexec.rs 的注入范式
-	// （"首个非 system 消息之前"）：约束模型行为的同时保持 prompt cache 前缀稳定
-	// ——每轮对话只在尾部追加历史，头部注入段不变，缓存不因名单提示断裂。
+	// 工具名单提示（见 toolRosterHint）：与 instructions 一样在收尾时被
+	// collapseSystemMessages 合并进头部唯一 system 消息（参考实现的单 system
+	// 形态），约束模型行为的同时保持 prompt cache 前缀稳定。压缩回合不带工具，
+	// 也不注入名单（避免诱导模型发起调用）。
 	chatTools := toolCtx.ChatTools()
-	if len(chatTools) > 0 {
+	if len(chatTools) > 0 && !toolCtx.IsCompaction() {
 		messages = append(messages, map[string]any{"role": "system", "content": toolRosterHint(chatTools)})
 	}
 	// 非法历史工具调用降级为文本（对齐 cc-switch #8241）：arguments 不是合法
@@ -61,6 +61,9 @@ func ToChat(body []byte) ([]byte, *ToolContext, error) {
 	if model, _ := req["model"].(string); isDeepSeekChatModel(model) {
 		messages = coalesceReplayedToolTurnMessages(messages)
 	}
+	// 带 tool_calls 的 assistant 必须携带非空 reasoning_content（kimi/DeepSeek
+	// 等 thinking 模型校验；跨轮恢复 miss 时防 400）。
+	messages = backfillToolCallReasoningPlaceholders(messages)
 	out["messages"] = collapseSystemMessages(messages)
 
 	// 输出上限：max_output_tokens → max_tokens（项目出站管线会再做一次别名翻译）。
@@ -77,7 +80,8 @@ func ToChat(body []byte) ([]byte, *ToolContext, error) {
 
 	// tool_choice 只在确有工具时下发：没有 tools 却带 tool_choice，严格上游
 	// 会直接 400（对齐 cc-switch #3640）。
-	if tools := toolCtx.ChatTools(); len(tools) > 0 {
+	// 压缩回合只要一段摘要：不带工具与结构化输出（与 Codex 本地压缩请求同形）。
+	if tools := toolCtx.ChatTools(); len(tools) > 0 && !toolCtx.IsCompaction() {
 		out["tools"] = tools
 		if tc, ok := req["tool_choice"]; ok {
 			out["tool_choice"] = responsesToolChoiceToChat(tc, toolCtx)
@@ -85,9 +89,19 @@ func ToChat(body []byte) ([]byte, *ToolContext, error) {
 	}
 
 	for _, k := range extraChatPassthroughFields {
+		if toolCtx.IsCompaction() && k == "response_format" {
+			continue
+		}
 		if v, ok := req[k]; ok {
 			out[k] = v
 		}
+	}
+
+	// 没有 tools 时 tool_choice / parallel_tool_calls 一并剔除：严格上游会 400
+	// （对齐参考 #3640）。
+	if _, hasTools := out["tools"]; !hasTools {
+		delete(out, "tool_choice")
+		delete(out, "parallel_tool_calls")
 	}
 
 	// 其余 Responses 专有字段**有意忽略**（Chat 上游无对应语义）：
@@ -149,7 +163,8 @@ func appendResponsesItems(items []any, ctx *ToolContext) []any {
 	var pendingCalls []any
 	var pendingReasoning string
 	var pendingMedia []any
-	seenCalls := map[string]bool{} // 已声明过调用的 call_id（孤儿结果判定）
+	var pendingOrphans []any // 无配对调用的工具结果：延后到回合边界降级为 user 消息
+	seenCalls := map[string]bool{}
 	lastAssistant := -1
 
 	flushCalls := func() {
@@ -158,8 +173,15 @@ func appendResponsesItems(items []any, ctx *ToolContext) []any {
 		}
 		// 最后一条是 assistant 且尚无 tool_calls → 并入它（对齐 cc-switch
 		// merge_pending_tool_calls_into_adjacent_assistant，避免多出空 assistant 消息）。
-		if n := len(messages); n > 0 {
-			if last, ok := messages[n-1].(map[string]any); ok && last["role"] == "assistant" {
+		for j := len(messages) - 1; j >= 0; j-- {
+			last, ok := messages[j].(map[string]any)
+			if !ok {
+				break
+			}
+			if last["role"] == "system" {
+				continue // 跳过尾部 system（参考 rposition 口径）
+			}
+			if last["role"] == "assistant" {
 				if tcs, ok := last["tool_calls"].([]any); !ok || len(tcs) == 0 {
 					last["tool_calls"] = pendingCalls
 					if pendingReasoning != "" {
@@ -170,8 +192,10 @@ func appendResponsesItems(items []any, ctx *ToolContext) []any {
 					return
 				}
 			}
+			break
 		}
-		msg := map[string]any{"role": "assistant", "tool_calls": pendingCalls}
+		// assistant 带 tool_calls 时显式 content:null（严格上游要求字段存在）。
+		msg := map[string]any{"role": "assistant", "content": nil, "tool_calls": pendingCalls}
 		if pendingReasoning != "" {
 			msg["reasoning_content"] = pendingReasoning
 		}
@@ -191,15 +215,42 @@ func appendResponsesItems(items []any, ctx *ToolContext) []any {
 		pendingMedia = nil
 	}
 
+	// flushOrphans 在回合边界把暂存的孤儿结果降级成 user 消息（对齐参考
+	// flush_pending_orphan_results）：立刻输出会形成 tool,user,tool，严格上游 400。
+	flushOrphans := func() {
+		if len(pendingOrphans) == 0 {
+			return
+		}
+		for _, raw := range pendingOrphans {
+			if item, ok := raw.(map[string]any); ok {
+				messages = append(messages, orphanToolOutputMessage(item))
+			}
+		}
+		pendingOrphans = nil
+	}
+
+	// appendUserItem 追加一条 user 消息（压缩提示词 / 摘要回放共用）：按回合边界
+	// 处理 pending reasoning，不产生 assistant 索引。
+	appendUserItem := func(msg map[string]any) {
+		flushCalls()
+		flushMedia()
+		flushOrphans()
+		attachReasoningToPreviousAssistant(messages, lastAssistant, &pendingReasoning)
+		messages = append(messages, msg)
+	}
+
 	for _, raw := range items {
 		item, ok := raw.(map[string]any)
 		if !ok {
 			if s, ok := raw.(string); ok {
-				flushCalls()
-				flushMedia()
-				messages = append(messages, map[string]any{"role": "user", "content": s})
+				appendUserItem(map[string]any{"role": "user", "content": s})
 			}
 			continue
+		}
+		// 非工具结果条目 = 回合边界：先降级孤儿结果（hoisted system 会被合并到
+		// 头部，不构成工具序列中断，参考同口径跳过）。
+		if !isToolResultItem(item) && !isSystemItem(item) {
+			flushOrphans()
 		}
 		switch stringField(item, "type") {
 		case "function_call":
@@ -223,38 +274,77 @@ func appendResponsesItems(items []any, ctx *ToolContext) []any {
 				seenCalls[id] = true
 			}
 			pendingCalls = append(pendingCalls, responsesToolSearchCallToChatToolCall(item))
-		case "function_call_output", "custom_tool_call_output", "tool_search_output":
+		case "function_call_output":
 			flushCalls()
 			callID := responseItemCallID(item)
-			// 剥离 tool 结果里的媒体块（Chat tool 消息不接受媒体），
-			// 收集到 pendingMedia，稍后作为合成 user 消息投递。
+			if callID == "" || !seenCalls[callID] {
+				pendingOrphans = append(pendingOrphans, item)
+				continue
+			}
 			toolContent, media := planToolOutputMedia(item["output"])
 			queueToolMedia(&pendingMedia, callID, media)
-			if callID == "" || !seenCalls[callID] {
-				// 孤儿结果：历史里没有对应的工具调用（客户端压缩/截断历史、
-				// 或输出先于调用出现）。Chat 要求 role:tool 必须有前置调用，
-				// 严格上游会 400，且之后每次重放都失败——转成 user 文本保留
-				// 上下文（对齐 cc-switch #8136）。
-				messages = append(messages, map[string]any{
-					"role":    "user",
-					"content": orphanToolOutputText(callID, toolContent),
-				})
-				continue
+			if len(media) == 0 {
+				if _, isString := item["output"].(string); isString {
+					// 字符串输出可解析为 JSON 时规范化（参考 canonicalize_json_string_if_parseable）。
+					toolContent = canonicalizeJSONStringIfParseable(toolContent)
+				}
 			}
 			messages = append(messages, map[string]any{
 				"role":         "tool",
 				"tool_call_id": callID,
 				"content":      toolContent,
 			})
+		case "custom_tool_call_output", "tool_search_output":
+			flushCalls()
+			callID := responseItemCallID(item)
+			if callID == "" || !seenCalls[callID] {
+				pendingOrphans = append(pendingOrphans, item)
+				continue
+			}
+			// 参考口径：custom/tool_search 结果以「整条 item 的 canonical JSON」
+			// 作为 tool content；媒体剥离后回写 output 字段。
+			transformed := cloneStringMap(item)
+			output, media := planToolOutputMedia(item["output"])
+			if len(media) > 0 {
+				queueToolMedia(&pendingMedia, callID, media)
+				transformed["output"] = output
+			}
+			messages = append(messages, map[string]any{
+				"role":         "tool",
+				"tool_call_id": callID,
+				"content":      canonicalJSON(transformed),
+			})
+		case "compaction_trigger":
+			// Codex 远程压缩：触发条目换成压缩提示词（用户消息）。
+			appendUserItem(compactionPromptItem())
+		case "compaction", "compaction_summary", "context_compaction":
+			// 历史压缩条目：解回摘要正文回放给模型；解不开的密文降级为说明文本。
+			if text, ok := compactionItemReplayText(item); ok {
+				appendUserItem(compactionSummaryUserItem(text))
+			}
 		case "reasoning":
 			flushMedia()
 			pendingReasoning = joinReasoning(pendingReasoning, responsesReasoningItemText(item))
 		case "additional_tools":
 			// 工具声明已在 buildToolContext 提升，此处不产生消息。
+		case "input_text", "input_image", "input_file", "input_audio":
+			// 裸 content-part item（无 type=message）：按单条消息处理，不丢内容。
+			flushCalls()
+			flushMedia()
+			flushOrphans()
+			synthetic := map[string]any{
+				"type":    "message",
+				"role":    firstNonEmpty(stringField(item, "role"), "user"),
+				"content": []any{item},
+			}
+			msg := responsesMessageToChatMessage(synthetic)
+			attachReasoningToPreviousAssistant(messages, lastAssistant, &pendingReasoning)
+			messages = append(messages, msg)
 		default:
 			if stringField(item, "type") == "message" || item["role"] != nil || item["content"] != nil {
 				flushCalls()
 				flushMedia()
+				flushOrphans()
 				msg := responsesMessageToChatMessage(item)
 				if msg["role"] == "assistant" {
 					// message item 自身也可能带 reasoning（客户端回放历史时把思考
@@ -278,8 +368,42 @@ func appendResponsesItems(items []any, ctx *ToolContext) []any {
 	}
 	flushCalls()
 	flushMedia()
+	flushOrphans()
 	attachReasoningToPreviousAssistant(messages, lastAssistant, &pendingReasoning)
 	return messages
+}
+
+// canonicalJSON 把值序列化为键序稳定的 JSON 字符串。
+func canonicalJSON(v any) string {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+// isToolResultItem 报告 item 是否为工具结果条目。
+func isToolResultItem(item map[string]any) bool {
+	switch stringField(item, "type") {
+	case "function_call_output", "custom_tool_call_output", "tool_search_output":
+		return true
+	}
+	return false
+}
+
+// isSystemItem 报告 item 是否 system/developer 角色（会被合并到头部）。
+func isSystemItem(item map[string]any) bool {
+	role := stringField(item, "role")
+	return role == "system" || role == "developer"
+}
+
+// cloneStringMap 浅拷贝 top-level map（只用于替换 output 字段，避免改动原始 item）。
+func cloneStringMap(src map[string]any) map[string]any {
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 // responsesMessageToChatMessage 把 Responses message item 转成 Chat message。
@@ -472,10 +596,32 @@ func joinReasoningUnique(existing, add string) string {
 	if existing == "" {
 		return add
 	}
-	if strings.Contains(existing, add) {
+	// 按空行分段去重（对齐参考#1341-1381 的 segment 口径）：子串判断会把
+	// "abc" 含 "bc" 误判成重复而丢段。
+	splitSegments := func(s string) []string {
+		var out []string
+		for _, seg := range strings.Split(s, "\n\n") {
+			if seg = strings.TrimSpace(seg); seg != "" {
+				out = append(out, seg)
+			}
+		}
+		return out
+	}
+	existingSegs := splitSegments(existing)
+	seen := make(map[string]bool, len(existingSegs))
+	for _, seg := range existingSegs {
+		seen[seg] = true
+	}
+	var missing []string
+	for _, seg := range splitSegments(add) {
+		if !seen[seg] {
+			missing = append(missing, seg)
+		}
+	}
+	if len(missing) == 0 {
 		return existing
 	}
-	return existing + "\n\n" + add
+	return existing + "\n\n" + strings.Join(missing, "\n\n")
 }
 
 // attachReasoningToPreviousAssistant 把剩余 pending reasoning 回溯附挂到上一条
@@ -490,18 +636,51 @@ func attachReasoningToPreviousAssistant(messages []any, lastAssistant int, pendi
 	*pending = ""
 }
 
-// collapseSystemMessages 把 system 消息折叠到 messages 头部。
+// collapseSystemMessages 把字符串 content 的 system 消息合并成一条并放到
+// messages 头部（对齐参考 collapse_system_messages_to_head）：部分上游只允许
+// 首条 system（MiniMax 等），逐条保留会 400；合并同时稳定提示词前缀。
+// 非字符串 content 的 system 消息保持原位（参考同口径）。
 func collapseSystemMessages(messages []any) []any {
-	systems := []any{}
-	rest := []any{}
+	chunks := []string{}
+	rest := make([]any, 0, len(messages))
 	for _, m := range messages {
 		if msg, ok := m.(map[string]any); ok && msg["role"] == "system" {
-			systems = append(systems, m)
-		} else {
-			rest = append(rest, m)
+			if text, ok := msg["content"].(string); ok {
+				if strings.TrimSpace(text) != "" {
+					chunks = append(chunks, text)
+				}
+				continue
+			}
 		}
+		rest = append(rest, m)
 	}
-	return append(systems, rest...)
+	if len(chunks) == 0 {
+		return rest
+	}
+	out := make([]any, 0, len(rest)+1)
+	out = append(out, map[string]any{"role": "system", "content": strings.Join(chunks, "\n\n")})
+	return append(out, rest...)
+}
+
+// backfillToolCallReasoningPlaceholders 给带 tool_calls 但缺非空 reasoning_content
+// 的 assistant 补占位 "tool call"（对齐参考 backfill_tool_call_reasoning_placeholders）：
+// kimi/Moonshot、DeepSeek 等 thinking 模型要求该字段非空，跨轮恢复 miss 时防 400。
+func backfillToolCallReasoningPlaceholders(messages []any) []any {
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if !ok || msg["role"] != "assistant" {
+			continue
+		}
+		calls, _ := msg["tool_calls"].([]any)
+		if len(calls) == 0 {
+			continue
+		}
+		if rc, ok := msg["reasoning_content"].(string); ok && strings.TrimSpace(rc) != "" {
+			continue
+		}
+		msg["reasoning_content"] = "tool call"
+	}
+	return messages
 }
 
 // applyReasoning 把 Responses 的 reasoning.effort 映射到 Chat 的 reasoning_effort。

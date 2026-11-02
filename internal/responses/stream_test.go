@@ -317,22 +317,51 @@ func TestStreamGuardAfterFailed(t *testing.T) {
 	}
 }
 
-// TestStreamTruncatedStreamFails 截断防御：无 finish_reason 也无 [DONE] 的断流
-// 必须报 response.failed，不得谎报 completed。
-func TestStreamTruncatedStreamFails(t *testing.T) {
+// TestStreamTruncatedWithOutputIsIncomplete 断流但已产出内容：按参考实现合成
+// finish_reason=length → incomplete（保留内容），而不是整体判失败。
+func TestStreamTruncatedWithOutputIsIncomplete(t *testing.T) {
 	s := NewStreamState(nil)
 	var buf bytes.Buffer
 	buf.Write(s.HandleChunk(chunk(map[string]any{"content": "half text"}, "", nil)))
 	buf.Write(s.Finalize()) // 模拟上游断流后直接收尾
 	out := buf.String()
+	if strings.Contains(out, "event: response.failed") {
+		t.Errorf("有实质输出的断流不应判失败\n%s", out)
+	}
+	if !strings.Contains(out, `"status":"incomplete"`) {
+		t.Errorf("truncated stream should be incomplete\n%s", out)
+	}
+	if !strings.Contains(out, "max_output_tokens") {
+		t.Errorf("missing incomplete reason\n%s", out)
+	}
+}
+
+// TestStreamTruncatedEmptyFails 完全空流的断流仍必须报 response.failed。
+func TestStreamTruncatedEmptyFails(t *testing.T) {
+	s := NewStreamState(nil)
+	out := string(s.Finalize())
 	if !strings.Contains(out, "event: response.failed") {
-		t.Errorf("truncated stream must fail\n%s", out)
+		t.Errorf("empty truncated stream must fail\n%s", out)
 	}
 	if !strings.Contains(out, "upstream_truncated") {
 		t.Errorf("missing truncated error type\n%s", out)
 	}
-	if strings.Contains(out, "event: response.completed") {
-		t.Errorf("truncated stream must not complete\n%s", out)
+}
+
+// TestStreamDoneWithoutFinishReasonCompletes [DONE] 是显式终态：没有
+// finish_reason 也必须正常完成，不能误判成 truncated（对齐参考实现）。
+func TestStreamDoneWithoutFinishReasonCompletes(t *testing.T) {
+	s := NewStreamState(nil)
+	var buf bytes.Buffer
+	buf.Write(s.HandleChunk(chunk(map[string]any{"content": "done text"}, "", nil)))
+	s.MarkDone()
+	buf.Write(s.Finalize())
+	out := buf.String()
+	if strings.Contains(out, "response.failed") {
+		t.Errorf("[DONE] 收尾不应失败\n%s", out)
+	}
+	if !strings.Contains(out, `"status":"completed"`) {
+		t.Errorf("[DONE] 应 completed\n%s", out)
 	}
 }
 

@@ -379,27 +379,25 @@ func TestToolRosterHintAppendedAtTail(t *testing.T) {
 	}
 	out := decode(t, raw)
 	msgs, _ := out["messages"].([]any)
-	if len(msgs) < 3 {
-		t.Fatalf("messages len=%d", len(msgs))
+	if len(msgs) != 2 {
+		t.Fatalf("messages len=%d（instructions 与名单提示应合并成一条 system）", len(msgs))
 	}
-	// 名单提示位于头部 system 区：instructions 之后、首条对话消息之前
-	//（对齐 TWA wb_toolexec 注入范式：约束行为 + prompt cache 前缀稳定）。
+	// instructions 与名单提示合并进头部唯一 system（对齐参考的单 system 形态）。
 	first, _ := msgs[0].(map[string]any)
-	if first["role"] != "system" || !strings.Contains(rawString(first, "content"), "You are a coding agent.") {
-		t.Fatalf("first message should be instructions system, got %v", first)
+	if first["role"] != "system" {
+		t.Fatalf("first message should be system, got %v", first)
 	}
-	hint, _ := msgs[1].(map[string]any)
-	if hint["role"] != "system" {
-		t.Fatalf("second message role=%v, want system roster hint", hint["role"])
+	content := rawString(first, "content")
+	if !strings.Contains(content, "You are a coding agent.") {
+		t.Errorf("merged system missing instructions: %q", content)
 	}
-	content := rawString(hint, "content")
 	for _, want := range []string{"exec_command", "write_stdin", "shell", "apply_patch"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("roster hint missing %q: %q", want, content)
 		}
 	}
-	if u, _ := msgs[2].(map[string]any); u["role"] != "user" {
-		t.Errorf("third message should be the first conversation message, got %v", u)
+	if u, _ := msgs[1].(map[string]any); u["role"] != "user" {
+		t.Errorf("second message should be the first conversation message, got %v", u)
 	}
 }
 

@@ -48,6 +48,9 @@ type ToolContext struct {
 	seenChatNames  map[string]bool
 	// nsNameToChat (namespace\x00name) → 扁平化后的 Chat 工具名，供回程精确还原。
 	nsNameToChat map[string]string
+	// compaction 本次请求是 Codex 远程压缩回合（input 含 compaction_trigger）：
+	// 该回合不下发工具，响应必须是单个 compaction item。
+	compaction bool
 }
 
 // NewToolContext 构造空工具上下文（导出供 server 层与测试使用）。
@@ -61,6 +64,12 @@ func NewToolContext() *ToolContext {
 
 // ChatTools 返回转换后的 Chat 工具数组（可能为空）。
 func (c *ToolContext) ChatTools() []any { return c.chatTools }
+
+// IsCompaction 报告本次请求是否为 Codex 远程压缩回合。
+func (c *ToolContext) IsCompaction() bool { return c != nil && c.compaction }
+
+// SetCompaction 标记本次请求为压缩回合（由 buildToolContext 调用）。
+func (c *ToolContext) SetCompaction(v bool) { c.compaction = v }
 
 // Lookup 按 Chat 工具名反查 Responses 工具规格。
 func (c *ToolContext) Lookup(chatName string) (ToolSpec, bool) {

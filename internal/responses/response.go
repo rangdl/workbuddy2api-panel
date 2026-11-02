@@ -8,6 +8,10 @@ import (
 
 // FromChat 把 Chat Completions 响应（upstream.Aggregate 结果）转换为 Responses 响应。
 func FromChat(resp map[string]any, ctx *ToolContext) (map[string]any, error) {
+	// 部分中转把 Chat completion 包在 {"data":{...}} 里（对齐参考 #5658）。
+	if wrapped, ok := resp["data"].(map[string]any); ok {
+		resp = wrapped
+	}
 	choices, _ := resp["choices"].([]any)
 	if len(choices) == 0 {
 		return nil, fmt.Errorf("no choices in chat response")
@@ -35,7 +39,8 @@ func FromChat(resp map[string]any, ctx *ToolContext) (map[string]any, error) {
 	if item := chatMessageToResponseItem(message, responseID); item != nil {
 		output = append(output, item)
 	}
-	output = append(output, chatToolCallsToResponseItems(message, reasoning, ctx)...)
+	toolItems, dropped := chatToolCallsToResponseItems(message, reasoning, ctx)
+	output = append(output, toolItems...)
 
 	out := map[string]any{
 		"id":         responseID,
@@ -49,6 +54,32 @@ func FromChat(resp map[string]any, ctx *ToolContext) (map[string]any, error) {
 	if finishReason == "length" {
 		out["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
 	}
+	if ctx.IsCompaction() {
+		return finalizeCompactionNonStream(out, output, finishReason)
+	}
+	// 「答一句就停」防御（对齐参考 #4341）：丢弃过无名工具调用且最终一个可用的
+	// 都没剩下时，如实报错而不是谎报 completed（流式路径同判据）。
+	if out["status"] == "completed" && dropped > 0 && len(toolItems) == 0 {
+		return nil, fmt.Errorf("upstream returned %d tool call(s) without a function name, leaving no usable tool call in this turn", dropped)
+	}
+	return out, nil
+}
+
+// finalizeCompactionNonStream 压缩回合的非流式收尾：非正常结束报 incomplete，
+// 摘要为空报错，否则追加唯一 compaction item。
+func finalizeCompactionNonStream(out map[string]any, output []any, finishReason string) (map[string]any, error) {
+	if reason := compactionIncompleteReason(finishReason); reason != "" {
+		out["status"] = "incomplete"
+		out["incomplete_details"] = map[string]any{"reason": reason}
+		return out, nil
+	}
+	summary := compactionSummaryFromAnyItems(output)
+	if strings.TrimSpace(summary) == "" {
+		return nil, fmt.Errorf("upstream returned no summary text for the compaction turn")
+	}
+	out["output"] = append(output, compactionOutputItem(summary))
+	out["status"] = "completed"
+	delete(out, "incomplete_details")
 	return out, nil
 }
 
@@ -134,18 +165,19 @@ func chatMessageToResponseItem(message map[string]any, responseID string) map[st
 // chatToolCallsToResponseItems 把 Chat tool_calls 还原为 Responses output items。
 // 依据 ToolContext 把 Chat 侧扁平/代理名还原为 function_call / custom_tool_call /
 // tool_search_call；缺失 name 的调用丢弃（防御畸形上游）。
-func chatToolCallsToResponseItems(message map[string]any, reasoning string, ctx *ToolContext) []any {
+func chatToolCallsToResponseItems(message map[string]any, reasoning string, ctx *ToolContext) ([]any, int) {
 	toolCalls, _ := message["tool_calls"].([]any)
 	if len(toolCalls) == 0 {
 		if legacy, ok := message["function_call"].(map[string]any); ok {
 			if item := chatLegacyFunctionCallToResponseItem(legacy, reasoning, ctx); item != nil {
-				return []any{item}
+				return []any{item}, 0
 			}
 		}
-		return nil
+		return nil, 0
 	}
 
 	items := make([]any, 0, len(toolCalls))
+	dropped := 0
 	for i, raw := range toolCalls {
 		tc, ok := raw.(map[string]any)
 		if !ok {
@@ -154,6 +186,7 @@ func chatToolCallsToResponseItems(message map[string]any, reasoning string, ctx 
 		fn, _ := tc["function"].(map[string]any)
 		name := stringField(fn, "name")
 		if name == "" {
+			dropped++
 			continue
 		}
 		callID := stringField(tc, "id")
@@ -163,7 +196,7 @@ func chatToolCallsToResponseItems(message map[string]any, reasoning string, ctx 
 		arguments := canonicalizeToolArguments(fn["arguments"])
 		items = append(items, chatToolCallToResponseItem(callID, name, arguments, reasoning, ctx))
 	}
-	return items
+	return items, dropped
 }
 
 // chatToolCallToResponseItem 还原单个 tool_call（非流式，status=completed）。

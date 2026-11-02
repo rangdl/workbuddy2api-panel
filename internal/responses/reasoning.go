@@ -93,20 +93,3 @@ func extractReasoningSummaryText(summary any) string {
 		return ""
 	}
 }
-
-// splitLeadingThinkBlock 拆分文本开头的内联思考块（<think> / <thinking>）。
-// 返回 (reasoning, answer, found)；无 think 块或块未闭合时 found=false。
-// 与流式 inlineThinkSplitter 共用标签识别与容错（允许开闭标签不配对）。
-func splitLeadingThinkBlock(text string) (string, string, bool) {
-	body, ok := stripLeadingThinkOpenTag(text)
-	if !ok {
-		return "", text, false
-	}
-	closeIdx, closeTag, ok := findThinkCloseTag(body)
-	if !ok {
-		return "", text, false
-	}
-	reasoning := strings.Trim(body[:closeIdx], thinkSeparators)
-	answer := strings.TrimLeft(body[closeIdx+len(closeTag):], thinkSeparators)
-	return reasoning, answer, true
-}

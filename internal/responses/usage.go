@@ -15,20 +15,33 @@ func chatUsageToResponsesUsage(usage any) map[string]any {
 		totalTokens = inputTokens + outputTokens
 	}
 
-	result := map[string]any{
+	cached := cachedTokens(obj)
+	cacheWrite := cacheWriteTokens(obj)
+	inputDetails := map[string]any{"cached_tokens": cached}
+	if cached > 0 || cacheWrite > 0 {
+		inputDetails["cache_write_tokens"] = cacheWrite
+	}
+	return map[string]any{
 		"input_tokens":          inputTokens,
 		"output_tokens":         outputTokens,
 		"total_tokens":          totalTokens,
-		"input_tokens_details":  map[string]any{"cached_tokens": cachedTokens(obj)},
+		"input_tokens_details":  inputDetails,
 		"output_tokens_details": outputTokensDetails(obj),
 	}
-	if v, ok := obj["cache_read_input_tokens"]; ok {
-		result["cache_read_input_tokens"] = numToInt(v)
-	}
+}
+
+// cacheWriteTokens 提取缓存写入 token 数（对齐参考：details 两级 → 直传字段）。
+func cacheWriteTokens(obj map[string]any) int64 {
 	if n, ok := nestedNum(obj, "prompt_tokens_details", "cache_write_tokens"); ok && n > 0 {
-		result["cache_creation_input_tokens"] = n
+		return n
 	}
-	return result
+	if n, ok := nestedNum(obj, "input_tokens_details", "cache_write_tokens"); ok && n > 0 {
+		return n
+	}
+	if n := numToInt(obj["cache_creation_input_tokens"]); n > 0 {
+		return n
+	}
+	return 0
 }
 
 // emptyResponsesUsage 返回全零 usage。
@@ -67,19 +80,19 @@ func nestedNum(obj map[string]any, outer, inner string) (int64, bool) {
 	return numToInt(v), true
 }
 
-// cachedTokens 提取缓存命中 token 数（多来源兜底）。
+// cachedTokens 提取缓存命中 token 数（多来源兜底，每级要求「存在且非 0」：
+// 部分中转把靠前字段硬编码为桩 0，真值只在低顺位字段；对齐参考 #8041）。
 func cachedTokens(obj map[string]any) int64 {
-	if v, ok := obj["cache_read_input_tokens"]; ok {
-		return numToInt(v)
+	for _, key := range []string{"cache_read_input_tokens", "prompt_cache_hit_tokens"} {
+		if n := numToInt(obj[key]); n > 0 {
+			return n
+		}
 	}
-	if n, ok := nestedNum(obj, "prompt_tokens_details", "cached_tokens"); ok {
+	if n, ok := nestedNum(obj, "prompt_tokens_details", "cached_tokens"); ok && n > 0 {
 		return n
 	}
-	if n, ok := nestedNum(obj, "input_tokens_details", "cached_tokens"); ok {
+	if n, ok := nestedNum(obj, "input_tokens_details", "cached_tokens"); ok && n > 0 {
 		return n
-	}
-	if v, ok := obj["prompt_cache_hit_tokens"]; ok {
-		return numToInt(v)
 	}
 	return 0
 }

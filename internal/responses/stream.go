@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -54,7 +55,9 @@ type StreamState struct {
 	finishReason string
 	started      bool
 	completed    bool
-	outputItems  []map[string]any
+	outputItems  []outputItem
+	// sawDone 上游显式发过 data: [DONE]（显式结束标记，独立于 finish_reason）。
+	sawDone bool
 	// sawTerminalSource 报告流是否以合法方式结束（收到 [DONE] 或 finish_reason）。
 	// 两者都缺 = 上游在流中途断开（连接死亡/非正常终止），Finalize 不得谎报
 	// response.completed——残缺文本与截断的工具参数会被客户端当完整回合执行。
@@ -108,7 +111,7 @@ func (s *StreamState) HandleChunk(chunk map[string]any) []byte {
 			s.pushReasoning(&out, reasoning)
 		}
 		if content := rawString(delta, "content"); content != "" {
-			thinking, text := s.think.push(content)
+			thinking, text := s.think.Push(content)
 			if thinking != "" {
 				s.pushReasoning(&out, thinking)
 			}
@@ -134,6 +137,27 @@ func (s *StreamState) HandleChunk(chunk map[string]any) []byte {
 	return out.Bytes()
 }
 
+// MarkDone 标记上游显式发过 data: [DONE]（显式结束标记，独立于 finish_reason）。
+func (s *StreamState) MarkDone() { s.sawDone = true }
+
+// hasSubstantiveOutput 报告本回合是否已产出实质内容（用于流结束时的终态判定）。
+func (s *StreamState) hasSubstantiveOutput() bool {
+	if strings.TrimSpace(s.textBuf.String()) != "" ||
+		strings.TrimSpace(s.reasoningBuf.String()) != "" {
+		return true
+	}
+	if len(s.outputItems) > 0 {
+		return true
+	}
+	for _, st := range s.tools {
+		if st != nil && (st.added || strings.TrimSpace(st.callID) != "" ||
+			strings.TrimSpace(st.name) != "" || strings.TrimSpace(st.arguments.String()) != "") {
+			return true
+		}
+	}
+	return false
+}
+
 // Finalize 收尾：关闭所有打开的 item 并发 response.completed（幂等）。
 //
 // 截断防御：收尾前若从未见过 finish_reason（[DONE] 或 finish_reason 帧均缺席），
@@ -151,12 +175,24 @@ func (s *StreamState) Finalize() []byte {
 	s.finalizeText(&out)
 	s.finalizeTools(&out)
 
-	// 上游异常断流（无任何 finish_reason）：如实报失败。
-	if !s.sawTerminalSource {
-		out.Write(sseEvent("response.failed", map[string]any{"response": s.failedResponse(
-			"upstream stream ended before finish_reason (truncated)", "upstream_truncated")}))
-		s.completed = true
-		return out.Bytes()
+	// Codex 远程压缩回合：交回唯一 compaction item（对齐参考 finish_compaction）。
+	if s.toolCtx.IsCompaction() {
+		return s.finishCompaction(out.Bytes())
+	}
+
+	// 终态判定（对齐参考）：
+	//   - 收到 [DONE] 即显式结束，没有 finish_reason 也按正常结束处理；
+	//   - 只断了连接（既无 [DONE] 也无 finish_reason）但已产出实质内容：
+	//     合成 finish_reason=length → incomplete（保留已产出内容）；
+	//   - 什么都没有才报 truncated。
+	if !s.sawTerminalSource && !s.sawDone {
+		if !s.hasSubstantiveOutput() {
+			out.Write(sseEvent("response.failed", map[string]any{"response": s.failedResponse(
+				"upstream stream ended before finish_reason (truncated)", "upstream_truncated")}))
+			s.completed = true
+			return out.Bytes()
+		}
+		s.finishReason = "length"
 	}
 
 	status := responseStatusFromFinishReason(s.finishReason)
@@ -183,6 +219,35 @@ func (s *StreamState) Finalize() []byte {
 	return out.Bytes()
 }
 
+// finishCompaction 压缩回合收尾：交回唯一 compaction item。
+// 非正常结束（截断/内容过滤）或摘要为空时报可重试错误，不能让 Codex 装上半截摘要。
+func (s *StreamState) finishCompaction(prefix []byte) []byte {
+	var out bytes.Buffer
+	out.Write(prefix)
+	if reason := compactionIncompleteReason(s.finishReason); reason != "" {
+		resp := s.baseResponse("incomplete", itemsToAny(s.outputItems))
+		resp["incomplete_details"] = map[string]any{"reason": reason}
+		out.Write(sseEvent("response.incomplete", map[string]any{"response": resp}))
+		s.completed = true
+		return out.Bytes()
+	}
+	summary := compactionSummaryFromItems(s.outputItems)
+	if strings.TrimSpace(summary) == "" {
+		out.Write(sseEvent("response.failed", map[string]any{"response": s.failedResponse(
+			"Upstream returned no summary text for the compaction turn", "compaction_summary_empty")}))
+		s.completed = true
+		return out.Bytes()
+	}
+	item := compactionOutputItem(summary)
+	idx := s.allocIndex()
+	out.Write(sseEvent("response.output_item.done", map[string]any{"output_index": idx, "item": item}))
+	s.outputItems = append(s.outputItems, outputItem{index: idx, item: item})
+	resp := s.baseResponse("completed", itemsToAny(s.outputItems))
+	out.Write(sseEvent("response.completed", map[string]any{"response": resp}))
+	s.completed = true
+	return out.Bytes()
+}
+
 // Failed 发出 response.failed（用于上游错误/空流）。
 func (s *StreamState) Failed(message, errType string) []byte {
 	if s.completed {
@@ -199,6 +264,24 @@ func (s *StreamState) Failed(message, errType string) []byte {
 	return out.Bytes()
 }
 
+// FailedWithError 用规整后的错误对象发 response.failed（保留上游 type/code）。
+func (s *StreamState) FailedWithError(errObj map[string]any) []byte {
+	if s.completed {
+		return nil
+	}
+	var out bytes.Buffer
+	s.ensureStarted(&out)
+	s.flushInlineThink(&out)
+	s.finalizeReasoning(&out)
+	s.finalizeText(&out)
+	s.finalizeTools(&out)
+	resp := s.baseResponse("failed", itemsToAny(s.outputItems))
+	resp["error"] = errObj
+	out.Write(sseEvent("response.failed", map[string]any{"response": resp}))
+	s.completed = true
+	return out.Bytes()
+}
+
 // failedResponse 构造 status=failed 的 response 对象（含 error）。
 func (s *StreamState) failedResponse(message, errType string) map[string]any {
 	resp := s.baseResponse("failed", itemsToAny(s.outputItems))
@@ -208,8 +291,8 @@ func (s *StreamState) failedResponse(message, errType string) map[string]any {
 
 // hasEmittedToolCall 报告本回合最终产出里是否至少有一个 Codex 可识别的工具调用 item。
 func (s *StreamState) hasEmittedToolCall() bool {
-	for _, item := range s.outputItems {
-		switch item["type"] {
+	for _, it := range s.outputItems {
+		switch it.item["type"] {
 		case "function_call", "custom_tool_call", "tool_search_call":
 			return true
 		}
@@ -364,13 +447,13 @@ func (s *StreamState) finalizeReasoning(out *bytes.Buffer) {
 		"summary": []any{map[string]any{"type": "summary_text", "text": text}},
 	}
 	out.Write(sseEvent("response.output_item.done", map[string]any{"output_index": s.reasoningIndex, "item": item}))
-	s.outputItems = append(s.outputItems, item)
+	s.outputItems = append(s.outputItems, outputItem{index: s.reasoningIndex, item: item})
 }
 
 // flushInlineThink 冲刷内联思考分裂器的残留（幂等）：未闭合的 think 块按
 // 思考内容下发，尚在 Detecting 的缓冲按正文下发。
 func (s *StreamState) flushInlineThink(out *bytes.Buffer) {
-	thinking, text := s.think.flush()
+	thinking, text := s.think.Flush()
 	if thinking != "" {
 		s.pushReasoning(out, thinking)
 	}
@@ -398,7 +481,7 @@ func (s *StreamState) finalizeText(out *bytes.Buffer) {
 		"content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}},
 	}
 	out.Write(sseEvent("response.output_item.done", map[string]any{"output_index": s.textIndex, "item": item}))
-	s.outputItems = append(s.outputItems, item)
+	s.outputItems = append(s.outputItems, outputItem{index: s.textIndex, item: item})
 }
 
 func (s *StreamState) finalizeTools(out *bytes.Buffer) {
@@ -429,6 +512,11 @@ func (s *StreamState) finalizeTools(out *bytes.Buffer) {
 			}))
 		}
 		arguments := state.arguments.String()
+		// 无参工具调用模型可能只发 name：空串归一为 "{}"（严格上游与 Codex
+		// 都要求可解析 JSON；对齐参考 canonicalize_tool_arguments_str）。
+		if !s.isCustom(state.name) {
+			arguments = canonicalizeToolArguments(arguments)
+		}
 		// reasoning 紧邻附挂（与非流式 FromChat 同口径）：DeepSeek 系上游要求
 		// assistant 的 tool_call 携带 reasoning_content，否则增量第二轮
 		// previous_response_id 恢复后 400（codex 恒走流式，必须在此持久化）。
@@ -450,7 +538,7 @@ func (s *StreamState) finalizeTools(out *bytes.Buffer) {
 			}))
 		}
 		out.Write(sseEvent("response.output_item.done", map[string]any{"output_index": state.outputIndex, "item": item}))
-		s.outputItems = append(s.outputItems, item)
+		s.outputItems = append(s.outputItems, outputItem{index: state.outputIndex, item: item})
 		state.done = true
 	}
 }
@@ -559,10 +647,21 @@ func sseEvent(eventType string, data map[string]any) []byte {
 	return b.Bytes()
 }
 
-func itemsToAny(items []map[string]any) []any {
-	out := make([]any, len(items))
-	for i, item := range items {
-		out[i] = item
+// outputItem 已完成的 output item 与其 output_index（用于按事件顺序输出）。
+type outputItem struct {
+	index int
+	item  map[string]any
+}
+
+// itemsToAny 按 output_index 排序后转成 []any（对齐参考实现
+// completed_output_items：事件顺序与 output 数组顺序一致）。
+func itemsToAny(items []outputItem) []any {
+	sorted := make([]outputItem, len(items))
+	copy(sorted, items)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].index < sorted[j].index })
+	out := make([]any, len(sorted))
+	for i, it := range sorted {
+		out[i] = it.item
 	}
 	return out
 }

@@ -158,7 +158,7 @@ func TestOrphanToolOutputBecomesUserText(t *testing.T) {
 	}
 	orphan, _ := out["messages"].([]any)[1].(map[string]any)
 	content, _ := orphan["content"].(string)
-	for _, want := range []string{"Orphan tool output", "missing_call", "ok"} {
+	for _, want := range []string{"tool_result without a matching tool_call", "missing_call", "ok"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("孤儿结果文本缺少 %q: %q", want, content)
 		}

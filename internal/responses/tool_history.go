@@ -170,15 +170,29 @@ func appendContextText(content any, texts []string) any {
 	}
 }
 
-// orphanToolOutputText 生成孤儿工具结果的上下文文本：保留 call_id 与原始输出，
-// 让模型知道这里曾有一次工具执行，但没有对应调用可回填。
-func orphanToolOutputText(callID, output string) string {
-	head := "[Orphan tool output; no matching tool call in history; context only]"
+// orphanToolOutputMarker 无配对调用的工具结果降级文案（对齐参考
+// ORPHAN_TOOL_OUTPUT_MARKER）。
+const orphanToolOutputMarker = "[tool_result without a matching tool_call]"
+
+// orphanToolOutputMessage 把孤儿工具结果降级成 user 消息：文本 body 内联
+// 「媒体已挂在本条消息」占位，媒体本体作为同一条消息的 content parts 跟随
+// （避免 base64 被序列化成纯文本既看不到图又撑爆 token）。
+func orphanToolOutputMessage(item map[string]any) map[string]any {
+	callID := responseItemCallID(item)
+	body, media := planToolOutputMediaWithMarker(item["output"], toolMediaAttachedMarker)
+	marker := orphanToolOutputMarker
 	if callID != "" {
-		head += "\ncall_id: " + callID
+		marker += " (call_id: " + callID + ")"
 	}
-	if output == "" {
-		return head
+	text := marker
+	if body != "" {
+		text += "\n" + body
 	}
-	return head + "\noutput: " + output
+	if len(media) == 0 {
+		return map[string]any{"role": "user", "content": text}
+	}
+	parts := make([]any, 0, len(media)+1)
+	parts = append(parts, map[string]any{"type": "text", "text": text})
+	parts = append(parts, media...)
+	return map[string]any{"role": "user", "content": parts}
 }

@@ -9,11 +9,11 @@ func runThinkSplitter(deltas []string) (string, string) {
 	var sp inlineThinkSplitter
 	var thinking, text strings.Builder
 	for _, delta := range deltas {
-		th, tx := sp.push(delta)
+		th, tx := sp.Push(delta)
 		thinking.WriteString(th)
 		text.WriteString(tx)
 	}
-	th, tx := sp.flush()
+	th, tx := sp.Flush()
 	thinking.WriteString(th)
 	text.WriteString(tx)
 	return thinking.String(), text.String()
@@ -47,15 +47,15 @@ func TestInlineThinkSplitter(t *testing.T) {
 // 未闭合的 think 块在边界冲刷时按思考内容原样下发，不丢失已收到的载荷。
 func TestInlineThinkSplitterFlushUnclosed(t *testing.T) {
 	var sp inlineThinkSplitter
-	if th, tx := sp.push("\x3cthink\x3eabc</thi"); th != "abc" || tx != "" {
+	if th, tx := sp.Push("\x3cthink\x3eabc</thi"); th != "abc" || tx != "" {
 		t.Fatalf("push=%q/%q", th, tx)
 	}
-	th, tx := sp.flush()
+	th, tx := sp.Flush()
 	if th != "</thi" || tx != "" {
 		t.Errorf("flush=%q/%q", th, tx)
 	}
 	// 幂等：再次 flush 不重复输出。
-	if th, tx := sp.flush(); th != "" || tx != "" {
+	if th, tx := sp.Flush(); th != "" || tx != "" {
 		t.Errorf("second flush=%q/%q", th, tx)
 	}
 }
