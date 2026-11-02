@@ -130,15 +130,29 @@ func TestThinkingBlocksToReasoningContent(t *testing.T) {
 
 // thinking 配置 → reasoning_effort 分档；未开 thinking 不注入。
 func TestThinkingEffortMapping(t *testing.T) {
-	out := mustToChat(t, `{"model":"m","max_tokens":1,"thinking":{"type":"enabled","budget_tokens":10240},"messages":[{"role":"user","content":"hi"}]}`)
-	if out["reasoning_effort"] != "high" {
-		t.Errorf("budget 10240 → effort=%v, want high", out["reasoning_effort"])
+	// 分档对齐参考 effort_from_thinking：<4000 low / <16000 medium / 其余 high。
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"budget 2048", `{"model":"m","thinking":{"type":"enabled","budget_tokens":2048}}`, "low"},
+		{"budget 10240", `{"model":"m","thinking":{"type":"enabled","budget_tokens":10240}}`, "medium"},
+		{"budget 20000", `{"model":"m","thinking":{"type":"enabled","budget_tokens":20000}}`, "high"},
+		{"enabled 无 budget", `{"model":"m","thinking":{"type":"enabled"}}`, "high"},
+		{"adaptive", `{"model":"m","thinking":{"type":"adaptive"}}`, "xhigh"},
+		{"output_config 直映", `{"model":"m","thinking":{"type":"enabled"},"output_config":{"effort":"high"}}`, "high"},
+		{"output_config + thinking off 降 low", `{"model":"m","output_config":{"effort":"high"}}`, "low"},
+		{"5.x 默认 adaptive", `{"model":"claude-sonnet-5-5"}`, "xhigh"},
 	}
-	out = mustToChat(t, `{"model":"m","max_tokens":1,"thinking":{"type":"enabled","budget_tokens":2048},"messages":[{"role":"user","content":"hi"}]}`)
-	if out["reasoning_effort"] != "medium" {
-		t.Errorf("budget 2048 → effort=%v, want medium", out["reasoning_effort"])
+	for _, c := range cases {
+		body := `{` + c.body[1:len(c.body)-1] + `,"max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`
+		out := mustToChat(t, body)
+		if out["reasoning_effort"] != c.want {
+			t.Errorf("%s: effort=%v, want %s", c.name, out["reasoning_effort"], c.want)
+		}
 	}
-	out = mustToChat(t, `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`)
+	out := mustToChat(t, `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`)
 	if _, has := out["reasoning_effort"]; has {
 		t.Errorf("no thinking config should not inject reasoning_effort: %v", out["reasoning_effort"])
 	}
@@ -302,7 +316,7 @@ func TestLeadingThinkBlockSplit(t *testing.T) {
 	}
 }
 
-// 坏 JSON arguments → {_raw} 保真。
+// 坏 JSON arguments → 空对象（对齐参考：{_raw} 不满足工具 schema）。
 func TestToolInputBadJSONFallback(t *testing.T) {
 	resp := chatResp(`{"id":"c","model":"m","choices":[{"finish_reason":"tool_calls",
 		"message":{"role":"assistant","content":"","tool_calls":[{"id":"t","type":"function","function":{"name":"f","arguments":"not-json"}}]}}]}`)
@@ -310,8 +324,8 @@ func TestToolInputBadJSONFallback(t *testing.T) {
 	content, _ := msg["content"].([]any)
 	tu, _ := content[0].(map[string]any)
 	input, _ := tu["input"].(map[string]any)
-	if input["_raw"] != "not-json" {
-		t.Errorf("input=%v, want _raw fallback", input)
+	if len(input) != 0 {
+		t.Errorf("input=%v, want empty object fallback", input)
 	}
 }
 

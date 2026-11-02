@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"strings"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/inlinethink"
 )
 
 // StreamState 把 Chat Completions SSE 帧转换为 Anthropic Messages SSE 事件。
@@ -54,6 +56,9 @@ type StreamState struct {
 	nextToolIndexToAdd int
 	droppedToolCalls   int // 缺名调用计数（收尾防御）
 
+	// think 跨 chunk 剥离正文开头的内联思考块（<think>/<thinking>）。
+	think inlinethink.Splitter
+
 	startedAt int64
 	completed bool
 }
@@ -93,11 +98,24 @@ func (s *StreamState) HandleChunk(chunk map[string]any) []byte {
 	if model := rawString(chunk, "model"); model != "" {
 		s.model = model
 	}
-	s.ensureStarted(&out)
-
+	// usage 先于 message_start 解析：首帧常带 prompt_tokens/cache 桶，
+	// message_start.usage 要用它填（对齐参考 streaming.rs）。
 	if usage, ok := chunk["usage"].(map[string]any); ok && usage != nil {
-		s.usage = usage // 末帧覆盖（include_usage 语义）
+		if s.usage == nil {
+			s.usage = usage
+		} else {
+			// 末帧覆盖 output 侧；input/cache 首帧已有值则保留（部分上游末帧省略）。
+			merged := make(map[string]any, len(s.usage)+len(usage))
+			for k, v := range s.usage {
+				merged[k] = v
+			}
+			for k, v := range usage {
+				merged[k] = v
+			}
+			s.usage = merged
+		}
 	}
+	s.ensureStarted(&out)
 
 	choices, _ := chunk["choices"].([]any)
 	if len(choices) == 0 {
@@ -106,13 +124,25 @@ func (s *StreamState) HandleChunk(chunk map[string]any) []byte {
 	choice, _ := choices[0].(map[string]any)
 
 	if delta, ok := choice["delta"].(map[string]any); ok {
-		if reasoning := rawString(delta, "reasoning_content"); reasoning != "" {
+		// OpenRouter/Kimi 用 reasoning，DeepSeek 用 reasoning_content（参考 serde alias）。
+		reasoning := rawString(delta, "reasoning_content")
+		if reasoning == "" {
+			reasoning = rawString(delta, "reasoning")
+		}
+		if reasoning != "" {
 			s.pushThinking(&out, reasoning)
 		}
 		if content := rawString(delta, "content"); content != "" {
-			s.pushText(&out, content)
+			thinking, text := s.think.Push(content)
+			if thinking != "" {
+				s.pushThinking(&out, thinking)
+			}
+			if text != "" {
+				s.pushText(&out, text)
+			}
 		}
 		if tcs, ok := delta["tool_calls"].([]any); ok {
+			s.flushInlineThink(&out)
 			for _, raw := range tcs {
 				if tc, ok := raw.(map[string]any); ok {
 					s.pushToolCall(&out, tc)
@@ -122,6 +152,7 @@ func (s *StreamState) HandleChunk(chunk map[string]any) []byte {
 	}
 	// 多个 finish_reason chunk：首个胜出（蓝本 has_emitted_message_delta 去重语义）。
 	if fr := rawString(choice, "finish_reason"); fr != "" && s.stopReason == "" {
+		s.flushInlineThink(&out)
 		s.stopReason = fr
 	}
 	return out.Bytes()
@@ -134,6 +165,7 @@ func (s *StreamState) Finalize() []byte {
 	}
 	var out bytes.Buffer
 	s.ensureStarted(&out)
+	s.flushInlineThink(&out)
 	s.closeThinking(&out)
 	s.closeText(&out)
 	s.finalizeTools(&out)
@@ -173,6 +205,7 @@ func (s *StreamState) FailedWithMessage(message, errType string) []byte {
 	}
 	var out bytes.Buffer
 	s.ensureStarted(&out)
+	s.flushInlineThink(&out)
 	s.closeThinking(&out)
 	s.closeText(&out)
 	s.finalizeTools(&out)
@@ -192,6 +225,17 @@ func (s *StreamState) FailedWithMessage(message, errType string) []byte {
 	return out.Bytes()
 }
 
+// flushInlineThink 冲刷内联思考分裂器残留（幂等）。
+func (s *StreamState) flushInlineThink(out *bytes.Buffer) {
+	thinking, text := s.think.Flush()
+	if thinking != "" {
+		s.pushThinking(out, thinking)
+	}
+	if text != "" {
+		s.pushText(out, text)
+	}
+}
+
 // hasToolUse 报告流中是否已出现至少一个有效工具块（stop_reason 判定用）。
 func (s *StreamState) hasToolUse() bool {
 	for _, tb := range s.tools {
@@ -209,6 +253,20 @@ func (s *StreamState) ensureStarted(out *bytes.Buffer) {
 		return
 	}
 	s.started = true
+	// message_start.usage：首帧带 usage 时填入 input/cache 桶（对齐参考）；
+	// 否则保持 0（真实 usage 仍会在 message_delta 全量给出）。
+	startUsage := map[string]any{"input_tokens": 0, "output_tokens": 0}
+	if s.usage != nil {
+		if u := usageOf(s.usage); u["input_tokens"] != nil {
+			startUsage = map[string]any{"input_tokens": u["input_tokens"], "output_tokens": 0}
+			if v, ok := u["cache_read_input_tokens"]; ok {
+				startUsage["cache_read_input_tokens"] = v
+			}
+			if v, ok := u["cache_creation_input_tokens"]; ok {
+				startUsage["cache_creation_input_tokens"] = v
+			}
+		}
+	}
 	out.Write(sseEvent("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
@@ -219,7 +277,7 @@ func (s *StreamState) ensureStarted(out *bytes.Buffer) {
 			"content":       []any{},
 			"stop_reason":   nil,
 			"stop_sequence": nil,
-			"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
+			"usage":         startUsage,
 		},
 	}))
 }

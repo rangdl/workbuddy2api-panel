@@ -4,12 +4,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/inlinethink"
 )
 
 // FromChat 把 Chat Completions 响应（upstream.Aggregate 结果）转换为 Anthropic message。
 //
 // 蓝本：cc-switch transform.rs openai_to_anthropic（533-726 行）。
 func FromChat(resp map[string]any) (map[string]any, error) {
+	// 部分中转把 Chat completion 包在 {"data":{...}} 里（对齐参考 #5658）。
+	if wrapped, ok := resp["data"].(map[string]any); ok {
+		resp = wrapped
+	}
 	choices, _ := resp["choices"].([]any)
 	if len(choices) == 0 {
 		return nil, fmt.Errorf("no choices in chat response")
@@ -67,7 +73,8 @@ func FromChat(resp map[string]any) (map[string]any, error) {
 	}
 	content = append(content, texts...)
 
-	// tool_calls → tool_use 块（input 必须反序列化回对象；解析失败回退 {_raw:...} 保真）。
+	// tool_calls → tool_use 块（input 必须反序列化回对象；解析失败回退 {}）。
+	hasToolBlocks := false
 	if tcs, ok := message["tool_calls"].([]any); ok {
 		for _, raw := range tcs {
 			tc, ok := raw.(map[string]any)
@@ -85,6 +92,23 @@ func FromChat(resp map[string]any) (map[string]any, error) {
 				"name":  name,
 				"input": parseToolInput(fn["arguments"]),
 			})
+			hasToolBlocks = true
+		}
+	}
+	// 旧式 message.function_call（对齐参考 transform.rs:761-790）：没有 tool_calls
+	// 时回落解析，避免 stop_reason=tool_use 却没有任何 tool_use 块的协议矛盾。
+	if !hasToolBlocks {
+		if fc, ok := message["function_call"].(map[string]any); ok {
+			name := stringField(fc, "name")
+			_, hasArgs := fc["arguments"]
+			if name != "" || hasArgs {
+				content = append(content, map[string]any{
+					"type":  "tool_use",
+					"id":    stringField(fc, "id"),
+					"name":  name,
+					"input": parseToolInput(fc["arguments"]),
+				})
+			}
 		}
 	}
 
@@ -151,7 +175,8 @@ func parseToolInput(arguments any) map[string]any {
 		if json.Unmarshal([]byte(a), &parsed) == nil && parsed != nil {
 			return parsed
 		}
-		return map[string]any{"_raw": a}
+		// 解析失败回退空对象（对齐参考：{_raw:...} 不满足工具 schema，客户端会另报错）。
+		return map[string]any{}
 	case map[string]any:
 		return a
 	default:
@@ -159,20 +184,10 @@ func parseToolInput(arguments any) map[string]any {
 	}
 }
 
-// splitLeadingThinkBlock 从 content 前置 <think>...</think> 块拆出思维链与正文
-// （与 responses 包 reasoning.go 同口径；DeepSeek 系上游常把思维链内嵌正文）。
+// splitLeadingThinkBlock 从 content 前置内联思考块拆出思维链与正文
+// （共享实现：支持 <think>/<thinking>，允许开闭标签不配对）。
 func splitLeadingThinkBlock(content string) (think, rest string, ok bool) {
-	trimmed := strings.TrimSpace(content)
-	if !strings.HasPrefix(trimmed, "<think>") {
-		return "", "", false
-	}
-	end := strings.Index(trimmed, "</think>")
-	if end < 0 {
-		return "", "", false
-	}
-	think = strings.TrimSpace(trimmed[len("<think>"):end])
-	rest = strings.TrimSpace(trimmed[end+len("</think>"):])
-	return think, rest, true
+	return inlinethink.SplitLeading(content)
 }
 
 // usageOf 把 OpenAI usage 映射为 Anthropic usage（蓝本 transform.rs:667-709）。
@@ -189,8 +204,18 @@ func usageOf(u any) map[string]any {
 	prompt := numToU64(obj["prompt_tokens"])
 	completion := numToU64(obj["completion_tokens"])
 
-	cacheRead := nestedU64(obj, "prompt_tokens_details", "cached_tokens")
-	cacheWrite := nestedU64(obj, "prompt_tokens_details", "cache_write_tokens")
+	// 每级要求非零（部分中转把靠前字段硬编码为桩 0；参考 #8041 同口径）。
+	cacheRead := firstNonZero(
+		numToU64(obj["cache_read_input_tokens"]),
+		nestedU64(obj, "prompt_tokens_details", "cached_tokens"),
+		nestedU64(obj, "input_tokens_details", "cached_tokens"),
+		numToU64(obj["prompt_cache_hit_tokens"]),
+	)
+	cacheWrite := firstNonZero(
+		nestedU64(obj, "prompt_tokens_details", "cache_write_tokens"),
+		nestedU64(obj, "input_tokens_details", "cache_write_tokens"),
+		numToU64(obj["cache_creation_input_tokens"]),
+	)
 
 	input := prompt
 	if cacheRead > 0 || cacheWrite > 0 {
@@ -205,6 +230,16 @@ func usageOf(u any) map[string]any {
 		out["cache_creation_input_tokens"] = cacheWrite
 	}
 	return out
+}
+
+// firstNonZero 返回第一个非零值（全零返回 0）。
+func firstNonZero(values ...uint64) uint64 {
+	for _, v := range values {
+		if v > 0 {
+			return v
+		}
+	}
+	return 0
 }
 
 // nestedU64 取 obj[outer][inner] 的非负数值（缺失/类型不符返回 0）。
