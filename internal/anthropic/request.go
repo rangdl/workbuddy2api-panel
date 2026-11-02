@@ -180,9 +180,10 @@ func blocksToChatMessages(role string, blocks []any) []any {
 	// 其他上游由 payload.go 既有管线决定去留）。
 	var reasoning strings.Builder
 	var textParts []string
-	var chatParts []any // 含图片时保留数组形态
-	var toolCalls []any // assistant: tool_use 块累积
-	var toolMsgs []any  // user: tool_result 块生成的独立 tool 消息
+	var chatParts []any  // 含图片时保留数组形态
+	var toolCalls []any  // assistant: tool_use 块累积
+	var toolMsgs []any   // user: tool_result 块生成的独立 tool 消息
+	var mediaParts []any // tool_result 里的图片：Chat tool 消息不收媒体，改为随后的 user 消息
 	hasImage := false
 
 	for _, raw := range blocks {
@@ -227,15 +228,26 @@ func blocksToChatMessages(role string, blocks []any) []any {
 			})
 		case "tool_result":
 			// 工具结果：独立 tool 消息（蓝本 transform.rs:400-431）。
-			// content 三形态：字符串原样 / blocks 数组合并文本 / 对象 JSON 序列化。
+			// Chat 的 tool 消息只收文本：图片搬进随后的合成 user 消息
+			// （对齐 cc-switch tool_media.rs）。Claude Code 的 Read 读图
+			// 正是把图片放在 tool_result 里，此前会被替换成 [image omitted]
+			// 丢弃，模型根本看不到图。
 			callID := stringField(block, "tool_use_id")
 			if callID == "" {
 				continue
 			}
+			text, media := splitToolResultContent(block["content"])
+			if len(media) > 0 {
+				mediaParts = append(mediaParts, map[string]any{
+					"type": "text",
+					"text": "[media output of tool call " + callID + "]",
+				})
+				mediaParts = append(mediaParts, media...)
+			}
 			toolMsgs = append(toolMsgs, map[string]any{
 				"role":         "tool",
 				"tool_call_id": callID,
-				"content":      toolResultContent(block["content"]),
+				"content":      text,
 			})
 		case "document":
 			// PDF 块：CodeBuddy 未验证 file 形态，忽略（不留残块）。
@@ -280,6 +292,9 @@ func blocksToChatMessages(role string, blocks []any) []any {
 	var out []any
 	if role == "user" {
 		out = append(out, toolMsgs...)
+		if len(mediaParts) > 0 {
+			out = append(out, map[string]any{"role": "user", "content": mediaParts})
+		}
 		if main != nil {
 			out = append(out, main)
 		}
@@ -292,35 +307,83 @@ func blocksToChatMessages(role string, blocks []any) []any {
 	return out
 }
 
-// toolResultContent 把 Anthropic tool_result.content 转成 Chat tool 消息的字符串形态：
-// 字符串原样；blocks 数组提取 text 部分合并；其他值 JSON 序列化。
-// （媒体块剥离为后续增强，与 responses 包 media.go 同思路；第一阶段文本化。）
-func toolResultContent(v any) string {
+// anthropicToolMediaMovedMarker 媒体块被搬离 tool 结果后的原位占位文本
+// （文案对齐参考实现 cc-switch tool_media.rs 的 TOOL_RESULT_MEDIA_MOVED_MARKER）。
+const anthropicToolMediaMovedMarker = "[tool result media moved to the following user message]"
+
+// splitToolResultContent 把 Anthropic tool_result.content 拆成
+// (Chat tool 消息的文本 content, 需要改走 user 消息的媒体 part 列表)。
+//
+// 规则对齐参考实现 cc-switch transform.rs + tool_media.rs：
+//   - 字符串原样；整段是图片 data URL 时替换为占位文本并把图片搬走；
+//   - blocks 数组逐块扫描：媒体块（type=image 且 source 有 payload）原位替换成
+//     {"type":"text","text":占位}，其余块原样保留，最后按键序稳定序列化成 JSON
+//     （参考实现的 canonical_json_string 口径；无媒体时同样序列化，保证行为一致）；
+//   - 其他值 JSON 序列化。nil → 空串。
+//
+// 为什么必须搬走：Chat Completions 的 tool 消息只收文本，媒体留在其中会被严格
+// 上游 400；直接丢弃则模型看不到图（Claude Code 的 Read 读图正是 tool_result
+// 携带 image 块，旧实现替换成 [image omitted] 后模型拿不到任何视觉信息）。
+func splitToolResultContent(v any) (string, []any) {
 	switch c := v.(type) {
 	case nil:
-		return ""
+		return "", nil
 	case string:
-		return c
-	case []any:
-		var texts []string
-		for _, raw := range c {
-			block, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			switch stringField(block, "type") {
-			case "text":
-				if t := rawString(block, "text"); t != "" {
-					texts = append(texts, t)
-				}
-			case "image":
-				texts = append(texts, "[image omitted]")
-			}
+		if part, ok := anthropicToolResultStringMedia(c); ok {
+			return anthropicToolMediaMovedMarker, []any{part}
 		}
-		return strings.Join(texts, "\n")
+		return c, nil
+	case []any:
+		var media []any
+		blocks := make([]any, 0, len(c))
+		for _, raw := range c {
+			if block, ok := raw.(map[string]any); ok {
+				if part, ok := anthropicToolResultMediaPart(block); ok {
+					media = append(media, part)
+					blocks = append(blocks, map[string]any{
+						"type": "text",
+						"text": anthropicToolMediaMovedMarker,
+					})
+					continue
+				}
+			}
+			blocks = append(blocks, raw)
+		}
+		if len(media) == 0 {
+			return canonicalJSONStringOf(c), nil
+		}
+		return canonicalJSONStringOf(blocks), media
 	default:
-		return canonicalJSONStringOf(v)
+		return canonicalJSONStringOf(v), nil
 	}
+}
+
+// anthropicToolResultMediaPart 把 tool_result 里的媒体块转成 Chat user content part。
+// 目前只搬图片（Anthropic image 块，source 支持 base64 与 url 两种形态）。
+func anthropicToolResultMediaPart(block map[string]any) (map[string]any, bool) {
+	if stringField(block, "type") != "image" {
+		return nil, false
+	}
+	return anthropicImageToChatPart(block)
+}
+
+// anthropicToolResultStringMedia 判定整段字符串本身是否图片 data URL
+// （与参考实现 whole_string_image_data_url 同口径：data:image/...;base64,
+// 且长度达到阈值，避免把短文本误判成图片）。
+func anthropicToolResultStringMedia(value string) (map[string]any, bool) {
+	trimmed := strings.TrimSpace(value)
+	if len(trimmed) < 8*1024 {
+		return nil, false
+	}
+	idx := strings.IndexByte(trimmed, ',')
+	if idx < 0 {
+		return nil, false
+	}
+	header := strings.ToLower(trimmed[:idx])
+	if !strings.HasPrefix(header, "data:image/") || !strings.HasSuffix(header, ";base64") {
+		return nil, false
+	}
+	return map[string]any{"type": "image_url", "image_url": map[string]any{"url": trimmed}}, true
 }
 
 // chatContentOf 依图片有无决定 content 形态：纯文本合并为字符串（prompt cache 友好），
@@ -340,28 +403,50 @@ func chatContentOf(hasImage bool, chatParts []any, textParts []string) any {
 
 // anthropicImageToChatPart 把 Anthropic image 块转成 Chat image_url part。
 // source 两种形态：base64（{"type":"base64","media_type","data"}）与 URL。
+//
+// detail 透传对齐参考实现 merge_top_level_detail：块上的 detail 合并进
+// image_url 对象；OpenAI 兼容网关只接受 auto/low/high，Codex 风格的
+// "original" 降级为 "auto"（否则严格上游整单 400）。
 func anthropicImageToChatPart(block map[string]any) (map[string]any, bool) {
 	source, ok := block["source"].(map[string]any)
 	if !ok {
 		return nil, false
 	}
+	var url string
 	switch stringField(source, "type") {
 	case "base64":
 		media := stringField(source, "media_type")
+		if media == "" {
+			media = firstNonEmpty(stringField(source, "mime_type"), stringField(source, "mimeType"))
+		}
 		data := rawString(source, "data")
-		if media == "" || data == "" {
+		if data == "" {
 			return nil, false
 		}
-		url := "data:" + media + ";base64," + data
-		return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}, true
+		if strings.HasPrefix(strings.ToLower(data), "data:image/") {
+			url = data
+			break
+		}
+		if media == "" {
+			media = "image/png"
+		}
+		url = "data:" + media + ";base64," + data
 	case "url":
-		url := stringField(source, "url")
+		url = stringField(source, "url")
 		if url == "" {
 			return nil, false
 		}
-		return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}, true
+	default:
+		return nil, false
 	}
-	return nil, false
+	imageURL := map[string]any{"url": url}
+	if detail, exists := block["detail"]; exists {
+		if s, ok := detail.(string); ok && s == "original" {
+			detail = "auto"
+		}
+		imageURL["detail"] = detail
+	}
+	return map[string]any{"type": "image_url", "image_url": imageURL}, true
 }
 
 // joinReasoning 追加 reasoning 文本（非空时以空行分隔；与 responses 包同口径）。

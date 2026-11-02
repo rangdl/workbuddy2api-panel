@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -541,7 +542,9 @@ func TestToolResultBeforeTextInSameUserMessage(t *testing.T) {
 	}
 }
 
-// tool_result 的 blocks 数组 content 提取 text 合并；image 占位。
+// tool_result 的 blocks 数组：媒体块原位替换为占位文本，整段内容按参考实现
+// 序列化为 JSON；图片搬到随后的 user 消息（Chat tool 消息不接受媒体）。
+// Claude Code 的 Read 读图正是走这条路径。
 func TestToolResultBlocksContent(t *testing.T) {
 	out := mustToChat(t, `{"model":"m","max_tokens":1,"messages":[
 		{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"f","input":{}}]},
@@ -550,9 +553,97 @@ func TestToolResultBlocksContent(t *testing.T) {
 				{"type":"text","text":"result line"},
 				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"x"}}]}]}]}`)
 	msgs, _ := out["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages len=%d: %v", len(msgs), msgs)
+	}
 	toolMsg, _ := msgs[1].(map[string]any)
-	if toolMsg["content"] != "result line\n[image omitted]" {
-		t.Errorf("tool content=%v", toolMsg["content"])
+	want := `[{"text":"result line","type":"text"},{"text":"` + anthropicToolMediaMovedMarker + `","type":"text"}]`
+	if toolMsg["role"] != "tool" || toolMsg["content"] != want {
+		t.Fatalf("tool 消息=%v\nwant content=%s", toolMsg, want)
+	}
+	if strings.Contains(toolMsg["content"].(string), "[image omitted]") {
+		t.Error("图片不应再被 [image omitted] 丢弃")
+	}
+	mediaMsg, _ := msgs[2].(map[string]any)
+	if mediaMsg["role"] != "user" {
+		t.Fatalf("媒体应作为 user 消息投递: %v", mediaMsg)
+	}
+	parts, _ := mediaMsg["content"].([]any)
+	if len(parts) != 2 {
+		t.Fatalf("媒体 parts=%v", parts)
+	}
+	img, _ := parts[1].(map[string]any)
+	if img["type"] != "image_url" {
+		t.Fatalf("图片 part=%v", img)
+	}
+	url, _ := img["image_url"].(map[string]any)["url"].(string)
+	if url != "data:image/png;base64,x" {
+		t.Errorf("图片 data URL=%v", url)
+	}
+}
+
+// 只有图片、没有文本的 tool_result：内容只剩占位块，图片照样投递。
+func TestToolResultImageOnly(t *testing.T) {
+	out := mustToChat(t, `{"model":"m","max_tokens":1,"messages":[
+		{"role":"assistant","content":[{"type":"tool_use","id":"read1","name":"Read","input":{}}]},
+		{"role":"user","content":[
+			{"type":"tool_result","tool_use_id":"read1","content":[
+				{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"abc"}}]}]}]}`)
+	msgs, _ := out["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages len=%d: %v", len(msgs), msgs)
+	}
+	toolMsg, _ := msgs[1].(map[string]any)
+	want := `[{"text":"` + anthropicToolMediaMovedMarker + `","type":"text"}]`
+	if toolMsg["content"] != want {
+		t.Errorf("tool content=%v, want %s", toolMsg["content"], want)
+	}
+	parts, _ := msgs[2].(map[string]any)["content"].([]any)
+	if len(parts) != 2 {
+		t.Fatalf("媒体 parts=%v", parts)
+	}
+}
+
+// 无媒体的 blocks 数组同样按 JSON 序列化（参考实现 canonical_json_string 口径）。
+func TestToolResultBlocksWithoutMediaJSON(t *testing.T) {
+	out := mustToChat(t, `{"model":"m","max_tokens":1,"messages":[
+		{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"f","input":{}}]},
+		{"role":"user","content":[
+			{"type":"tool_result","tool_use_id":"t1","content":[
+				{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}]}`)
+	msgs, _ := out["messages"].([]any)
+	toolMsg, _ := msgs[1].(map[string]any)
+	want := `[{"text":"a","type":"text"},{"text":"b","type":"text"}]`
+	if toolMsg["content"] != want {
+		t.Errorf("tool content=%v, want %s", toolMsg["content"], want)
+	}
+	if len(msgs) != 2 {
+		t.Errorf("无媒体时不应产生额外 user 消息: %v", msgs)
+	}
+}
+
+// detail 透传与降级（对齐参考实现 merge_top_level_detail）：original → auto，
+// 已是完整 data URL 的 data 不再重复包一层。
+func TestImageDetailAndDataURLPassthrough(t *testing.T) {
+	out := mustToChat(t, `{"model":"m","max_tokens":1,"messages":[
+		{"role":"user","content":[
+			{"type":"image","detail":"original","source":{"type":"base64","media_type":"image/png","data":"aWNv"}},
+			{"type":"image","source":{"type":"base64","media_type":"image/png","data":"data:image/png;base64,ZZZ"}}]}]}`)
+	msgs, _ := out["messages"].([]any)
+	parts, _ := msgs[0].(map[string]any)["content"].([]any)
+	if len(parts) != 2 {
+		t.Fatalf("parts=%v", parts)
+	}
+	first, _ := parts[0].(map[string]any)["image_url"].(map[string]any)
+	if first["detail"] != "auto" {
+		t.Errorf("detail 应降级为 auto: %v", first)
+	}
+	if first["url"] != "data:image/png;base64,aWNv" {
+		t.Errorf("url=%v", first["url"])
+	}
+	second, _ := parts[1].(map[string]any)["image_url"].(map[string]any)
+	if second["url"] != "data:image/png;base64,ZZZ" {
+		t.Errorf("已是 data URL 时不应二次包装: %v", second["url"])
 	}
 }
 
