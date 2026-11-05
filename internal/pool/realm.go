@@ -8,6 +8,10 @@ import (
 
 // expiringVirtualSlots 快过期账号在新会话候选集中的虚拟实例权重。
 // 3:1 是温和偏好，不是固定比例：账号组成变化会自然改变最终占比。
+//
+// 注意它与 pick 里的快过期偏好是**两个维度**：这里表达的是「新会话哈希分配时
+// 更容易落到快过期号上」（重复槽位，无法表达硬优先级），pick 里则是先硬优先级
+// 进短名单、再靠 ×expiringVirtualSlots 提高抽中概率（见 pick.go 的 atRisk 键）。
 const expiringVirtualSlots = 3
 
 // AvailableUIDsForRealm 同 AvailableUIDs，但仅返回 Realm()==realm 的账号。
@@ -18,13 +22,7 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
-			continue
-		}
-		if !e.healthy(now) {
-			continue
-		}
-		if p.inFlightFull(e) {
+		if !p.gateLocked(e, gateSpec{realm: realm, now: now}).ok() {
 			continue
 		}
 		uids = append(uids, uid)
@@ -46,16 +44,7 @@ func (p *Pool) ServableForModelRealm(model, realm string) int {
 	now := time.Now()
 	n := 0
 	for _, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
-			continue
-		}
-		if !e.healthyForModel(now, model) {
-			continue
-		}
-		if p.inFlightFull(e) {
-			continue
-		}
-		if p.floorBlockedForRealmModel(e, model, realm, now) {
+		if !p.gateLocked(e, gateSpec{model: model, realm: realm, now: now}).ok() {
 			continue
 		}
 		n++
@@ -69,21 +58,18 @@ func (p *Pool) ServableForModelRealm(model, realm string) int {
 // 原有序列表哈希，即可让新会话对快过期账号形成温和偏好。重复项按 UID 排序后
 // 展开，保证同一账号拓扑下不同进程得到一致列表。
 //
-// 该方法是现有 AvailableUIDsForModelRealm 的增量入口，不改变旧方法语义，也不
-// 修改配置、状态或 Redis schema。prefer_expiring=false 时退化为逐账号一次。
+// 该方法是现有 AvailableUIDsForModelRealm 的增量入口：两者只在「快过期账号是否
+// 重复计入」上不同，可用性判据**完全一样**（同一个 gateLocked，含积分保底）。
+// 此前两处各自手写一遍条件表，本函数漏了积分保底：触底号照样进入新会话候选表，
+// 被粘上后才在 PickByUIDForModel 拦住——「先粘一个死号再解绑」。
+// prefer_expiring=false 时退化为逐账号一次。
 func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
-			continue
-		}
-		if !e.healthyForModel(now, model) {
-			continue
-		}
-		if p.inFlightFull(e) {
+		if !p.gateLocked(e, gateSpec{model: model, realm: realm, now: now}).ok() {
 			continue
 		}
 		uids = append(uids, uid)
@@ -107,19 +93,17 @@ func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string 
 
 // AvailableUIDsForModelRealm 同 AvailableUIDsForModel，但仅返回 Realm()==realm 的账号
 // （6004 模型豁免照常生效）。realm=="" 退化为 AvailableUIDsForModel。
+//
+// 两者现在都由 gateLocked 判定，因此语义确实相等（含积分保底）；此前本函数缺
+// 积分保底而 AvailableUIDsForModel 也无，两者虽相等但都与 ServableForModelRealm
+// 不一致（后者计入保底）——同一个问题两种答案。
 func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
-			continue
-		}
-		if !e.healthyForModel(now, model) {
-			continue
-		}
-		if p.inFlightFull(e) {
+		if !p.gateLocked(e, gateSpec{model: model, realm: realm, now: now}).ok() {
 			continue
 		}
 		uids = append(uids, uid)

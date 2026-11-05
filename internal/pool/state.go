@@ -383,10 +383,7 @@ func (p *Pool) AvailableUIDs() []string {
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
-		if !e.healthy(now) {
-			continue
-		}
-		if p.inFlightFull(e) {
+		if !p.gateLocked(e, gateSpec{now: now}).ok() {
 			continue
 		}
 		uids = append(uids, uid)
@@ -398,16 +395,16 @@ func (p *Pool) AvailableUIDs() []string {
 // AvailableUIDsForModel 同 AvailableUIDs，但把健康口径换成 healthyForModel：
 // 在该模型上被 6004 限流的账号不列入，而在**其他模型**被限流的账号照常列入（模型豁免）。
 // 供会话粘性按模型分配与命中校验；model 为空时等价于 AvailableUIDs。
+//
+// 积分保底也计入：触底号不列进候选表，否则粘性会先粘到它、再由
+// PickByUIDForModel 拦住解绑（同一个判据，见 gate.go）。
 func (p *Pool) AvailableUIDsForModel(model string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
-		if !e.healthyForModel(now, model) {
-			continue
-		}
-		if p.inFlightFull(e) {
+		if !p.gateLocked(e, gateSpec{model: model, now: now}).ok() {
 			continue
 		}
 		uids = append(uids, uid)
@@ -428,21 +425,19 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 		return nil
 	}
 	now := time.Now()
-	if !e.healthyForModel(now, model) {
-		return nil
-	}
-	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
-	// （判据含上游目录倍率兜底，realm 取账号所属域——粘性号已确定，无需外部传入）。
-	// 返回 nil 后 handler 侧解绑粘性（unbindSticky）走普通轮换换号，粘性号回血
-	// 后下次会话重新绑定。
-	// 日志频次：天然每请求至多一条——首次返回 nil 即解绑，后续轮转不再调入本路径
-	// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
-	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
+	// 统一判据（gate.go）。realm 取账号自己的域：粘性号已确定，无需外部传入，
+	// 但积分保底里的上游倍率表按 (域, 模型) 分桶，所以必须带上它而不是留空。
+	switch x := p.gateLocked(e, gateSpec{model: model, realm: e.a.Realm(), now: now}); x {
+	case excludeNone:
+	case excludeCreditFloor:
+		// 与 pick 的 floorBlocked 同判据——触底 + 收费即拦。返回 nil 后 handler 侧
+		// 解绑粘性（unbindSticky）走普通轮换换号，粘性号回血后下次会话重新绑定。
+		// 日志频次：天然每请求至多一条——首次返回 nil 即解绑，后续轮转不再调入本路径
+		// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
 		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
 			logfmt.Label(e.a.UID, e.a.NicknameValue()), model, e.credits, p.creditFloor)
 		return nil
-	}
-	if p.inFlightFull(e) {
+	default:
 		return nil
 	}
 	e.lastUsed = now
@@ -461,10 +456,7 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 		return nil
 	}
 	now := time.Now()
-	if !e.healthy(now) {
-		return nil
-	}
-	if p.inFlightFull(e) {
+	if !p.gateLocked(e, gateSpec{now: now}).ok() {
 		return nil
 	}
 	e.lastUsed = now
