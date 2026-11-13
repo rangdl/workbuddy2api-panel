@@ -1220,11 +1220,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="hr"></div>
           <div class="fld"><span class="lb">添加账号（OAuth 登录）</span>
             <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+              <input id="traeLoginDeviceId" placeholder="设备号（可留空，见下方说明）" style="width:220px">
               <button type="button" class="xs" id="btnTraeLogin">1. 生成授权链接</button>
               <input id="traeCallback" placeholder="2. 浏览器完成授权后，粘贴地址栏完整 URL" style="flex:1;min-width:240px">
               <button type="button" class="xs" id="btnTraeFinish">完成登录</button>
             </div>
-            <span class="hint" id="traeLoginHint">Trae 用授权码 + PKCE 流程：生成链接 → 浏览器授权 → 复制地址栏 URL 粘贴回来。</span></div>
+            <span class="hint" id="traeLoginHint">Trae 用授权码 + PKCE 流程：生成链接 → 浏览器授权 → 复制地址栏 URL 粘贴回来。</span>
+            <span class="hint">设备号 = Trae 客户端 <code>storage.json</code> 里 <code>iCubeAuthInfo://icube-dc:&lt;数字&gt;</code> 键名中的那串数字（12~20 位，15/16 位都见过）。
+              <b>签到限额按设备算</b>：留空会用已导入的设备号或自动生成一个占位号，占位号签到必被拒（9074）——要签到就必须填真实设备号。</span></div>
           <div class="fld"><span class="lb">导入设备凭证（可选，但强烈建议）</span>
             <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
               <input id="traeStorage" placeholder="粘贴 Trae 客户端 storage.json 内容，或单条 icube 密文" style="flex:1;min-width:240px">

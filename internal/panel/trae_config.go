@@ -335,35 +335,84 @@ func parseImportCredentials(req traeImportRequest) ([]*trae.DeviceCredential, er
 }
 
 // traeLoginStart 生成授权 URL（PKCE + CSRF state）并登记登录会话。
+//
+// 设备号可以在请求体里显式指定（`device_id` / `machine_id`）——这是登录能否
+// 用于签到的关键：Trae 的每日签到限额按**设备**算，且只有客户端在服务端注册
+// 过的真实设备号才能通过设备检查（生成号必然 9074）。不指定时的行为：
+//   - 复用已导入凭证里**尚未被任何账号占用**的设备号（同机多账号共用一套设备
+//     密钥是客户端自身的行为，但不该悄悄把新账号挂到已有账号的设备上）；
+//   - 都没有才生成占位号，并在响应里明确标注 `device_generated: true`。
 func (p *Panel) traeLoginStart(w http.ResponseWriter, r *http.Request) {
 	path := p.cfg.TraePath
 	if path == "" {
 		writeErr(w, http.StatusNotImplemented, "trae config api not available")
 		return
 	}
+	var req struct {
+		DeviceID  string `json:"device_id"`
+		MachineID string `json:"machine_id"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&req)
+	}
+	req.DeviceID = strings.TrimSpace(req.DeviceID)
+	req.MachineID = strings.TrimSpace(req.MachineID)
+	if req.DeviceID != "" && !trae.IsValidDeviceID(req.DeviceID) {
+		writeErr(w, http.StatusBadRequest,
+			"device_id 应为一串 12~20 位十进制数字（Trae 客户端 storage.json 里 "+
+				"iCubeAuthInfo://icube-dc:<数字> 键名中的数字）")
+		return
+	}
+
 	cfg, _ := trae.Load(path)
 	clientID, callback := "", ""
 	if cfg != nil {
 		clientID = cfg.OAuthClientID
 		callback = cfg.OAuthCallbackURL
 	}
-	// 设备标识：优先复用已导入凭证的设备 id（与签名私钥同源，否则上游 20403/20405）。
-	deviceID, machineID := "", ""
-	if cfg != nil {
-		for _, a := range cfg.Accounts {
-			if a.DeviceID != "" {
-				deviceID, machineID = a.DeviceID, a.MachineID
-				break
+
+	deviceID, machineID := req.DeviceID, req.MachineID
+	deviceSource := "explicit"
+	generated := false
+	if deviceID == "" {
+		// 复用已导入凭证的设备号，但跳过"已被某个账号占用"的（见函数注释）。
+		if cfg != nil {
+			used := make(map[string]bool, len(cfg.Accounts))
+			for _, a := range cfg.Accounts {
+				used[a.DeviceID] = true
+			}
+			for _, a := range cfg.Accounts {
+				if a.DeviceID != "" && !used[a.DeviceID] {
+					deviceID, machineID = a.DeviceID, a.MachineID
+					deviceSource = "imported"
+					break
+				}
+			}
+			// 所有已导入设备号都已被占用时，仍复用第一个（同机多账号共用设备，
+			// 与客户端行为一致），但要靠签到侧的 9095 提示暴露限制。
+			if deviceID == "" {
+				for _, a := range cfg.Accounts {
+					if a.DeviceID != "" {
+						deviceID, machineID = a.DeviceID, a.MachineID
+						deviceSource = "shared"
+						break
+					}
+				}
 			}
 		}
 	}
 	if deviceID == "" {
-		// 无既有设备：生成一对稳定标识（登录后可再导入真实设备凭证覆盖）。
+		// 占位号：登录本身可用，但用它签到必然 9074。
 		var err error
-		if deviceID, err = randomDigits(15); err != nil {
+		if deviceID, err = randomDigits(16); err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		deviceSource = "generated"
+		generated = true
+	}
+	if machineID == "" {
+		var err error
 		if machineID, err = trae.RandomHex(32); err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -389,11 +438,21 @@ func (p *Panel) traeLoginStart(w http.ResponseWriter, r *http.Request) {
 	}
 	traeLoginMu.Unlock()
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"ok": true, "url": url, "state": sess.State,
-		"callback_url": orDefaultStr(callback, trae.DefaultRedirectURI),
-		"device_id":    deviceID,
-	})
+		"callback_url":     orDefaultStr(callback, trae.DefaultRedirectURI),
+		"device_id":        deviceID,
+		"device_source":    deviceSource,
+		"device_generated": generated,
+	}
+	if generated {
+		resp["warning"] = "设备号是自动生成的占位值，用它签到会被拒（9074）。" +
+			"请从装了 Trae 客户端的机器上取真实设备号后重新登录。"
+	}
+	if deviceSource == "shared" {
+		resp["warning"] = "该设备号已被其它账号使用：签到限额按设备算，一天只有第一个账号能签成。"
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // traeLoginFinish 用回调 URL 完成登录（换取 token 并落账号）。
@@ -410,9 +469,19 @@ func (p *Panel) traeLoginFinish(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		CallbackURL string `json:"callback_url"`
+		// DeviceID / MachineID 可选：不带时沿用发起登录时登记的设备号。
+		// 带了则以它为准（用于「生成号 → 真实号」的修正场景）。
+		DeviceID  string `json:"device_id"`
+		MachineID string `json:"machine_id"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if v := strings.TrimSpace(req.DeviceID); v != "" && !trae.IsValidDeviceID(v) {
+		writeErr(w, http.StatusBadRequest,
+			"device_id 应为一串 12~20 位十进制数字（Trae 客户端 storage.json 里 "+
+				"iCubeAuthInfo://icube-dc:<数字> 键名中的数字）")
 		return
 	}
 	authCode, traceID, err := trae.ParseAuthCallback(req.CallbackURL)
@@ -431,17 +500,25 @@ func (p *Panel) traeLoginFinish(w http.ResponseWriter, r *http.Request) {
 	if cfg == nil {
 		cfg = &trae.Config{}
 	}
-	cred := &trae.DeviceCredential{DeviceID: sess.DeviceID, MachineID: sess.MachineID}
+	// 设备身份以本次请求的覆盖值为准（未带则用发起登录时的登记值）。
+	devID, machID := sess.DeviceID, sess.MachineID
+	if v := strings.TrimSpace(req.DeviceID); v != "" {
+		devID = v
+	}
+	if v := strings.TrimSpace(req.MachineID); v != "" {
+		machID = v
+	}
+	cred := &trae.DeviceCredential{DeviceID: devID, MachineID: machID}
 	// 已有同设备账号的私钥时复用它（设备身份一致才不会被拒）。
 	for _, a := range cfg.Accounts {
-		if a.DeviceID == sess.DeviceID && a.PrivateKeyPEM != "" {
+		if a.DeviceID == devID && a.PrivateKeyPEM != "" {
 			cred.PrivateKeyPEM = a.PrivateKeyPEM
 			break
 		}
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	pair, err := p.cfg.TraeClient.ExchangeAuthCode(ctx, cfg, authCode, sess.PKCEVerifier, cred, sess.DeviceID, sess.MachineID)
+	pair, err := p.cfg.TraeClient.ExchangeAuthCode(ctx, cfg, authCode, sess.PKCEVerifier, cred, devID, machID)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "换取 token 失败: "+err.Error())
 		return
@@ -464,6 +541,12 @@ func (p *Panel) traeLoginFinish(w http.ResponseWriter, r *http.Request) {
 		cfg.Accounts[i].ExpiresAt = pair.ExpiresAt
 		cfg.Accounts[i].Disabled = false
 		cfg.Accounts[i].DisabledReason = ""
+		// 设备身份跟着本次登录走：允许把"生成号"换成真实号（签到只认真实号）。
+		cfg.Accounts[i].DeviceID = devID
+		cfg.Accounts[i].MachineID = machID
+		if cred.PrivateKeyPEM != "" {
+			cfg.Accounts[i].PrivateKeyPEM = cred.PrivateKeyPEM
+		}
 		merged = true
 	}
 	if !merged {
@@ -473,8 +556,8 @@ func (p *Panel) traeLoginFinish(w http.ResponseWriter, r *http.Request) {
 			AccessToken:   pair.AccessToken,
 			RefreshToken:  pair.RefreshToken,
 			ExpiresAt:     pair.ExpiresAt,
-			DeviceID:      sess.DeviceID,
-			MachineID:     sess.MachineID,
+			DeviceID:      devID,
+			MachineID:     machID,
 			PrivateKeyPEM: cred.PrivateKeyPEM,
 			AppVersion:    trae.DefaultPageAppVersion,
 		})

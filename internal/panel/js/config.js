@@ -536,12 +536,20 @@ $('btnTraeLogin').onclick = async () => {
   const btn = $('btnTraeLogin');
   btn.disabled = true;
   try {
-    const d = await api('trae/login/start', { method: 'POST' });
-    $('traeLoginHint').innerHTML = '授权链接已生成（设备 ' + esc(d.device_id || '') + '）：' +
+    const devId = ($('traeLoginDeviceId').value || '').trim();
+    const d = await api('trae/login/start', {
+      method: 'POST',
+      body: JSON.stringify(devId ? { device_id: devId } : {}),
+    });
+    const src = d.device_source === 'generated' ? '自动生成，签到会被拒'
+      : (d.device_source === 'shared' ? '与已有账号共用，一天只有一个能签成'
+        : (d.device_source === 'imported' ? '沿用已导入设备' : '手动指定'));
+    $('traeLoginHint').innerHTML = '授权链接已生成（设备 ' + esc(d.device_id || '') +
+      ' · ' + esc(src) + '）：' +
       '<a href="' + esc(d.url) + '" target="_blank" rel="noopener">打开授权页</a>。' +
       '完成授权后浏览器会跳转到回调地址，把**地址栏完整 URL** 复制到右侧输入框。';
     window.open(d.url, '_blank', 'noopener');
-    toast('授权链接已生成，请在浏览器完成授权', 'ok');
+    toast(d.warning || '授权链接已生成，请在浏览器完成授权', d.warning ? 'warn' : 'ok');
   } catch (e) { toast('生成失败：' + e.message, 'err'); }
   finally { btn.disabled = false; }
 };
@@ -552,7 +560,10 @@ $('btnTraeFinish').onclick = async () => {
   btn.disabled = true;
   btn.textContent = '登录中…';
   try {
-    const d = await api('trae/login/finish', { method: 'POST', body: JSON.stringify({ callback_url: cb }) });
+    const devId = ($('traeLoginDeviceId').value || '').trim();
+    const body = { callback_url: cb };
+    if (devId) body.device_id = devId;
+    const d = await api('trae/login/finish', { method: 'POST', body: JSON.stringify(body) });
     toast('登录成功：' + d.uid + (d.has_device_key ? '（含设备签名能力）' : '（无设备密钥，续期可能受限）'), 'ok');
     $('traeCallback').value = '';
     loadTraeConfig();

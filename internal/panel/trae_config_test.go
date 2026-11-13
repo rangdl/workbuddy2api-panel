@@ -306,3 +306,76 @@ func TestTraeRemoveAccount(t *testing.T) {
 		t.Errorf("删除不存在账号 status = %d, want 404", rec.Code)
 	}
 }
+
+// TestTraeLoginStartExplicitDevice 显式指定设备号：URL 与响应都应带上它，
+// device_source=explicit、且不标 generated。
+func TestTraeLoginStartExplicitDevice(t *testing.T) {
+	dir := t.TempDir()
+	p, _ := newTraePanel(t, dir)
+	rec := traeDo(p, http.MethodPost, "/panel/api/trae/login/start",
+		`{"device_id":"1234567890123456"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
+	}
+	var got struct {
+		URL             string `json:"url"`
+		DeviceID        string `json:"device_id"`
+		DeviceSource    string `json:"device_source"`
+		DeviceGenerated bool   `json:"device_generated"`
+		Warning         string `json:"warning"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.DeviceID != "1234567890123456" {
+		t.Errorf("device_id = %q", got.DeviceID)
+	}
+	if got.DeviceSource != "explicit" || got.DeviceGenerated {
+		t.Errorf("source = %q generated = %v", got.DeviceSource, got.DeviceGenerated)
+	}
+	if got.Warning != "" {
+		t.Errorf("显式设备号不应有警告: %q", got.Warning)
+	}
+	if !strings.Contains(got.URL, "device_id=1234567890123456") {
+		t.Errorf("授权 URL 缺 device_id: %s", got.URL)
+	}
+}
+
+// TestTraeLoginStartRejectsBadDevice 非法设备号 400（含字母 / 长度越界）。
+func TestTraeLoginStartRejectsBadDevice(t *testing.T) {
+	dir := t.TempDir()
+	p, _ := newTraePanel(t, dir)
+	for _, dev := range []string{"abc123456789", "123", "123456789012345678901"} {
+		rec := traeDo(p, http.MethodPost, "/panel/api/trae/login/start",
+			`{"device_id":"`+dev+`"}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("device_id=%q status = %d, want 400", dev, rec.Code)
+		}
+	}
+}
+
+// TestTraeLoginStartGeneratedWarns 未指定且无已导入设备时生成占位号，
+// 必须显式告警（占位号签到必被拒成 9074）。
+func TestTraeLoginStartGeneratedWarns(t *testing.T) {
+	dir := t.TempDir()
+	p, _ := newTraePanel(t, dir)
+	rec := traeDo(p, http.MethodPost, "/panel/api/trae/login/start", "")
+	var got struct {
+		DeviceID        string `json:"device_id"`
+		DeviceSource    string `json:"device_source"`
+		DeviceGenerated bool   `json:"device_generated"`
+		Warning         string `json:"warning"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.DeviceGenerated || got.DeviceSource != "generated" {
+		t.Errorf("应标记为生成号: %+v", got)
+	}
+	if !strings.Contains(got.Warning, "9074") {
+		t.Errorf("警告应点明 9074: %q", got.Warning)
+	}
+	if !trae.IsValidDeviceID(got.DeviceID) {
+		t.Errorf("占位号形态非法: %q", got.DeviceID)
+	}
+}
