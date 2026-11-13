@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
+	"log"
+	"strings"
+	"sync"
 )
 
 // traeOpTimeout 单次运维操作的超时（签到含 status 预检 + claim，两个上游往返）。
@@ -140,4 +143,74 @@ func (p *Panel) traeCheckinStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "last_run": lastRun, "results": outcomes,
 	})
+}
+
+// traeSyncProfiles 批量从上游拉取昵称并落盘。
+//
+// 为什么需要：Trae 的 JWT 里没有用户名字段，昵称只能来自 GetUserInfo。
+// 登录时已经自动拉过一次，但这个接口用于两类场景：
+//   - 手工导入/历史遗留的账号（当初没有昵称）；
+//   - 用户在上游改了昵称（与 CodeBuddy 的「昵称同步」同语义）。
+//
+// 与 CodeBuddy 的实现对齐：并发受限、失败不影响其它账号、只在变化时写盘。
+func (p *Panel) traeSyncProfiles(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.TraeClient == nil || p.cfg.TraePath == "" {
+		writeErr(w, http.StatusNotImplemented, "trae client not available")
+		return
+	}
+	cfg, err := trae.Load(p.cfg.TraePath, p.cfg.AuthDir)
+	if err != nil || cfg == nil {
+		writeErr(w, http.StatusBadRequest, "trae.json 不存在或无法读取")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), traeOpTimeout)
+	defer cancel()
+
+	var (
+		mu      sync.Mutex
+		wg      sync.WaitGroup
+		updated int
+		failed  int
+	)
+	sem := make(chan struct{}, 4)
+	for i := range cfg.Accounts {
+		acc := &cfg.Accounts[i]
+		if acc.Disabled || acc.AccessToken == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(a *trae.Account) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			info, ierr := p.cfg.TraeClient.GetUserInfo(ctx, cfg, a)
+			if ierr != nil {
+				mu.Lock()
+				failed++
+				mu.Unlock()
+				return
+			}
+			name := strings.TrimSpace(info.Nickname)
+			if name == "" || name == a.Name {
+				return // 取不到或未变化：不写盘
+			}
+			a.Name = name
+			if serr := trae.SaveAccount(cfg.AuthDir, a); serr != nil {
+				log.Printf("WARN: [trae] 昵称落盘失败 %s: %v", a.UID, serr)
+				mu.Lock()
+				failed++
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			updated++
+			mu.Unlock()
+		}(acc)
+	}
+	wg.Wait()
+	if updated > 0 || failed > 0 {
+		log.Printf("[trae] 昵称同步：更新 %d 个，失败 %d 个（未变化不计数）", updated, failed)
+		p.reloadTrae()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "updated": updated, "failed": failed})
 }

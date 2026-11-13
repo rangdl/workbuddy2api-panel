@@ -663,6 +663,19 @@ func (p *Panel) traeLoginFinish(w http.ResponseWriter, r *http.Request) {
 	if uid == "" {
 		uid = "trae-" + tail(pair.AccessToken, 8)
 	}
+	// 昵称从上游拉（JWT 里没有）：GetUserInfo 走 OAuth 域，失败不影响登录。
+	// uid 也顺手用它校正一次——JWT 的 user_id 与上游 UserID 一致，但有兜底更稳。
+	nickname := ""
+	if p.cfg.TraeClient != nil {
+		if info, perr := p.cfg.TraeClient.GetUserInfo(ctx, cfg, &trae.Account{
+			UID: uid, AccessToken: pair.AccessToken,
+		}); perr == nil && info != nil {
+			nickname = strings.TrimSpace(info.Nickname)
+			if info.UID != "" {
+				uid = info.UID
+			}
+		}
+	}
 	// 合并到配置：同 uid 覆盖 token，新 uid 追加。
 	idx := -1
 	for i := range cfg.Accounts {
@@ -673,8 +686,10 @@ func (p *Panel) traeLoginFinish(w http.ResponseWriter, r *http.Request) {
 	}
 	if idx < 0 {
 		cfg.Accounts = append(cfg.Accounts, trae.Account{
-			UID:           uid,
-			Name:          "trae-" + uid,
+			UID: uid,
+			// 昵称来自 GetUserInfo（ScreenName）。取不到时留空——
+			// logfmt.Label 会退化成 uid8 短号，不会显示难看的占位串。
+			Name:          nickname,
 			AccessToken:   pair.AccessToken,
 			RefreshToken:  pair.RefreshToken,
 			ExpiresAt:     pair.ExpiresAt,

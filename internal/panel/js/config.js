@@ -636,6 +636,17 @@ async function loadTraeConfig() {
     $('traeNote').textContent = '';
   } catch (e) { /* 后端未提供该接口时静默 */ }
 }
+$('btnTraeSyncProfiles').onclick = async () => {
+  const btn = $('btnTraeSyncProfiles');
+  btn.disabled = true; btn.textContent = '同步中…';
+  try {
+    const d = await api('trae/sync_profiles', { method: 'POST' });
+    toast('昵称同步完成：更新 ' + (d.updated || 0) + ' 个' +
+      (d.failed ? '，失败 ' + d.failed + ' 个' : ''), d.failed ? 'warn' : 'ok');
+    loadTraeConfig();
+  } catch (e) { toast('同步失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '同步昵称'; }
+};
 $('btnTraeReload').onclick = loadTraeConfig;
 $('btnTraeSave').onclick = async () => {
   const btn = $('btnTraeSave');

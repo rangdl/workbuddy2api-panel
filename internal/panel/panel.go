@@ -253,6 +253,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/trae/login/finish", p.withAuth(p.traeLoginFinish))
 	p.mux.HandleFunc("POST /panel/api/trae/accounts/{uid}/remove", p.withAuth(p.removeTraeAccount))
 	p.mux.HandleFunc("POST /panel/api/trae/checkin_all", p.withAuth(p.traeCheckinAll))
+	p.mux.HandleFunc("POST /panel/api/trae/sync_profiles", p.withAuth(p.traeSyncProfiles))
 	p.mux.HandleFunc("POST /panel/api/trae/accounts/{uid}/checkin", p.withAuth(p.traeAccountCheckin))
 	p.mux.HandleFunc("POST /panel/api/trae/accounts/{uid}/credits", p.withAuth(p.traeAccountCredits))
 	p.mux.HandleFunc("GET /panel/api/trae/checkin_status", p.withAuth(p.traeCheckinStatus))
