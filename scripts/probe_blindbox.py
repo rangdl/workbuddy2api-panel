@@ -436,14 +436,56 @@ def cmd_draw(args):
     return 0
 
 
+def cmd_claim(args):
+    """领取猫猫旅行到站奖励（验证门控：企业切换会话能否领奖）。"""
+    creds = load_auths(args.account)
+    for i, c in enumerate(creds):
+        if i:
+            time.sleep(args.gap)
+        print(f"\n=== {c['nick'] or '?'}  {c['uid'][:8]} ===")
+        code, body = _call(c, "GET", GROWTH_PREFIX + "/buddy/travel/status")
+        if not _ok(code, body):
+            print(f"  跳过：status 查询失败 {_brief(code, body)}")
+            continue
+        d = _envelope(body)
+        state = _dig(d, "state", default="?")
+        record = _dig(d, "record_id", default=0) or 0
+        reward = _dig(d, "reward_credit", default=0)
+        print(f"  状态：state={state} record_id={record} reward={reward}")
+        if state != "arrived":
+            print("  跳过：不是 arrived 状态")
+            continue
+        if not record:
+            print("  跳过：缺 record_id")
+            continue
+        payload = {"record_id": record}
+        if not args.yes:
+            print(f"  [dry-run] 将要 POST {GROWTH_PREFIX}/buddy/travel/claim {json.dumps(payload)}")
+            continue
+        code, body = _call(c, "POST", GROWTH_PREFIX + "/buddy/travel/claim", payload)
+        if _ok(code, body):
+            d2 = _envelope(body)
+            got = _dig(d2, "reward_credit", "credit", default=reward)
+            print(f"  ✓ 领奖成功：+{got} 积分")
+            time.sleep(1)
+            code, body = _call(c, "GET", GROWTH_PREFIX + "/buddy/travel/status")
+            if _ok(code, body):
+                d3 = _envelope(body)
+                print(f"  复查：state={_dig(d3,'state',default='?')} record_id={_dig(d3,'record_id',default=0)}")
+        else:
+            print(f"  ✗ 领奖失败：{_brief(code, body)}")
+            print("  → 企业切换会话被上游拒绝，门控是对的")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Buddy 能量盲盒 / 抽奖端点探针",
+        description="Buddy 能量盲盒 / 抽奖 / 旅行领奖端点探针",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__)
-    ap.add_argument("action", choices=["probe", "open", "draw"])
+    ap.add_argument("action", choices=["probe", "open", "draw", "claim"])
     ap.add_argument("account", help="uid 前缀 / auth 文件名 / ALL")
     ap.add_argument("--yes", action="store_true", help="写操作必须显式放行")
     ap.add_argument("--count", type=int, default=1, help="open 时本次开盒数（受服务端上限钳制）")
@@ -463,6 +505,10 @@ def main():
         if not args.yes:
             print("\n[dry-run 模式] 加 --yes 才会真正抽奖（消耗次数，不可逆）")
         return cmd_draw(args)
+    if args.action == "claim":
+        if not args.yes:
+            print("\n[dry-run 模式] 加 --yes 才会真正领奖（不可逆）")
+        return cmd_claim(args)
 
 
 if __name__ == "__main__":

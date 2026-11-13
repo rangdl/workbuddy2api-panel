@@ -41,8 +41,13 @@ func sessionTestScheduler(t *testing.T, switched bool) (*Scheduler, *recorderUps
 // TestEnterpriseSessionGateSkipsBehaviorTasks 企业切换会话的行为类任务门控：
 // /v2/report 等行为事件对该形态返回 200 却被上游静默丢弃（实测 2026-10-12，
 // 15 个成长任务全部 0/x 且 90s 内进度从不跳动），执行即零收益白跑——
-// 活跃上报 / 连登管家 / 猫猫旅行 / 夜猫子必须一个上游调用都不发；
+// 活跃上报 / 连登管家 / 夜猫子必须一个上游调用都不发；
 // 签到不在此列（对该形态未观测到静默失败，且失败是显式报错）。
+//
+// **猫猫旅行不在此列**（2026-11-13 调整）：实测该形态下 travel/status 与
+// buddy/quota 均正常返回，且旅行领奖 / 盲盒开盒都不走 /v2/report 计分通道。
+// 原实现把旅行一并门控，导致「能量盲盒」按钮在企业切换会话账号上返回
+// 0 个账号。现在放行，由 travelOne 的错误处理兜底。
 // 每个子用例配个人号对照，证明"没发请求"是门控生效而非构造有误。
 func TestEnterpriseSessionGateSkipsBehaviorTasks(t *testing.T) {
 	// 与 TestEnterpriseGateSkipsGrowthTasks 同款：把夜猫子窗口钉在窗口内。
@@ -60,7 +65,8 @@ func TestEnterpriseSessionGateSkipsBehaviorTasks(t *testing.T) {
 	}{
 		{"签到", func(s *Scheduler) { s.RunCheckinNow() }, "/daily-checkin", false},
 		{"活跃上报", func(s *Scheduler) { s.RunActivityNow() }, "/v2/report", true},
-		{"猫猫旅行", func(s *Scheduler) { s.RunTravelNow() }, "/activity/growth/buddy/info", true},
+		// 旅行放行：读端点实测可用，写操作不走 report 计分通道。
+		{"猫猫旅行", func(s *Scheduler) { s.RunTravelNow() }, "/activity/growth/buddy/info", false},
 		{"夜猫子", func(s *Scheduler) { s.RunBlackcatNow() }, "/v2/activity/growth/tasks", true},
 		{"连登管家", func(s *Scheduler) { s.RunStreakBonusNow() }, "/activity/growth/streak", true},
 	}
