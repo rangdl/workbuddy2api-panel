@@ -16,7 +16,7 @@ import (
 // 端点（tech-framework §6.1）：
 //   - POST {api_base}/trae/api/v2/ug/checkin_credits/status   签到状态（只读预检）
 //   - POST {api_base}/trae/api/v2/ug/checkin_credits/claim    执行签到
-//   - POST {api_base}/trae/api/v2/pay/ide_user_ent_usage      积分包查询
+//   - POST {api_base}/trae/api/v2/pay/web_user_ent_usage  积分包查询
 //
 // 与 chat 链路的关键差异：这三条接口用 **api.trae.cn**（不是 chat 的 mchost.guru），
 // 且请求头族不同（VSCode UA + market/session 头）。body 均为 `{}`（积分查询带参数）。
@@ -414,26 +414,6 @@ func firstPositive(vals ...float64) float64 {
 		}
 	}
 	return 0
-}
-
-// parseCreditPack 解析单个积分包（字段全部宽容取值）。
-func parseCreditPack(pack map[string]any) CreditPack {
-	var p CreditPack
-	base, _ := pack["entitlement_base_info"].(map[string]any)
-	if base == nil {
-		base = pack // 部分形态字段直接在顶层
-	}
-	p.ProductID = intOf(base["product_id"])
-	p.CreditsLimit = floatOf(base["credits_limit"])
-	p.StartTime = str(base["start_time"])
-	p.EndTime = firstNonEmpty(str(base["end_time"]), str(base["expire_time"]))
-	p.GroupName = str(base["group_name"])
-	p.NextBillingTime = intOf(base["next_billing_time"])
-	// usage 在 pack 顶层，不在 entitlement_base_info 内。
-	if usage, ok := pack["usage"].(map[string]any); ok {
-		p.CreditsUsed = floatOf(usage["credits_amount"])
-	}
-	return p
 }
 
 // apiPost 向 api.trae.cn 发一次 POST（签到/积分接口共用）。

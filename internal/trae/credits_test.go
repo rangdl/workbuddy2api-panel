@@ -222,46 +222,108 @@ func TestCheckinVerifyDisabled(t *testing.T) {
 	}
 }
 
-// TestQueryCredits 积分包解析：通用/Work 分类 + 剩余计算。
+// TestQueryCredits 用**实测结构**（dsh 的 USAGE_API_RESEARCH 记录）验证解析。
+//
+// 关键点：credits_limit 在 entitlement_base_info.quota 里，不在 base 顶层；
+// 会员包还要再深一层 product_extra.package_extra.quota。
 func TestQueryCredits(t *testing.T) {
 	srv, seen := newAPIServer(t, func(path string, _ map[string]any) (int, string) {
 		if path != EndpointEntUsage {
 			t.Errorf("意外路径 %s", path)
 		}
-		return 200, `{"code":0,"data":{"user_entitlement_pack_list":[
-			{"entitlement_base_info":{"product_id":208,"credits_limit":1000,"start_time":"2026-09-14 15:52:38","end_time":"2026-10-14 15:52:38"},
+		return 200, `{"code":0,"data":{
+			"usage_summary":{"total_amount":1800,"consumed_amount":500,"consumption_ratio":0.27},
+			"user_entitlement_pack_list":[
+			{"entitlement_base_info":{"product_id":208,"quota":{"credits_limit":1000},
+			  "start_time":"2026-09-14 15:52:38","end_time":"2026-10-14 15:52:38"},
 			 "usage":{"credits_amount":400}},
-			{"entitlement_base_info":{"product_id":209,"credits_limit":500,"group_name":"会员积分"},
+			{"entitlement_base_info":{"product_id":209,"quota":{"credits_limit":500},
+			  "display_desc":"会员积分"},
 			 "usage":{"credits_amount":100}},
-			{"entitlement_base_info":{"product_id":221,"credits_limit":300}}
+			{"entitlement_base_info":{"product_id":221,"quota":{"credits_limit":300}}},
+			{"entitlement_base_info":{"product_id":208,
+			  "product_extra":{"package_extra":{"quota":{"credits_limit":200}}}},
+			 "usage":{"credits_amount":50}}
 		]}}`
 	})
 	sum, err := NewClient().QueryCredits(context.Background(), apiCfg(srv.URL), testAccount())
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 208 剩 600 + 221 剩 300 = 900（通用）；209 剩 400（Work）
-	if sum.General != 900 {
-		t.Errorf("General = %v, want 900", sum.General)
+	// 208: 600 + 150(package_extra 200-50) = 750；221: 300 → 通用 1050
+	if sum.General != 1050 {
+		t.Errorf("General = %v, want 1050", sum.General)
 	}
 	if sum.Work != 400 {
 		t.Errorf("Work = %v, want 400", sum.Work)
 	}
-	if sum.Total != 1300 {
-		t.Errorf("Total = %v, want 1300", sum.Total)
+	// Limit/Total 取上游 usage_summary（1800 / 1300）：逐包求和会漏包。
+	if sum.Limit != 1800 || sum.Total != 1300 {
+		t.Errorf("Limit/Total = %v/%v, want 1800/1300", sum.Limit, sum.Total)
 	}
-	if sum.Limit != 1800 {
-		t.Errorf("Limit = %v, want 1800", sum.Limit)
+	if !sum.TotalFromSummary {
+		t.Error("TotalFromSummary 应为 true")
 	}
-	if len(sum.Packs) != 3 {
-		t.Fatalf("Packs = %d", len(sum.Packs))
+	if len(sum.Packs) != 4 {
+		t.Fatalf("Packs = %d, want 4", len(sum.Packs))
 	}
 	if sum.Packs[0].EndTime != "2026-10-14 15:52:38" {
 		t.Errorf("EndTime = %q", sum.Packs[0].EndTime)
 	}
-	// 请求体必须带 require_usage
+	// package_extra 里的额度必须被读到（旧实现读不到 → 该包 0 额度被丢弃）。
+	if sum.Packs[3].CreditsLimit != 200 {
+		t.Errorf("package_extra 额度未解析: %+v", sum.Packs[3])
+	}
 	if (*seen)[0]["require_usage"] != true {
 		t.Errorf("请求体缺 require_usage: %v", (*seen)[0])
+	}
+}
+
+// TestQueryCreditsFallsBackToAlias 主端点无 pack 列表时走别名端点。
+func TestQueryCreditsFallsBackToAlias(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == EndpointEntUsageAlias {
+			_, _ = w.Write([]byte(`{"code":0,"user_entitlement_pack_list":[
+				{"entitlement_base_info":{"product_id":208,"quota":{"credits_limit":100}},
+				 "usage":{"credits_amount":10}}]}`))
+			return
+		}
+		// 主端点：200 但没有 pack 列表（旧 ide_user_ent_usage 的真实表现）
+		_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+	}))
+	defer srv.Close()
+
+	sum, err := NewClient().QueryCredits(context.Background(), apiCfg(srv.URL), testAccount())
+	if err != nil {
+		t.Fatalf("应回落到别名端点: %v", err)
+	}
+	if len(paths) != 2 || paths[1] != EndpointEntUsageAlias {
+		t.Errorf("请求路径 = %v", paths)
+	}
+	if sum.General != 90 {
+		t.Errorf("General = %v, want 90", sum.General)
+	}
+}
+
+// TestQueryCreditsNoUsageSummary usage_summary 缺失时退回逐包求和。
+func TestQueryCreditsNoUsageSummary(t *testing.T) {
+	srv, _ := newAPIServer(t, func(string, map[string]any) (int, string) {
+		return 200, `{"code":0,"user_entitlement_pack_list":[
+			{"entitlement_base_info":{"product_id":208,"quota":{"credits_limit":100}},
+			 "usage":{"credits_amount":40}}]}`
+	})
+	sum, err := NewClient().QueryCredits(context.Background(), apiCfg(srv.URL), testAccount())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.TotalFromSummary {
+		t.Error("无 usage_summary 时 TotalFromSummary 应为 false")
+	}
+	if sum.Limit != 100 || sum.Total != 60 {
+		t.Errorf("Limit/Total = %v/%v, want 100/60", sum.Limit, sum.Total)
 	}
 }
 

@@ -36,7 +36,7 @@ func (p *Panel) traeAccountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "trae client not available")
 		return
 	}
-	cfg, err := trae.Load(p.cfg.TraePath)
+	cfg, err := trae.Load(p.cfg.TraePath, p.cfg.AuthDir)
 	if err != nil || cfg == nil {
 		writeErr(w, http.StatusBadRequest, "trae.json 不存在或无法读取")
 		return
@@ -100,7 +100,7 @@ func (p *Panel) traeAccountCredits(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "trae client not available")
 		return
 	}
-	cfg, err := trae.Load(p.cfg.TraePath)
+	cfg, err := trae.Load(p.cfg.TraePath, p.cfg.AuthDir)
 	if err != nil || cfg == nil {
 		writeErr(w, http.StatusBadRequest, "trae.json 不存在或无法读取")
 		return

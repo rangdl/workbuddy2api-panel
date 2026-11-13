@@ -155,7 +155,7 @@ func TestTraeConfigSavePreservesCredentials(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
 	}
-	saved, err := trae.Load(path)
+	saved, err := trae.Load(path, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestTraeConfigSaveDisableAccount(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
 	}
-	saved, _ := trae.Load(path)
+	saved, _ := trae.Load(path, "")
 	if saved == nil || len(saved.Accounts) != 1 || !saved.Accounts[0].Disabled {
 		t.Fatalf("禁用未生效: %+v", saved)
 	}
@@ -277,7 +277,7 @@ func TestTraeImportRejectsBadCipher(t *testing.T) {
 		t.Fatalf("status = %d, want 400（body=%s）", rec.Code, rec.Body)
 	}
 	// 账号凭证未被污染
-	saved, _ := trae.Load(path)
+	saved, _ := trae.Load(path, "")
 	if saved.Accounts[0].PrivateKeyPEM != "" {
 		t.Error("导入失败不应写入凭证")
 	}
@@ -309,7 +309,7 @@ func TestTraeRemoveAccount(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
 	}
-	saved, _ := trae.Load(path)
+	saved, _ := trae.Load(path, "")
 	if len(saved.Accounts) != 1 || saved.Accounts[0].UID != "u-2" {
 		t.Fatalf("删除结果不符: %+v", saved.Accounts)
 	}

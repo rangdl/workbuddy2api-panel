@@ -40,7 +40,7 @@
 | `trae-api-cn.mchost.guru` | `POST /api/agent/v3/llm_utils_chat` | 核心对话（HTTP + SSE） |
 | `trae-api-cn.mchost.guru` | `POST /api/ide/v1/get_detail_param` | 模型列表 |
 | `api.trae.cn` | `POST /trae/api/v2/ug/checkin_credits/claim` / `status` | 签到 |
-| `api.trae.cn` | `POST /trae/api/v2/pay/ide_user_ent_usage` | 积分/权益查询 |
+| `api.trae.cn` | `POST /trae/api/v2/pay/web_user_ent_usage` | 积分/权益查询 |
 | `api.trae.com.cn` | `POST /cloudide/api/v3/trae/oauth/ExchangeToken` | Token 刷新 |
 | `api.trae.com.cn` | `POST /cloudide/api/v3/trae/GetUserInfo` | 用户信息 |
 | `www.trae.cn` | `GET /authorization` | OAuth 授权页 |
@@ -218,13 +218,13 @@ JWT 全量寿命约 **13 天**，参考项目把刷新压到最后 48h（`accoun
 | P1 | `trae` 包骨架 + 凭证存储 + 设备私钥导入（tc 解密） | 3–5 天 | P0 通过 | ✅ **已实现** |
 | P2 | `llm_utils_chat` 请求构造 + SOLO SSE → OpenAI 转换 | 4–6 天 | — | ✅ **已实现** |
 | P3 | 面板接入（登录 / 账号列表 / 模型）+ 错误分类 + 冷却 | 3–4 天 | — | ✅ **已实现** |
-| P4 | 签到 / 积分查询（`checkin_credits` / `ide_user_ent_usage`） | 2–3 天 | 可选 | ✅ **已实现** |
+| P4 | 签到 / 积分查询（`checkin_credits` /  `web_user_ent_usage`） | 2–3 天 | 可选 | ✅ **已实现** |
 
 ### P4 落地清单（2026-09-27）
 
 | 文件 | 内容 |
 |---|---|
-| `internal/trae/credits.go` | 签到状态预检（`checkin_credits/status`）、签到（`checkin_credits/claim`）、积分包查询（`pay/ide_user_ent_usage`）；签到专用头族（VSCode UA + market/session 头）；宽容解析（`data/result/resp/response/info` 信封深挖，**但 `code` 只看顶层**——深挖会误伤嵌套业务对象的同名 code） |
+| `internal/trae/credits.go` | 签到状态预检（`checkin_credits/status`）、签到（`checkin_credits/claim`）、积分包查询（`pay/web_user_ent_usage`）；签到专用头族（VSCode UA + market/session 头）；宽容解析（`data/result/resp/response/info` 信封深挖，**但 `code` 只看顶层**——深挖会误伤嵌套业务对象的同名 code） |
 | `internal/trae/scheduler.go` | 独立签到调度器（每分钟判定配置时点；同日去重；账号间限速 800ms；失败按分类写冷却、成功即清） |
 | `internal/panel/trae_ops.go` | 面板运维接口：全部签到 / 单账号签到 / 积分查询 / 最近签到结果 |
 | `internal/panel/index.html` + `app.js` | 账号行「签到」「积分」按钮 + 顶部「全部签到」「上次签到结果」+ 排程配置（开关 + 时点） |

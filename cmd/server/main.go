@@ -320,20 +320,20 @@ func main() {
 	tpClient := thirdparty.NewClient()
 	// Trae 上游（可选；trae.json 缺失或 enabled=false 时不启用）。
 	// 冷却表在 main 构造：面板与 handler 需共用同一实例（前者展示、后者读写）。
-	traeCfg := loadTraeConfig(*cfgPath)
+	traeCfg := loadTraeConfig(*cfgPath, cfg.AuthDir)
 	traeClient := trae.NewClient()
 	traeCool := trae.NewCooldowns()
 	// 签到调度器：ConfigFn 每次 tick 重新读文件（热重载自然生效）；
 	// 用 trae.Load 而非 loadTraeConfig 是为了避免每分钟重复打启动摘要日志。
 	traeSched := trae.NewScheduler(func() *trae.Config {
-		cfg, err := trae.Load(trae.ConfigPath(*cfgPath))
-		if err != nil || cfg == nil {
+		tcfg, err := trae.Load(trae.ConfigPath(*cfgPath), cfg.AuthDir)
+		if err != nil || tcfg == nil {
 			return nil
 		}
 		// 续期轮换后的 refreshToken 必须落盘（否则重启后续期全废）。
 		// 一账号一文件：只写变化的那个账号，不重写整个配置。
-		cfg.SaveAccount = saveTraeAccountFunc(cfg.AuthDir)
-		return cfg
+		tcfg.SaveAccount = saveTraeAccountFunc(tcfg.AuthDir)
+		return tcfg
 	}, traeClient, traeCool)
 
 	// handlerRef 供面板热重载闭包引用（panel 先于 handler 构造，闭包在保存时才调用）。
@@ -402,7 +402,7 @@ func main() {
 			if handlerRef == nil {
 				return nil
 			}
-			handlerRef.SetTraeConfig(loadTraeConfig(*cfgPath))
+			handlerRef.SetTraeConfig(loadTraeConfig(*cfgPath, cfg.AuthDir))
 			return nil
 		},
 		LoadConfig: func() (any, error) {

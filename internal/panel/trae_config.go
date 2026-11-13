@@ -87,7 +87,7 @@ func (p *Panel) getTraeConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "trae config api not available")
 		return
 	}
-	cfg, err := trae.Load(path)
+	cfg, err := trae.Load(path, p.cfg.AuthDir)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "read trae.json: "+err.Error())
 		return
@@ -178,7 +178,7 @@ func (p *Panel) saveTraeConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
-	old, err := trae.Load(path)
+	old, err := trae.Load(path, p.cfg.AuthDir)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "read trae.json: "+err.Error())
 		return
@@ -304,7 +304,7 @@ func (p *Panel) importTraeDevice(w http.ResponseWriter, r *http.Request) {
 	// uid 留空 = 按设备号自动匹配账号（只有一个可匹配项时才应用，
 	// 避免把凭证写到错误账号上）；匹配不到或有多项时返回候选让人确认。
 	if req.UID == "" {
-		cfg0, _ := trae.Load(path)
+		cfg0, _ := trae.Load(path, p.cfg.AuthDir)
 		if cfg0 == nil {
 			writeErr(w, http.StatusBadRequest, "trae.json 不存在：请先完成一次登录或手工创建配置")
 			return
@@ -331,7 +331,7 @@ func (p *Panel) importTraeDevice(w http.ResponseWriter, r *http.Request) {
 		req.UID = matched[0]
 	}
 
-	cfg, err := trae.Load(path)
+	cfg, err := trae.Load(path, p.cfg.AuthDir)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "read trae.json: "+err.Error())
 		return
@@ -473,7 +473,7 @@ func (p *Panel) traeLoginStart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	cfg, _ := trae.Load(path)
+	cfg, _ := trae.Load(path, p.cfg.AuthDir)
 	clientID, callback := "", ""
 	if cfg != nil {
 		clientID = cfg.OAuthClientID
@@ -615,7 +615,7 @@ func (p *Panel) traeLoginFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, _ := trae.Load(path)
+	cfg, _ := trae.Load(path, p.cfg.AuthDir)
 	if cfg == nil {
 		cfg = &trae.Config{}
 	}
@@ -723,7 +723,7 @@ func (p *Panel) removeTraeAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	uid := r.PathValue("uid")
-	cfg, err := trae.Load(path)
+	cfg, err := trae.Load(path, p.cfg.AuthDir)
 	if err != nil || cfg == nil {
 		writeErr(w, http.StatusBadRequest, "trae.json 不存在或无法读取")
 		return

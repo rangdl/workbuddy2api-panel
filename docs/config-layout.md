@@ -41,8 +41,13 @@ Trae 账号**不再内嵌在 `trae.json` 里**，改为 `auths/trae-<uid>.json`�
 - **权限最小化**：账号文件含明文 refreshToken 与设备私钥，单独 `0600`。
 - **心智一致**：备份 / 手工编辑 / 导入导出的方式与 CodeBuddy 相同。
 
-`trae.json` 的 `auth_dir` 指定账号目录，缺省为 `trae.json` 同级的 `auths/`
-（与 CodeBuddy 共用目录，靠 `trae-` / `workbuddy-` 前缀区分）。
+`trae.json` 的 `auth_dir` 指定账号目录；**留空时用主配置 `config.json` 的
+`auth_dir`**（缺省 `./auths`，相对启动目录），从而与 workbuddy 账号落在同一目录，
+靠 `trae-` / `workbuddy-` 前缀区分。
+
+> 注意不要按 `trae.json` 的位置推导账号目录：配置在 `config/`、账号在根 `auths/`，
+> 两者**不同级**。早期实现按配置文件推导，导致 Trae 账号被写到 `config/auths/`
+> 而与 workbuddy 分家。
 
 > **旧版自动迁移**：启动时若发现 `trae.json` 里还有 `accounts` 数组，会把它拆成
 > 一账号一文件后清空该数组。迁移是幂等的；任何一条写失败都会保留源数组并告警，

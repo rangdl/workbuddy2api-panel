@@ -82,7 +82,7 @@ func TestConfigLoad(t *testing.T) {
 	dir := t.TempDir()
 
 	// 缺失
-	cfg, err := Load(filepath.Join(dir, "nope.json"))
+	cfg, err := Load(filepath.Join(dir, "nope.json"), "")
 	if err != nil || cfg != nil {
 		t.Fatalf("文件缺失应返回 (nil,nil)，得到 %v/%v", cfg, err)
 	}
@@ -92,7 +92,7 @@ func TestConfigLoad(t *testing.T) {
 	if err := os.WriteFile(bad, []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(bad); err == nil {
+	if _, err := Load(bad, ""); err == nil {
 		t.Error("损坏文件应报错")
 	}
 
@@ -126,7 +126,7 @@ func TestConfigLoad(t *testing.T) {
 	if err := SaveAccount(DefaultAuthDir(good), &Account{UID: "u1", AccessToken: "t"}); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err = Load(good)
+	cfg, err = Load(good, "")
 	if err != nil {
 		t.Fatal(err)
 	}

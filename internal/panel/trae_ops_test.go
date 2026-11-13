@@ -26,7 +26,7 @@ func newTraeOpsPanel(t *testing.T, upstreamURL string) (*Panel, string) {
 	client := trae.NewClient()
 	cool := trae.NewCooldowns()
 	sched := trae.NewScheduler(func() *trae.Config {
-		c, err := trae.Load(path)
+		c, err := trae.Load(path, "")
 		if err != nil {
 			return nil
 		}
@@ -187,7 +187,7 @@ func TestTraeOpsUnavailable(t *testing.T) {
 func TestTraeConfigViewIncludesSchedule(t *testing.T) {
 	srv := newTraeOpsUpstream(t)
 	p, path := newTraeOpsPanel(t, srv.URL)
-	cfg, _ := trae.Load(path)
+	cfg, _ := trae.Load(path, "")
 	cfg.Schedule = trae.CheckinSchedule{Enabled: true, Hours: []int{9, 21}, GapMS: 800}
 	writeTraeTestConfig(t, path, cfg)
 
@@ -219,7 +219,7 @@ func TestTraeConfigSaveSchedule(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
 	}
-	saved, _ := trae.Load(path)
+	saved, _ := trae.Load(path, "")
 	if !saved.Schedule.Enabled || len(saved.Schedule.Hours) != 2 || saved.Schedule.Hours[0] != 7 {
 		t.Fatalf("排程未保存: %+v", saved.Schedule)
 	}

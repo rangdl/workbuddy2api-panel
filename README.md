@@ -1053,7 +1053,9 @@ auths/
 └── trae-<uid>.json            Trae 账号（含 token + 设备公私钥，权限 0600）
 ```
 
-`auth_dir` 留空 = `trae.json` 同级的 `auths/`。早于本版的 `trae.json` 若内嵌了
+`auth_dir` 留空 = 用主配置 `config.json` 的 `auth_dir`（缺省 `./auths`，相对启动
+目录），**与 workbuddy 账号同目录**，靠 `trae-` / `workbuddy-` 前缀区分。
+早于本版的 `trae.json` 若内嵌了
 `accounts` 数组，启动时自动拆成一账号一文件后清空该数组（幂等；写失败则保留
 源数组并在下次启动重试）。
 
@@ -1105,9 +1107,13 @@ auths/
   未翻转标 `unverified`（不报成功、下轮重试）；
 - **每日自动签到**：面板可配开关与时点（默认 `[9]`），独立调度器按点执行、同日去重；
   失败按错误分类写入冷却（与 chat 链路共用同一张冷却表）；
-- **积分查询**：`pay/ide_user_ent_usage` 拉取积分包明细，按 `product_id` 动态分类
-  （209 = Work 积分，其余归通用积分——签到积分归属曾变更，不可写死来源），
-  面板展示通用 / Work / 合计 / 额度。
+- **积分查询**：`pay/web_user_ent_usage`（别名 `user_current_entitlement_list`）拉取积分包
+  明细与 `usage_summary`，按 `product_id` 动态分类（209 = Work 积分，其余归通用积分——
+  签到积分归属曾变更，不可写死来源），面板展示通用 / Work / 合计 / 额度。
+
+  > 包内额度字段在 `entitlement_base_info.quota.credits_limit`，会员包还要再深一层
+  > `product_extra.package_extra.quota.credits_limit`；`usage.credits_amount` 是**已消耗**，
+  > 剩余 = 额度 − 已用。合计/额度优先取上游 `usage_summary`（逐包求和会漏掉免费包）。
 
 > ⚠️ **签到限额按「设备」算，不按账号。** 返回码 `9095` 的主语是设备：
 > 多个账号共用同一个 `device_id` 时，一天只有第一个能签成，其余全部 9095。

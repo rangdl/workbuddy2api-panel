@@ -251,11 +251,15 @@ type legacyConfig struct {
 // Load 读取 trae.json 与账号目录。
 //
 // 文件缺失返回 (nil, nil)——调用方据此判定"未启用 Trae"。
-// 账号来自 cfg.AuthDir（缺省为 trae.json 同级的 auths/）。
+//
+// 账号目录优先级：trae.json 的 auth_dir > defaultAuthDir 参数。
+// 传空则回落到 DefaultAuthDir（trae.json 同级），但生产路径**必须**传主配置
+// 的 auth_dir——否则会去 config/auths/ 找账号，而 workbuddy 账号在根目录
+// auths/ 下，两边分家。
 //
 // 注意：本函数**不迁移**旧版内嵌账号，迁移在 MigrateLegacyAccounts 里显式做，
 // 免得"每分钟都在写的调度器读路径"顺手改磁盘。
-func Load(path string) (*Config, error) {
+func Load(path, defaultAuthDir string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -268,7 +272,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	if strings.TrimSpace(c.AuthDir) == "" {
-		c.AuthDir = DefaultAuthDir(path)
+		if strings.TrimSpace(defaultAuthDir) != "" {
+			c.AuthDir = defaultAuthDir
+		} else {
+			c.AuthDir = DefaultAuthDir(path)
+		}
 	}
 	accounts, err := LoadAccounts(c.AuthDir)
 	if err != nil {
@@ -281,7 +289,10 @@ func Load(path string) (*Config, error) {
 	return &c, nil
 }
 
-// DefaultAuthDir trae.json 缺省账号目录：同级的 auths/（与 CodeBuddy 共用）。
+// DefaultAuthDir 兜底账号目录（trae.json 同级）。
+//
+// 仅作**最后兜底**：标准布局里配置在 config/、账号在根 auths/，两者不同级，
+// 所以生产路径应显式传主配置的 auth_dir 给 Load。
 func DefaultAuthDir(configPath string) string {
 	return filepath.Join(filepath.Dir(configPath), "auths")
 }
@@ -293,7 +304,7 @@ func DefaultAuthDir(configPath string) string {
 // 宁可下次启动再试，也不能让账号凭空消失。
 //
 // 返回迁移的账号数（0 表示无需迁移）。
-func MigrateLegacyAccounts(configPath string) (int, error) {
+func MigrateLegacyAccounts(configPath, defaultAuthDir string) (int, error) {
 	raw, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -309,14 +320,19 @@ func MigrateLegacyAccounts(configPath string) (int, error) {
 		return 0, nil
 	}
 
-	// AuthDir 可能配在同一个文件里，先取出来（缺省同级 auths/）。
+	// AuthDir 可能配在同一个文件里，先取出来；否则用调用方给的默认目录
+	// （生产路径传主配置的 auth_dir，保证与 workbuddy 账号同目录）。
 	var meta struct {
 		AuthDir string `json:"auth_dir"`
 	}
 	_ = json.Unmarshal(raw, &meta)
 	dir := strings.TrimSpace(meta.AuthDir)
 	if dir == "" {
-		dir = DefaultAuthDir(configPath)
+		if strings.TrimSpace(defaultAuthDir) != "" {
+			dir = defaultAuthDir
+		} else {
+			dir = DefaultAuthDir(configPath)
+		}
 	}
 
 	migrated := 0

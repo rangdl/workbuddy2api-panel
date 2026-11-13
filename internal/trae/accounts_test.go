@@ -134,7 +134,7 @@ func TestMigrateLegacyAccounts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, err := MigrateLegacyAccounts(path)
+	n, err := MigrateLegacyAccounts(path, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestMigrateLegacyAccounts(t *testing.T) {
 	}
 
 	// 源配置的全局字段保留、accounts 被清空。
-	cfg, err := Load(path)
+	cfg, err := Load(path, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestMigrateLegacyAccounts(t *testing.T) {
 	}
 
 	// 幂等：再跑一次不迁移任何东西。
-	n, err = MigrateLegacyAccounts(path)
+	n, err = MigrateLegacyAccounts(path, "")
 	if err != nil || n != 0 {
 		t.Errorf("二次迁移应无操作，得到 n=%d err=%v", n, err)
 	}
@@ -182,7 +182,7 @@ func TestMigrateLegacyAccountsKeepsSourceOnFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, err := MigrateLegacyAccounts(path)
+	n, err := MigrateLegacyAccounts(path, "")
 	if err == nil {
 		t.Fatal("有失败项时应返回错误")
 	}
@@ -204,7 +204,7 @@ func TestMigrateLegacyAccountsHonorsAuthDir(t *testing.T) {
 	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := MigrateLegacyAccounts(path); err != nil {
+	if _, err := MigrateLegacyAccounts(path, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(AccountPath(custom, "u1")); err != nil {
@@ -251,5 +251,80 @@ func TestConcurrentSaveAccountNoLoss(t *testing.T) {
 		if byUID[uid] != "at-"+uid {
 			t.Errorf("%s 的 token 不符: %q", uid, byUID[uid])
 		}
+	}
+}
+
+// TestLoadUsesExplicitAuthDir 账号目录必须由调用方显式指定。
+//
+// 标准布局里配置在 config/trae.json、账号在根 auths/，两者**不同级**——
+// 若按配置文件位置推导会得到 config/auths/，与 workbuddy 账号分家。
+func TestLoadUsesExplicitAuthDir(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "config")
+	authDir := filepath.Join(root, "auths")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(configDir, "trae.json")
+	if err := os.WriteFile(path, []byte(`{"enabled":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 账号写在根 auths/（与 workbuddy 同一目录）。
+	if err := SaveAccount(authDir, &Account{UID: "trae-u1", AccessToken: "t1"}); err != nil {
+		t.Fatal(err)
+	}
+	// 同目录下放一个 workbuddy 账号，确认不会被 trae 误读。
+	if err := os.WriteFile(filepath.Join(authDir, "workbuddy-u2.json"),
+		[]byte(`{"uid":"u2","accessToken":"t2"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path, authDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AuthDir != authDir {
+		t.Errorf("AuthDir = %q, want %q", cfg.AuthDir, authDir)
+	}
+	if len(cfg.Accounts) != 1 || cfg.Accounts[0].UID != "trae-u1" {
+		t.Errorf("应只读到 trae 账号，得到 %+v", cfg.Accounts)
+	}
+
+	// 不传默认目录时会退回 config/auths/（兜底行为，非生产路径）。
+	fallback, err := Load(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback.AuthDir == authDir {
+		t.Error("不传默认目录时不应知道根 auths/ 的位置")
+	}
+	if len(fallback.Accounts) != 0 {
+		t.Errorf("兜底目录里没有账号，得到 %+v", fallback.Accounts)
+	}
+}
+
+// TestMigrateUsesExplicitAuthDir 迁移也必须落到调用方指定的目录。
+func TestMigrateUsesExplicitAuthDir(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "config")
+	authDir := filepath.Join(root, "auths")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(configDir, "trae.json")
+	raw := `{"accounts":[{"uid":"trae-u1","access_token":"t1"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n, err := MigrateLegacyAccounts(path, authDir)
+	if err != nil || n != 1 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	if _, err := os.Stat(AccountPath(authDir, "trae-u1")); err != nil {
+		t.Errorf("账号未迁移到指定目录: %v", err)
+	}
+	// 不应在 config/ 下建 auths/。
+	if _, err := os.Stat(filepath.Join(configDir, "auths")); !os.IsNotExist(err) {
+		t.Error("不应在配置目录下创建 auths/")
 	}
 }
