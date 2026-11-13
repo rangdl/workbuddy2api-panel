@@ -107,6 +107,9 @@ type Config struct {
 	TraeCooldowns *trae.Cooldowns
 	// TraeScheduler Trae 签到调度器（手动触发签到 / 查询最近结果用；nil = 501）。
 	TraeScheduler *trae.Scheduler
+	// TraeStats Trae 账号运行期计数（成功/失败/在途/用量展示用）。
+	// 与 server 侧共用同一实例；nil = 不展示运行期统计。
+	TraeStats *trae.Stats
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -776,13 +779,15 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
 func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.cfg.Pool.Remove(uid)
-	if a == nil {
+	acc := p.cfg.Pool.Remove(uid)
+	if acc == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+	// Remove 返回 gateway.Account；CodeBuddy 账号取出原始凭证以删除文件。
+	a := pool.UnwrapAuth(acc)
 	fileMsg := ""
-	if a.FilePath != "" {
+	if a != nil && a.FilePath != "" {
 		if err := os.Remove(a.FilePath); err != nil && !os.IsNotExist(err) {
 			fileMsg = err.Error()
 		}

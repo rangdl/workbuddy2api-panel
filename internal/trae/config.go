@@ -165,6 +165,15 @@ func (c *Config) Normalize() {
 	if c.IDEVersionCode == "" {
 		c.IDEVersionCode = DefaultIDEVersionCode
 	}
+	// 版本码必须是纯数字：上游把 x-app-version-code / x-ide-version-code 绑定为
+	// 数字类型，填点分串（如 "0.1.52"）会被回 `4001 parameter type does not
+	// match binding data`，且报错完全不指向版本头，极难排查（dsh 实测）。
+	if !isAllDigits(c.IDEVersionCode) {
+		log.Printf("WARN: [trae] ide_version_code = %q 不是纯数字，"+
+			"上游会回 4001 parameter type does not match binding data；已回退到内置值 %s",
+			c.IDEVersionCode, DefaultIDEVersionCode)
+		c.IDEVersionCode = DefaultIDEVersionCode
+	}
 	if c.AppID == "" {
 		c.AppID = DefaultAppID
 	}
@@ -450,4 +459,19 @@ func (a *Account) AccessTokenHeader() string {
 		return t
 	}
 	return "Cloud-IDE-JWT " + t
+}
+
+// isAllDigits 报告字符串是否全为 ASCII 数字且非空。
+//
+// 用途：上游把版本码头绑定为数字类型，非纯数字会被 4001 拒绝且报错不指向该头。
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }

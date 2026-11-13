@@ -103,6 +103,11 @@ type PrepareOptions struct {
 	IDEVersion     string
 	IDEVersionCode string
 	AppID          string
+	// Function 显式指定上游 function 名；空则按内置规则按模型推断。
+	//
+	// 为什么需要：不同模型归属不同 function（solo_work_lite / solo_agent / chat_v3…），
+	// 归属错了上游回 4001。上游目录（catalog.go）能给出权威归属，此处让调用方覆盖。
+	Function string
 	// NewID 生成 uuid-like 字符串；nil 用内置实现（测试可注入固定值）。
 	NewID func() string
 }
@@ -132,6 +137,7 @@ func PrepareChatBody(src []byte, opt PrepareOptions) ([]byte, error) {
 	rewriteMessages(obj)
 	normalizeToolChoice(obj)
 	normalizeTools(obj)
+	normalizeReasoningEffort(obj)
 
 	model := ""
 	if m, ok := obj["model"].(string); ok {
@@ -148,9 +154,19 @@ func PrepareChatBody(src []byte, opt PrepareOptions) ([]byte, error) {
 	}
 
 	obj["config_name"] = configName
+	// model 与 config_name 必须同值：网关认 config_name 作 wire id，但部分
+	// 后端也会校验 model；不显式写入会保留客户端传来的原始值（可能是大写
+	// 显示名或别名），与 config_name 不一致。
+	obj["model"] = configName
 	obj["model_name"] = modelName
 	obj["stream"] = true
-	obj["function"] = FunctionForModel(strings.ToLower(model))
+	// function 归属：显式指定优先（上游目录给出的权威值），否则按内置规则推断。
+	// 归属错了上游回 4001（"该 config_name 不被这个 function 服务"）。
+	if opt.Function != "" {
+		obj["function"] = opt.Function
+	} else {
+		obj["function"] = FunctionForModel(strings.ToLower(model))
+	}
 	obj["max_tokens"] = maxTokensOf(obj)
 	obj["conversation_id"] = opt.NewID()
 	obj["session_id"] = opt.NewID()
@@ -282,6 +298,11 @@ func normalizeTools(obj map[string]any) {
 			continue
 		}
 		if params, ok := fn["parameters"].(map[string]any); ok {
+			// 先洗成 draft-4 再字符串化：DeepSeek 后端对整个 tools 批次做
+			// 严格校验，draft-3 的 property 级 required:true 会让整轮回
+			// `4027 invalid JSON Schema`（dsh issue #49 实测）；哪个模型走
+			// 哪个后端由上游路由决定，所以所有带 tools 的请求都要先洗。
+			normalizeJSONSchema(params)
 			if b, err := json.Marshal(params); err == nil {
 				fn["parameters"] = string(b)
 			}
@@ -333,4 +354,134 @@ func genUUIDLike() string {
 	}
 	h := hex.EncodeToString(buf)
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// normalizeJSONSchema 把 JSON Schema 从 draft-3 归一为 draft-4 形态。
+//
+// 核心差异只有一处：draft-3 允许在**属性定义里**写 `"required": true`，而
+// draft-4 要求 `required` 是父级的**字符串数组**。DeepSeek 后端对整批 tools
+// 做严格校验，遇到 draft-3 形态会回 `4027 invalid JSON Schema`，且报错不指向
+// 具体哪个工具（dsh issue #49 实测）。
+//
+// 递归处理 properties / items / anyOf / oneOf / allOf / not / additionalProperties
+// ——组合关键字里同样可能出现 draft-3 的写法。
+func normalizeJSONSchema(node map[string]any) {
+	if node == nil {
+		return
+	}
+	// 1) 收集子级的 property 级 required:true，提升为父级 required 数组。
+	if props, ok := node["properties"].(map[string]any); ok {
+		var required []string
+		for name, raw := range props {
+			sub, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if req, ok := sub["required"]; ok {
+				if b, isBool := req.(bool); isBool {
+					// draft-3 属性级写法：删除并把名字提到父级。
+					delete(sub, "required")
+					if b {
+						required = append(required, name)
+					}
+				}
+			}
+			normalizeJSONSchema(sub)
+		}
+		if len(required) > 0 {
+			node["required"] = mergeRequired(node["required"], required)
+		}
+	}
+	// 2) 组合关键字里的子 schema。
+	for _, key := range []string{"anyOf", "oneOf", "allOf"} {
+		if list, ok := node[key].([]any); ok {
+			for _, item := range list {
+				if sub, ok := item.(map[string]any); ok {
+					normalizeJSONSchema(sub)
+				}
+			}
+		}
+	}
+	// 3) items 可能是单 schema 或 schema 数组。
+	switch items := node["items"].(type) {
+	case map[string]any:
+		normalizeJSONSchema(items)
+	case []any:
+		for _, item := range items {
+			if sub, ok := item.(map[string]any); ok {
+				normalizeJSONSchema(sub)
+			}
+		}
+	}
+	// 4) additionalProperties / not 也可能是 schema。
+	for _, key := range []string{"additionalProperties", "not"} {
+		if sub, ok := node[key].(map[string]any); ok {
+			normalizeJSONSchema(sub)
+		}
+	}
+}
+
+// mergeRequired 合并 required 数组并去重（保持首次出现顺序）。
+//
+// 返回 []string 而非 []any：调用方（含测试）直接按字符串切片读取；
+// JSON 序列化时两者都产出字符串数组，不影响出站形态。
+func mergeRequired(existing any, add []string) []string {
+	seen := make(map[string]bool, len(add))
+	out := make([]string, 0, len(add))
+	switch v := existing.(type) {
+	case []any:
+		for _, x := range v {
+			if s, ok := x.(string); ok && !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	case []string:
+		for _, s := range v {
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	for _, s := range add {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// reasoningEffortMap OpenAI 的 effort 档位 → Trae 原生档位。
+//
+// Trae 的 raw/新版端点只认 light / high / extra_high（实测），而 OpenAI
+// 客户端发的是 minimal/low/medium/high/xhigh。不归一的话上游要么忽略、
+// 要么当未知字段处理。
+var reasoningEffortMap = map[string]string{
+	"minimal": "light",
+	"low":     "light",
+	"medium":  "high",
+	"high":    "high",
+	"xhigh":   "extra_high",
+	"max":     "extra_high",
+}
+
+// normalizeReasoningEffort 把 reasoning_effort 归一成上游档位。
+// 无法识别的值直接删除（传未知档位不如不传，避免上游 4001）。
+func normalizeReasoningEffort(obj map[string]any) {
+	v, exists := obj["reasoning_effort"]
+	if !exists {
+		return
+	}
+	s, ok := v.(string)
+	if !ok {
+		delete(obj, "reasoning_effort")
+		return
+	}
+	if mapped, hit := reasoningEffortMap[strings.ToLower(strings.TrimSpace(s))]; hit {
+		obj["reasoning_effort"] = mapped
+		return
+	}
+	delete(obj, "reasoning_effort")
 }

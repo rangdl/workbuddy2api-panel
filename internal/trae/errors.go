@@ -44,7 +44,46 @@ const (
 	// （生成号必 9074），少部分是真正的排队限流。两种情况都**不该当场重试**——
 	// 连打会延长惩罚，交给下一轮排程即可。
 	ErrCheckinBusy ErrKind = "checkin_busy"
+	// ErrRiskControl 账号触发上游风控（4017）：冷却无效，直接摘出轮转。
+	ErrRiskControl ErrKind = "risk_control"
 )
+
+// ShouldRotate 该错误是否值得**换号重试**。
+//
+// 取舍来自 dsh 的 FAILOVER_KINDS：
+//   - 换号有用：凭证失效、额度耗尽、软限流、上游 5xx、风控（这个号废了）
+//   - 换号无用：模型不可用（换号还是同一个模型）、请求本身有问题（换号只会
+//     把同一个错误烧两遍）
+//
+// ErrNone（未分类）不换号：宁可把原始错误透出，也不要盲目重试消耗额度。
+func (c Classification) ShouldRotate() bool {
+	switch c.Kind {
+	case ErrSessionDead, ErrPlanLimit, ErrSoftRate, ErrServer, ErrRiskControl, ErrDeviceProof:
+		return true
+	default:
+		return false
+	}
+}
+
+// HTTPStatus 把分类映射为返回给客户端的 HTTP 状态码。
+//
+// 目的：把上游的业务语义翻成客户端能懂的状态码——额度耗尽对应 402、
+// 凭证失效对应 401、限流对应 429，而不是一律 502。客户端据此做正确的
+// 重试决策（502 通常被当成上游故障无限重试）。
+func (c Classification) HTTPStatus() int {
+	switch c.Kind {
+	case ErrSessionDead, ErrDeviceProof:
+		return http.StatusUnauthorized
+	case ErrPlanLimit:
+		return http.StatusPaymentRequired
+	case ErrSoftRate, ErrCheckinBusy:
+		return http.StatusTooManyRequests
+	case ErrModelUnknown, ErrClient, ErrCheckinAlready:
+		return http.StatusBadRequest
+	default:
+		return http.StatusBadGateway
+	}
+}
 
 // 冷却时长（分类 → 时长；0 表示不冷却）。
 const (
@@ -137,6 +176,24 @@ func classifyBizCode(code int64, msg string, status int) Classification {
 		return Classification{
 			Kind: ErrModelUnknown, Code: itoa64(code),
 			Message: orDefault(m, "模型在该账号不可用"),
+		}
+	// 4008 额度耗尽：账号级问题，换号有用（别的号可能还有额度）。
+	case 4008:
+		return Classification{
+			Kind: ErrPlanLimit, Cooldown: planLimitCooldown, Code: "4008",
+			Message: orDefault(m, "额度已耗尽"),
+		}
+	// 4011 限流：**不是**「不支持该模型」，换号或稍后重试都有效（dsh 实测）。
+	case 4011:
+		return Classification{
+			Kind: ErrSoftRate, Cooldown: softRateCooldown, Code: "4011",
+			Message: orDefault(m, "上游限流"),
+		}
+	// 4017 风控：账号被标记，冷却无效，直接摘出轮转。
+	case 4017:
+		return Classification{
+			Kind: ErrRiskControl, Disable: true, Code: "4017",
+			Message: orDefault(m, "触发上游风控，该账号需人工处理"),
 		}
 	// 9004 / 9095 都是「今日已签」，不是失败：
 	//   - 9004 = 请求未带 x-device-id，上游按已签处理（dsh 实测 2026-09-24）；

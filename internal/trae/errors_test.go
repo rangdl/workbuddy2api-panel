@@ -188,3 +188,64 @@ func TestCooldownsSnapshotOrder(t *testing.T) {
 		t.Errorf("应按剩余时间降序，首条 = %s", snap[0].UID)
 	}
 }
+
+// TestShouldRotate 换号判定：只有「换个账号可能好」的错误才换。
+func TestShouldRotate(t *testing.T) {
+	rotate := []ErrKind{ErrSessionDead, ErrPlanLimit, ErrSoftRate, ErrServer, ErrRiskControl, ErrDeviceProof}
+	noRotate := []ErrKind{ErrModelUnknown, ErrClient, ErrNone, ErrCheckinAlready, ErrCheckinBusy}
+
+	for _, k := range rotate {
+		if !(Classification{Kind: k}).ShouldRotate() {
+			t.Errorf("%s 应换号", k)
+		}
+	}
+	for _, k := range noRotate {
+		if (Classification{Kind: k}).ShouldRotate() {
+			t.Errorf("%s 不应换号（换号只会重复同一个错误）", k)
+		}
+	}
+}
+
+// TestChatDomainCodes 4008 额度耗尽 / 4011 限流 / 4017 风控。
+func TestChatDomainCodes(t *testing.T) {
+	cases := []struct {
+		code     int64
+		wantKind ErrKind
+		rotate   bool
+		disable  bool
+	}{
+		{4008, ErrPlanLimit, true, false},
+		{4011, ErrSoftRate, true, false},
+		{4017, ErrRiskControl, true, true},
+	}
+	for _, c := range cases {
+		got := Classify(0, nil, c.code, "")
+		if got.Kind != c.wantKind {
+			t.Errorf("code=%d Kind = %q, want %q", c.code, got.Kind, c.wantKind)
+		}
+		if got.ShouldRotate() != c.rotate {
+			t.Errorf("code=%d ShouldRotate = %v", c.code, got.ShouldRotate())
+		}
+		if got.Disable != c.disable {
+			t.Errorf("code=%d Disable = %v", c.code, got.Disable)
+		}
+	}
+}
+
+// TestHTTPStatusMapping 流内拒绝要映射成真实的 HTTP 状态码。
+func TestHTTPStatusMapping(t *testing.T) {
+	cases := map[ErrKind]int{
+		ErrSessionDead:  http.StatusUnauthorized,
+		ErrPlanLimit:    http.StatusPaymentRequired,
+		ErrSoftRate:     http.StatusTooManyRequests,
+		ErrModelUnknown: http.StatusBadRequest,
+		ErrClient:       http.StatusBadRequest,
+		ErrServer:       http.StatusBadGateway,
+		ErrRiskControl:  http.StatusBadGateway,
+	}
+	for k, want := range cases {
+		if got := (Classification{Kind: k}).HTTPStatus(); got != want {
+			t.Errorf("%s → %d, want %d", k, got, want)
+		}
+	}
+}

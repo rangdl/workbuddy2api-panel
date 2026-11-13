@@ -124,3 +124,22 @@ func TestRetryAfter(t *testing.T) {
 		t.Errorf("非法应为 0，得到 %v", d)
 	}
 }
+
+// TestChatHeadersTokenTriple token 三处都要设（Authorization / X-Cloudide-Token /
+// X-Ide-Token）——bluechonk 实测缺任一个都可能被拒。
+func TestChatHeadersTokenTriple(t *testing.T) {
+	acc := &Account{UID: "u1", AccessToken: "jwt-abc", DeviceID: "1234567890123456"}
+	cfg := &Config{AppID: DefaultAppID, IDEVersion: DefaultIDEVersion, IDEVersionCode: DefaultIDEVersionCode}
+	req, _ := http.NewRequest(http.MethodPost, "https://example.com", nil)
+	applyChatHeaders(req, cfg, acc, acc.AccessTokenHeader())
+
+	if got := req.Header.Get("Authorization"); got != "Cloud-IDE-JWT jwt-abc" {
+		t.Errorf("Authorization = %q", got)
+	}
+	if got := req.Header.Get("X-Cloudide-Token"); got != "jwt-abc" {
+		t.Errorf("X-Cloudide-Token = %q（裸 token）", got)
+	}
+	if got := req.Header.Get("X-Ide-Token"); got != "jwt-abc" {
+		t.Errorf("X-Ide-Token = %q（裸 token）", got)
+	}
+}

@@ -1,6 +1,7 @@
 package trae
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -301,5 +302,98 @@ func TestAggregateNoDone(t *testing.T) {
 	c, _ := choices[0].(map[string]any)
 	if c["finish_reason"] != "stop" {
 		t.Errorf("finish_reason = %v, want stop", c["finish_reason"])
+	}
+}
+
+// TestPeekStreamDetectsEarlyError 200 流里首个 error 事件必须被识别，
+// 且预读字节要能完整重放。
+func TestPeekStreamDetectsEarlyError(t *testing.T) {
+	upstream := "event:metadata\ndata:{\"session_id\":\"s1\"}\n\n" +
+		"event:timing_cost\ndata:{}\n\n" +
+		"event:error\ndata:{\"code\":1005,\"message\":\"额度不足\"}\n\n"
+	res, err := PeekStream(strings.NewReader(upstream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error == nil {
+		t.Fatal("应识别到流内错误")
+	}
+	if res.Error.Code != 1005 || res.Error.Message != "额度不足" {
+		t.Errorf("error = %+v", res.Error)
+	}
+	// 诊断事件之后才出现 error，说明它们不算"已应答"。
+	if !strings.Contains(string(res.Header), "metadata") {
+		t.Errorf("预读字节应包含已读的诊断事件，得到 %q", res.Header)
+	}
+}
+
+// TestPeekStreamPassesNormalStream 正常流（诊断后直接出内容）不应判错，
+// 且 Header 必须拼回完整原始字节。
+func TestPeekStreamPassesNormalStream(t *testing.T) {
+	upstream := "event:metadata\ndata:{}\n\n" +
+		"event:output\ndata:{\"response\":\"你\"}\n\n" +
+		"event:output\ndata:{\"response\":\"好\"}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	res, err := PeekStream(strings.NewReader(upstream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("不应判错: %+v", res.Error)
+	}
+	if string(res.Header) != upstream {
+		t.Errorf("Header 必须能完整重放原流\n得到: %q\n期望: %q", res.Header, upstream)
+	}
+}
+
+// TestPeekStreamErrorFirst 首个事件就是 error（无诊断前缀）。
+func TestPeekStreamErrorFirst(t *testing.T) {
+	res, err := PeekStream(strings.NewReader("event:error\ndata:{\"code\":4001,\"message\":\"模型不可用\"}\n\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error == nil || res.Error.Code != 4001 {
+		t.Fatalf("res = %+v", res)
+	}
+}
+
+// TestParseSoloEventNotifyUsage notify_usage 解析出 IDE / Work 余额。
+func TestParseSoloEventNotifyUsage(t *testing.T) {
+	data := `{"billing_mode":"credits","cn_credits_remain_info":{"ide_credits":1234.5,"work_credits":88}}`
+	ev := parseSoloEvent("notify_usage", data)
+	if !ev.HasRemain {
+		t.Fatal("应标记 HasRemain")
+	}
+	if ev.RemainIDE != 1234.5 || ev.RemainWork != 88 {
+		t.Errorf("RemainIDE=%v RemainWork=%v", ev.RemainIDE, ev.RemainWork)
+	}
+	if ev.BillingMode != "credits" {
+		t.Errorf("BillingMode = %q", ev.BillingMode)
+	}
+}
+
+// TestParseSoloEventQueuePosition 排队位置解析。
+func TestParseSoloEventQueuePosition(t *testing.T) {
+	ev := parseSoloEvent("request_wait_in_queue", `{"position":1234}`)
+	if !ev.HasQueue || ev.QueuePosition != 1234 {
+		t.Errorf("ev = %+v", ev)
+	}
+}
+
+// TestConvertStreamCarriesRemain notify_usage 的余额进入 StreamResult。
+func TestConvertStreamCarriesRemain(t *testing.T) {
+	upstream := "event:output\ndata:{\"response\":\"hi\"}\n\n" +
+		"event:notify_usage\ndata:{\"cn_credits_remain_info\":{\"ide_credits\":42,\"work_credits\":7}}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	var out bytes.Buffer
+	res, err := ConvertStream(strings.NewReader(upstream), "c1", "m1", func(b []byte) error {
+		out.Write(b)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.HasRemain || res.RemainIDE != 42 || res.RemainWork != 7 {
+		t.Errorf("res = %+v", res)
 	}
 }

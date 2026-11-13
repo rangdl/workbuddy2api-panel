@@ -257,3 +257,183 @@ func TestFunctionForModel(t *testing.T) {
 		}
 	}
 }
+
+// TestPrepareChatBodyModelMatchesConfigName model 与 config_name 必须同值。
+//
+// 网关认 config_name 作 wire id，但部分后端也校验 model；不显式写入会保留
+// 客户端传来的原值（可能是大写显示名），两者不一致。
+func TestPrepareChatBodyModelMatchesConfigName(t *testing.T) {
+	src := []byte(`{"model":"GLM-5.3","messages":[{"role":"user","content":"hi"}]}`)
+	out, err := PrepareChatBody(src, PrepareOptions{UID: "u1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(out, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["model"] != body["config_name"] {
+		t.Errorf("model=%v config_name=%v，必须同值", body["model"], body["config_name"])
+	}
+	if body["config_name"] != "glm-5.3" {
+		t.Errorf("config_name = %v，应归一成小写目录名", body["config_name"])
+	}
+}
+
+// TestNormalizeJSONSchemaDraft3 draft-3 的 property 级 required:true 提升为
+// 父级 required 数组；false 直接删除。
+func TestNormalizeJSONSchemaDraft3(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"path": map[string]any{"type": "string", "required": true},
+			"note": map[string]any{"type": "string", "required": false},
+			"opts": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"deep": map[string]any{"type": "boolean", "required": true},
+				},
+			},
+		},
+	}
+	normalizeJSONSchema(schema)
+
+	props := schema["properties"].(map[string]any)
+	if _, exists := props["path"].(map[string]any)["required"]; exists {
+		t.Error("property 级 required 应被删除")
+	}
+	if _, exists := props["note"].(map[string]any)["required"]; exists {
+		t.Error("required:false 应被删除")
+	}
+	req, _ := schema["required"].([]string)
+	if len(req) != 1 || req[0] != "path" {
+		t.Errorf("父级 required = %v, want [path]", req)
+	}
+	// 嵌套对象也要递归处理。
+	nested := props["opts"].(map[string]any)
+	nreq, _ := nested["required"].([]string)
+	if len(nreq) != 1 || nreq[0] != "deep" {
+		t.Errorf("嵌套 required = %v, want [deep]", nreq)
+	}
+}
+
+// TestNormalizeJSONSchemaMergesExisting 已有 required 数组时合并去重。
+func TestNormalizeJSONSchemaMergesExisting(t *testing.T) {
+	schema := map[string]any{
+		"type":     "object",
+		"required": []any{"a", "b"},
+		"properties": map[string]any{
+			"b": map[string]any{"type": "string", "required": true},
+			"c": map[string]any{"type": "string", "required": true},
+		},
+	}
+	normalizeJSONSchema(schema)
+	req, _ := schema["required"].([]string)
+	if len(req) != 3 || req[0] != "a" || req[1] != "b" || req[2] != "c" {
+		t.Errorf("required = %v, want [a b c]", req)
+	}
+}
+
+// TestNormalizeJSONSchemaHandlesCombinators anyOf/items 里也要递归。
+func TestNormalizeJSONSchemaHandlesCombinators(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"v": map[string]any{
+				"anyOf": []any{
+					map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"x": map[string]any{"type": "string", "required": true},
+						},
+					},
+				},
+			},
+		},
+	}
+	normalizeJSONSchema(schema)
+	branch := schema["properties"].(map[string]any)["v"].(map[string]any)["anyOf"].([]any)[0].(map[string]any)
+	req, _ := branch["required"].([]string)
+	if len(req) != 1 || req[0] != "x" {
+		t.Errorf("anyOf 分支 required = %v, want [x]", req)
+	}
+}
+
+// TestPrepareChatBodyNormalizesToolSchema 端到端：tools 里的 draft-3 schema
+// 在字符串化之前就被归一。
+func TestPrepareChatBodyNormalizesToolSchema(t *testing.T) {
+	src := []byte(`{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"read","parameters":{
+			"type":"object","properties":{"path":{"type":"string","required":true}}}}}]}`)
+	out, err := PrepareChatBody(src, PrepareOptions{UID: "u1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(out, &body); err != nil {
+		t.Fatal(err)
+	}
+	tools := body["tools"].([]any)
+	fn := tools[0].(map[string]any)["function"].(map[string]any)
+	paramsStr, ok := fn["parameters"].(string)
+	if !ok {
+		t.Fatalf("parameters 应为 JSON 字符串，得到 %T", fn["parameters"])
+	}
+	var params map[string]any
+	if err := json.Unmarshal([]byte(paramsStr), &params); err != nil {
+		t.Fatal(err)
+	}
+	req, _ := params["required"].([]any)
+	if len(req) != 1 || req[0] != "path" {
+		t.Errorf("字符串化后的 schema required = %v, want [path]", req)
+	}
+	prop := params["properties"].(map[string]any)["path"].(map[string]any)
+	if _, exists := prop["required"]; exists {
+		t.Error("property 级 required 应已删除")
+	}
+}
+
+// TestNormalizeReasoningEffort OpenAI 档位 → Trae 原生档位。
+func TestNormalizeReasoningEffort(t *testing.T) {
+	cases := map[string]string{
+		"minimal": "light",
+		"low":     "light",
+		"medium":  "high",
+		"HIGH":    "high",
+		"xhigh":   "extra_high",
+		"max":     "extra_high",
+	}
+	for in, want := range cases {
+		obj := map[string]any{"reasoning_effort": in}
+		normalizeReasoningEffort(obj)
+		if obj["reasoning_effort"] != want {
+			t.Errorf("%q → %v, want %q", in, obj["reasoning_effort"], want)
+		}
+	}
+	// 无法识别的值直接删除（传未知档位会被上游拒）。
+	obj := map[string]any{"reasoning_effort": "ultra"}
+	normalizeReasoningEffort(obj)
+	if _, exists := obj["reasoning_effort"]; exists {
+		t.Error("未知档位应删除")
+	}
+	// 非字符串同样删除。
+	obj = map[string]any{"reasoning_effort": 3}
+	normalizeReasoningEffort(obj)
+	if _, exists := obj["reasoning_effort"]; exists {
+		t.Error("非字符串应删除")
+	}
+}
+
+// TestPrepareChatBodyReasoningEffort 端到端：归一后的档位进入请求体。
+func TestPrepareChatBodyReasoningEffort(t *testing.T) {
+	src := []byte(`{"model":"glm-5.3","reasoning_effort":"xhigh","messages":[{"role":"user","content":"hi"}]}`)
+	out, err := PrepareChatBody(src, PrepareOptions{UID: "u1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(out, &body)
+	if body["reasoning_effort"] != "extra_high" {
+		t.Errorf("reasoning_effort = %v, want extra_high", body["reasoning_effort"])
+	}
+}

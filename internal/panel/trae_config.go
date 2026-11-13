@@ -56,6 +56,8 @@ type traeAccountView struct {
 	CheckinDeviceAlready bool `json:"checkin_device_already,omitempty"`
 	// CheckinError 签到状态查询失败的原因（空 = 查询成功）。
 	CheckinError string `json:"checkin_error,omitempty"`
+	// Stats 运行期计数（成功/失败/在途/用量/最近额度）。nil = 未注入统计表。
+	Stats *trae.StatView `json:"stats,omitempty"`
 }
 
 // traeScheduleView 排程视图（与 trae.CheckinSchedule 同名字段）。
@@ -134,6 +136,13 @@ func (p *Panel) getTraeConfig(w http.ResponseWriter, r *http.Request) {
 	// 实时补签到状态（并发、带超时；失败只记录原因，不影响配置读取）。
 	if cfg != nil && p.cfg.TraeClient != nil && r.URL.Query().Get("no_checkin") == "" {
 		p.fillTraeCheckinStatus(r.Context(), cfg, view.Accounts)
+	}
+	// 运行期计数：进程内快照，无上游请求，直接套用。
+	if p.cfg.TraeStats != nil {
+		for i := range view.Accounts {
+			st := p.cfg.TraeStats.Get(view.Accounts[i].UID)
+			view.Accounts[i].Stats = &st
+		}
 	}
 	for _, a := range view.Accounts {
 		if a.Disabled || !a.HasToken {
@@ -741,6 +750,11 @@ func (p *Panel) removeTraeAccount(w http.ResponseWriter, r *http.Request) {
 	p.reloadTrae()
 	if p.cfg.TraeCooldowns != nil {
 		p.cfg.TraeCooldowns.Clear(uid)
+	}
+	// 运行期计数一并清掉：账号已删，残留条目只会在同 uid 重新登录时
+	// 显示上一轮的历史数字，反而误导。
+	if p.cfg.TraeStats != nil {
+		p.cfg.TraeStats.Reset(uid)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

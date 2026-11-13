@@ -96,9 +96,9 @@ func (c *Client) ChatStream(ctx context.Context, cfg *Config, acc *Account, body
 
 // applyChatHeaders 设置 Trae 上游要求的完整头族。
 //
-// 说明：`x-ide-token` 传**裸 token**，`Authorization` 传带 `Cloud-IDE-JWT ` 前缀的
-// 完整值——两处口径都保留（蓝本用前者，协议文档记载后者），避免因上游校验侧变化
-// 而单点失效。
+// 说明：token 要同时设三处——`Authorization`（带 `Cloud-IDE-JWT ` 前缀）、
+// `X-Cloudide-Token`（裸 token）、`X-Ide-Token`（裸 token）。bluechonk 实测
+// 缺任一个都可能被拒（"同一 token 要设三处，缺任一个都可能被拒"）。
 func applyChatHeaders(req *http.Request, cfg *Config, acc *Account, tokenWithPrefix string) {
 	raw := acc.AccessToken
 	if len(tokenWithPrefix) > len("Cloud-IDE-JWT ") {
@@ -109,6 +109,7 @@ func applyChatHeaders(req *http.Request, cfg *Config, acc *Account, tokenWithPre
 	h.Set("Accept", "*/*")
 	h.Set("User-Agent", "TraeClient/TTNet")
 	h.Set("Authorization", tokenWithPrefix)
+	h.Set("X-Cloudide-Token", raw)
 	h.Set("X-Ide-Token", raw)
 	h.Set("X-App-Id", cfg.AppID)
 	h.Set("X-App-Version", "default")

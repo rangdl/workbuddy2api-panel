@@ -2,6 +2,7 @@ package trae
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,6 +38,15 @@ type soloEvent struct {
 	FinishReason string
 	ErrorCode    int64
 	ErrorMsg     string
+	// RemainIDE / RemainWork notify_usage 给出的剩余额度（IDE / Work 积分）。
+	RemainIDE  float64
+	RemainWork float64
+	HasRemain  bool
+	// BillingMode notify_usage 的计费模式（如 credits / dollar）。
+	BillingMode string
+	// QueuePosition request_wait_in_queue 的排队位置。
+	QueuePosition int64
+	HasQueue      bool
 }
 
 // StreamResult 流式转换的结果统计。
@@ -51,6 +61,10 @@ type StreamResult struct {
 	// Content / Reasoning 累积的文本（供调用方记账与日志）。
 	Content   strings.Builder
 	Reasoning strings.Builder
+	// RemainIDE / RemainWork notify_usage 给出的剩余额度（HasRemain 为真时有效）。
+	RemainIDE  float64
+	RemainWork float64
+	HasRemain  bool
 }
 
 // ConvertStream 把上游 SOLO SSE 流转成 OpenAI SSE 帧，逐帧交给 emit。
@@ -109,6 +123,13 @@ func ConvertStream(r io.Reader, chatID, model string, emit func([]byte) error) (
 		case "token_usage":
 			if ev.Usage != nil {
 				pendingUsage = ev.Usage
+			}
+		case "notify_usage":
+			// 只保留最后一次：一次对话可能多次上报，最后一条才是当前余额。
+			if ev.HasRemain {
+				res.RemainIDE = ev.RemainIDE
+				res.RemainWork = ev.RemainWork
+				res.HasRemain = true
 			}
 		case "done", "turn_completion":
 			finish := ev.FinishReason
@@ -426,6 +447,104 @@ func parseSoloEvent(event, data string) *soloEvent {
 		if ev.ErrorMsg == "" {
 			ev.ErrorMsg = fmt.Sprintf("upstream error code=%d", ev.ErrorCode)
 		}
+	case "notify_usage":
+		// 真实的剩余额度来源：cn_credits_remain_info.{ide_credits, work_credits}。
+		// 积分查询接口的口径包含 work 额度，会高估"可用"；这里是唯一能区分
+		// IDE 积分（对话真正消耗的那份）与 Work 积分的地方。
+		if info, ok := raw["cn_credits_remain_info"].(map[string]any); ok {
+			ev.RemainIDE = floatOf(info["ide_credits"])
+			ev.RemainWork = floatOf(info["work_credits"])
+			ev.HasRemain = true
+		}
+		if s, ok := raw["billing_mode"].(string); ok {
+			ev.BillingMode = s
+		}
+	case "request_wait_in_queue":
+		// 排队位置：可用于判断是否该换号（chat_v3 通用池常 1000+，solo 较轻）。
+		ev.QueuePosition = intOf(raw["position"])
+		if ev.QueuePosition == 0 {
+			ev.QueuePosition = intOf(raw["queue_position"])
+		}
+		ev.HasQueue = true
 	}
 	return ev
+}
+
+// PeekResult peek 上游流的结果。
+type PeekResult struct {
+	// Header 预读消耗的原始字节，调用方必须拼回流前面（io.MultiReader）。
+	Header []byte
+	// Error 流内错误（nil = 无错误，可正常转发）。
+	Error *StreamError
+	// QueuePosition 预读阶段看到的排队位置（HasQueue 为真时有效）。
+	//
+	// 上游在开始产出内容前可能先发 request_wait_in_queue。排队过深时
+	// 换一个 function/账号往往比干等更快（chat_v3 通用池常 1000+，
+	// solo 池较轻 —— 实测差异明显）。
+	QueuePosition int64
+	HasQueue      bool
+}
+
+// peekMaxBytes 预读上限：够覆盖诊断事件 + error 事件即可。
+const peekMaxBytes = 64 * 1024
+
+// PeekStream 预读流开头，判断上游是否在 HTTP 200 的 SSE 里返回了错误。
+//
+// 为什么需要：Trae 可能对「额度不足 / 模型不可用」这类拒绝返回 HTTP 200，
+// 然后在流里发的第一个事件就是 `event:error`。若直接透传 200，客户端只会
+// 看到 "stream ended without finish_reason" 并自行重试多次——每次都烧上游
+// 风控额度，且真正的错误原因永远不暴露（dsh issue #19 的根因）。
+//
+// 实现：用 TeeReader 边解析边留底。每条事件解析前记录已读偏移，判定为
+// 「诊断类」就把该事件对应的字节保留在 header 里继续往后看；判定为内容/done
+// 就停止预读，把剩余已读字节一并交给调用方重放。
+//
+// 注意：`metadata` / `timing_cost` 等诊断事件**不算已应答**，因为拒绝可能
+// 出现在它们之后（实测序列 metadata → timing_cost → error）。
+func PeekStream(r io.Reader) (PeekResult, error) {
+	var captured bytes.Buffer
+	var queuePos int64
+	var sawQueue bool
+	tee := io.TeeReader(r, &captured)
+	sc := newSSEScanner(tee)
+
+	// consumed 是解析到当前事件为止，TeeReader 已写入 captured 的字节数。
+	for {
+		ev, err := sc.next()
+
+		if err == io.EOF {
+			// 流提前结束：已读的全部交回，让上层按"正常结束"处理。
+			return PeekResult{Header: captured.Bytes(), QueuePosition: queuePos, HasQueue: sawQueue}, nil
+		}
+		if err != nil {
+			return PeekResult{Header: captured.Bytes()}, err
+		}
+		if ev == nil {
+			continue
+		}
+
+		switch ev.Event {
+		case "error":
+			return PeekResult{
+				Header: captured.Bytes(),
+				Error:  &StreamError{Code: ev.ErrorCode, Message: ev.ErrorMsg},
+			}, nil
+		case "metadata", "timing_cost", "extra_info", "request_wait_in_queue",
+			"progress_notice", "notify_usage", "thought":
+			// 诊断/元数据类：不算已应答，继续看下一条。
+			// thought 虽属内容，但只有推理没有正文时也可能后接 error；
+			// 为稳妥起见把它归入"继续看"，预读上限会兜住。
+			if ev.HasQueue {
+				queuePos, sawQueue = ev.QueuePosition, true
+			}
+			if captured.Len() >= peekMaxBytes {
+				// 预读超限：放弃判定，把已读内容全交回（宁可不判错，也不吞流）。
+				return PeekResult{Header: captured.Bytes(), QueuePosition: queuePos, HasQueue: sawQueue}, nil
+			}
+			continue
+		default:
+			// 内容事件 / done：上游已正常应答，停止预读。
+			return PeekResult{Header: captured.Bytes(), QueuePosition: queuePos, HasQueue: sawQueue}, nil
+		}
+	}
 }

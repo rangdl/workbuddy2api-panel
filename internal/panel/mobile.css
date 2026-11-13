@@ -130,6 +130,20 @@
   #accBody tr > .usage-cell { grid-column: 4 / 13; order: 2; }
   #accBody tr > .acts { order: 3; }
 
+  /* Trae 账号卡（列序与账号池完全一致，故复用同一套映射）：
+     ① 标题/ID + 状态 ② 积分 + 成功失败 + 在途 ③ 用量 + 最近成功 ④ 按钮 */
+  #traeAccBody tr > .who { grid-column: 1 / 9; }
+  #traeAccBody tr > td:nth-child(3) { grid-column: 9 / 13; justify-content: flex-end; }
+  #traeAccBody tr > td:nth-child(3)::before { content: none; }
+  #traeAccBody tr > td:nth-child(3) .trae-tags { flex-direction: column; align-items: flex-end; gap: 2px; }
+  #traeAccBody tr > .cred { grid-column: 1 / 7; gap: 5px; }
+  #traeAccBody tr > .cred .n { font-size: 10.5px; }
+  #traeAccBody tr > td:nth-child(5) { grid-column: 7 / 10; }
+  #traeAccBody tr > td:nth-child(6) { grid-column: 10 / 13; }
+  #traeAccBody tr > td:nth-child(8) { grid-column: 1 / 4; order: 1; }
+  #traeAccBody tr > .usage-cell { grid-column: 4 / 13; order: 2; }
+  #traeAccBody tr > .acts { order: 3; }
+
   /* 模型锁池（v1.12.0 新增，8 列）：模型 / 域 / 状态 / 可选·总数 / 锁定账号 / 最早解锁 / 全池解锁 / 原因 */
   #mlBody tr > td:nth-child(1) { grid-column: 1 / 9; }
   #mlBody tr > td:nth-child(2) { grid-column: 9 / 13; justify-content: flex-end; }

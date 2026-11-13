@@ -373,52 +373,151 @@ $('btnTpSave').onclick = async () => {
 };
 
 /* ── 上游接入：Trae（独立 trae.json） ─────────────────────────────── */
-/* 账号行 = 启用勾选 + uid/名称 + 状态标签 + 删除。
-   凭证永不回显（后端只给 has_* 布尔与尾号），故本页只维护"保留哪些账号 / 顺序 / 启用态"，
-   凭证由服务端从旧文件带入或经 OAuth / 设备凭证导入写入。 */
-function traeTag(text, cls) {
-  const s = document.createElement('span');
-  s.className = 'tag ' + (cls || '');
-  s.textContent = text;
-  return s;
-}
-function traeAccountRow(a, cool) {
-  const row = document.createElement('div');
-  row.className = 'trae-acc';
-  row.dataset.uid = a.uid;
-  row.style.cssText = 'display:flex;align-items:center;gap:10px;border:1px solid var(--line);border-radius:8px;padding:8px 10px;flex-wrap:wrap';
+/* 账号表与「账号池」同构（9 列）：健康色条 / 账号 / 状态 / 积分 / 成功失败 /
+   在途 / 用量 / 最近成功 / 操作。凭证永不回显（后端只给 has_* 布尔与尾号），
+   故本页只维护"保留哪些账号 / 顺序 / 启用态"。
 
+   与 WorkBuddy 账号池的差异只在数据来源：那边来自 pool（落盘 + Redis），
+   这边来自 trae.Stats（进程内，重启清零）+ 签到状态缓存 + 积分查询。 */
+
+/* traeCreditsHtml 积分列：有上限时画进度条，否则只显示剩余。
+   数据优先级：权威查询（有 limit）> notify_usage 余额 > 未知。 */
+function traeCreditsHtml(st) {
+  if (!st || (!st.credits && !st.credits_limit)) {
+    return '<div class="n" style="color:var(--ink-3)">—</div>';
+  }
+  const limit = st.credits_limit || 0;
+  const remain = st.credits || 0;
+  const pct = limit > 0 ? Math.min(100, Math.round(remain / limit * 100)) : 0;
+  const num = v => Math.round(v).toLocaleString();
+  const tip = '通用 ' + num(st.credits_ide || 0) + ' / Work ' + num(st.credits_work || 0) +
+    (limit > 0 ? '（额度 ' + num(limit) + '，' + pct + '%）' : '（额度未知）') +
+    (st.credits_at ? '\n更新于 ' + ago(st.credits_at) : '');
+  return '<div class="n" title="' + esc(tip) + '">' + num(remain) +
+    (limit > 0 ? '<span class="of">/' + num(limit) + '</span>' : '') + '</div>' +
+    (limit > 0 ? '<div class="bar"><i style="width:' + pct + '%"></i></div>' : '');
+}
+
+/* traeUsageHtml 用量列：与账号池同一套 formatTokenCount / formatLatency / formatRate。 */
+function traeUsageHtml(st) {
+  const tu = (st && st.token_usage) || {};
+  const req = tu.request_count || 0;
+  const totalTok = formatTokenCount(tu.total_tokens);
+  const totalTokUnit = totalTok === '—' ? '' : '<em>tok</em>';
+  const latency = formatLatency(st ? st.last_latency_ms : 0);
+  const rate = formatRate(tu.last_tokens_per_second);
+  const title = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate +
+    (tu.last_model ? '\n模型：' + tu.last_model : '');
+  return '<span class="usage-line" aria-label="' + esc(title) + '">' +
+    '<span class="usage-item usage-count" title="' + esc(title) + '"><b>' + req + '</b><em>次</em></span>' +
+    '<span class="usage-item usage-total"><b>' + totalTok + '</b>' + totalTokUnit + '</span>' +
+    '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
+    '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
+  '</span>';
+}
+
+/* traeStatusHtml 状态列：冷却 > 禁用 > 凭证缺失 > 可用；附签到状态。
+   返回的是内层容器：不能把 display:flex 直接设在 <td> 上——那会让单元格脱离
+   表格布局（变成普通 flex 容器），整行列宽错位。账号池的 rate-limits 同理。 */
+function traeStatusHtml(a, cool) {
+  const parts = [];
+  if (a.disabled) parts.push('<span class="tag bad">已禁用</span>');
+  else if (cool) {
+    const rem = Math.max(1, Math.round(cool.remaining_sec / 60));
+    parts.push('<span class="tag warn" title="' + esc(cool.reason || '') + '">冷却 · ' + rem + ' 分钟</span>');
+  } else if (!a.has_token) parts.push('<span class="tag bad">无 token</span>');
+  else parts.push('<span class="tag ok">可用</span>');
+
+  if (!a.has_refresh) parts.push('<span class="tag warn">无 refresh</span>');
+  if (!a.has_device_key) parts.push('<span class="tag warn" title="设备私钥缺失：token 续期需 DeviceProof 签名">无设备密钥</span>');
+  if (a.has_token && a.token_tail) {
+    parts.push('<span class="tag mute" title="access token 尾号（仅用于核对是哪一份凭证）">token ' + esc(a.token_tail) + '</span>');
+  }
+
+  // 签到状态：Done=账号已签；DeviceAlready=该设备已签（限额按设备算）。
+  const done = a.checkin_done === true;
+  const devDone = a.checkin_device_already === true;
+  if (done) parts.push('<span class="tag ok">今日已签</span>');
+  else if (devDone) parts.push('<span class="tag mute" title="签到限额按设备算，本账号今日无法再签">设备已签</span>');
+  else if (a.checkin_error) {
+    parts.push('<span class="tag warn" title="' + esc(a.checkin_error) + '">签到状态未知</span>');
+  }
+  return parts.join('');
+}
+
+function traeAccountRow(a, cool) {
+  const tr = document.createElement('tr');
+  tr.dataset.uid = a.uid;
+  const st = a.stats || {};
+
+  // 1. 健康色条：与账号池同色系（禁用/冷却=warn-bad）。
+  const tdMark = document.createElement('td');
+  tdMark.className = 'mark';
+  tdMark.setAttribute('aria-hidden', 'true');
+  const bar = document.createElement('i');
+  tdMark.append(bar);
+
+  // 2. 账号列：勾选框（= 是否参与轮转）+ uid + 名称。
+  const tdWho = document.createElement('td');
+  tdWho.className = 'who';
+  const nm = document.createElement('div');
+  nm.className = 'nm';
   const on = document.createElement('input');
   on.type = 'checkbox';
   on.className = 'trae-acc-on';
   on.checked = !a.disabled;
-  on.title = '取消勾选 = 该账号不参与轮转';
+  on.title = '取消勾选 = 该账号不参与轮转（保存后生效）';
+  on.style.cssText = 'margin-right:6px;vertical-align:middle';
+  const nmText = document.createElement('span');
+  nmText.className = 'mid';
+  nmText.textContent = a.name || '未命名';
+  nm.append(on, nmText);
+  const id = document.createElement('div');
+  id.className = 'id';
+  id.title = 'uid: ' + a.uid;
+  id.textContent = a.uid;
+  tdWho.append(nm, id);
 
-  const uid = document.createElement('span');
-  uid.style.cssText = 'font-family:ui-monospace,SFMono-Regular,monospace;font-weight:600';
-  uid.textContent = a.uid;
+  // 3. 状态列：flex 设在**内层 div** 上，<td> 保持表格单元格语义。
+  const tdStatus = document.createElement('td');
+  tdStatus.innerHTML = '<div class="trae-tags">' + traeStatusHtml(a, cool) + '</div>';
 
-  const name = document.createElement('span');
-  name.style.cssText = 'opacity:.65;font-size:12px';
-  name.textContent = a.name || '';
+  // 4. 积分列。
+  const tdCred = document.createElement('td');
+  tdCred.className = 'cred';
+  tdCred.innerHTML = traeCreditsHtml(st);
 
-  const tags = document.createElement('span');
-  tags.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap';
-  tags.append(a.has_token ? traeTag('token ' + (a.token_tail || ''), 'good') : traeTag('无 token', 'bad'));
-  tags.append(a.has_refresh ? traeTag('可续期') : traeTag('无 refresh', 'warn'));
-  tags.append(a.has_device_key ? traeTag('设备签名', 'good') : traeTag('无设备密钥', 'warn'));
-  if (cool) tags.append(traeTag('冷却 ' + Math.max(1, Math.round(cool.remaining_sec / 60)) + ' 分钟', 'bad'));
-  if (a.disabled) tags.append(traeTag('已禁用', 'off'));
+  // 5. 成功 / 失败。
+  const tdOk = document.createElement('td');
+  tdOk.className = 'num';
+  tdOk.innerHTML = (st.success_count || 0) +
+    ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (st.err_total || 0) + '</span>';
 
-  const actions = document.createElement('span');
-  actions.style.cssText = 'margin-left:auto;display:flex;gap:6px';
-  // 今日签到状态：Done=账号已签，DeviceAlready=该设备已签（多账号共用设备号时
-  // 只有第一个账号是 Done，其余是 DeviceAlready）。
-  const done = a.checkin_done === true;
-  const devDone = a.checkin_device_already === true;
+  // 6. 在途。
+  const tdFlight = document.createElement('td');
+  tdFlight.className = 'num';
+  tdFlight.textContent = String(st.in_flight || 0);
+
+  // 7. 用量。
+  const tdUsage = document.createElement('td');
+  tdUsage.className = 'num usage-cell';
+  tdUsage.innerHTML = traeUsageHtml(st);
+
+  // 8. 最近成功。
+  const tdLast = document.createElement('td');
+  tdLast.className = 'num';
+  tdLast.style.color = 'var(--ink-3)';
+  tdLast.textContent = ago(st.last_success);
+
+  // 9. 操作。
+  const tdActs = document.createElement('td');
+  tdActs.className = 'acts';
+
   const ck = document.createElement('button');
   ck.type = 'button';
-  ck.className = 'xs';
+  ck.className = 'xs ghost';
+  const done = a.checkin_done === true;
+  const devDone = a.checkin_device_already === true;
   ck.textContent = done ? '已签' : (devDone ? '设备已签' : '签到');
   if (done) ck.title = '今日已签到；点一下可重新查询并刷新状态';
   else if (devDone) ck.title = '该设备今日已签（签到限额按设备算，本账号今日无法再签）；点一下可重新查询';
@@ -436,9 +535,10 @@ function traeAccountRow(a, cool) {
     } catch (e) { toast('签到失败：' + e.message, 'err'); }
     finally { ck.disabled = false; ck.textContent = done ? '已签' : '签到'; }
   };
+
   const cr = document.createElement('button');
   cr.type = 'button';
-  cr.className = 'xs';
+  cr.className = 'xs ghost';
   cr.textContent = '积分';
   cr.onclick = async () => {
     cr.disabled = true;
@@ -455,12 +555,14 @@ function traeAccountRow(a, cool) {
       } else {
         toast('积分查询失败：' + (d.message || '未知错误'), 'err');
       }
+      loadTraeConfig();
     } catch (e) { toast('积分查询失败：' + e.message, 'err'); }
     finally { cr.disabled = false; cr.textContent = '积分'; }
   };
+
   const del = document.createElement('button');
   del.type = 'button';
-  del.className = 'xs';
+  del.className = 'xs ghost danger';
   del.textContent = '删除';
   del.onclick = async () => {
     if (!confirm('删除 Trae 账号 ' + a.uid + '？其凭证（token / 设备私钥）一并删除，不可恢复。')) return;
@@ -470,26 +572,30 @@ function traeAccountRow(a, cool) {
       loadTraeConfig();
     } catch (e) { toast('删除失败：' + e.message, 'err'); }
   };
-  actions.append(ck, cr, del);
 
-  row.append(on, uid, name, tags, actions);
-  return row;
+  tdActs.append(ck, cr, del);
+  tr.append(tdMark, tdWho, tdStatus, tdCred, tdOk, tdFlight, tdUsage, tdLast, tdActs);
+  return tr;
 }
+
 function renderTraeAccounts(list, cooldowns) {
-  const box = $('traeAccounts');
-  box.innerHTML = '';
+  const tb = $('traeAccBody');
+  if (!tb) return;
   const coolMap = {};
   for (const c of (cooldowns || [])) coolMap[c.uid] = c;
   if (!list || !list.length) {
-    box.innerHTML = '<div class="hint">还没有 Trae 账号——用下方的「生成授权链接」完成一次 OAuth 登录。</div>';
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty">还没有 Trae 账号 —— 用下方的「生成授权链接」完成一次 OAuth 登录</div></td></tr>';
     return;
   }
-  for (const a of list) box.append(traeAccountRow(a, coolMap[a.uid]));
+  // 先建片段再一次性替换：逐个 append 会让浏览器多次重排，账号多时可见抖动。
+  const frag = document.createDocumentFragment();
+  for (const a of list) frag.append(traeAccountRow(a, coolMap[a.uid]));
+  tb.replaceChildren(frag);
 }
 function collectTraeConfig() {
   const accounts = [];
   const disabled = [];
-  for (const row of $('traeAccounts').children) {
+  for (const row of $('traeAccBody').children) {
     const uid = row.dataset.uid;
     if (!uid) continue;
     accounts.push(uid);

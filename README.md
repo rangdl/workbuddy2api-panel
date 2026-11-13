@@ -1070,12 +1070,33 @@ auths/
 
 - **设备凭证**：tc 信封解密（AES-128-CBC + 随安装包分发的公开 pepper 表 + SHA-512 完整性校验）、
   EC P-256 私钥解析（PKCS#8 / SEC1）、SPKI 公钥导出、DeviceProof 签名（P1363 `r‖s`）；
-- **请求构造**：OpenAI Chat → `llm_utils_chat`（模型名 → `config_name`/`model_name` 映射、
+- **请求构造**：OpenAI Chat → `llm_utils_chat`（模型名 → `config_name`/`model`/`model_name` 映射、
   `tool_calls.function` → `function_call` 改名、`tool_choice` 归一化、`tools.parameters` 字符串化、
-  必需字段注入、`function` 按模型分发 `solo_work_lite`/`solo_agent`）；
+  必需字段注入、`function` 按上游目录分发）；
+  - **tool schema 归一**：把 draft-3 的 property 级 `required: true` 提升为父级 `required` 数组。
+    DeepSeek 后端对整个 tools 批次做严格校验，一个 draft-3 schema 会让整轮回
+    `4027 invalid JSON Schema`，而哪个模型走哪个后端由上游路由决定——所以一律先洗；
+  - **`reasoning_effort` 归一**：`minimal/low → light`、`medium/high → high`、
+    `xhigh/max → extra_high`；未知档位直接删除（传了反而 4001）；
 - **响应转换**：SOLO 自定义 SSE（`output`/`thought`/`token_usage`/`done`/`error`）→ OpenAI SSE 流式帧
   与非流式聚合，含 `reasoning_content` 与 `tool_calls` 还原、错误就地透传、无 `done` 时幂等补 `[DONE]`；
-- **上游调用**：完整出站头族（`X-Ide-Token`/`X-Device-Id`/`X-Machine-Id`/`X-App-Id` 等）+ 链路追踪头。
+  - **`notify_usage`**：解析 `cn_credits_remain_info.{ide_credits, work_credits}`。
+    这是唯一能区分 IDE 积分（对话实际消耗）与 Work 积分的口径——积分查询接口含 work，
+    会高估可用额度。IDE 积分低于 50 时提前冷却账号；
+  - **`request_wait_in_queue`**：排队 ≥ 500 位时给账号 2 分钟短冷却，
+    让轮转把后续请求分给更空闲的号；
+- **上游调用**：完整出站头族（`Authorization` + `X-Cloudide-Token` + `X-Ide-Token` 三处同 token，
+  缺任一个都可能被拒）；`X-Ide-Version-Code` 强制纯数字（填点分串上游回
+  `4001 parameter type does not match binding data`，且报错不指向版本头）；
+- **换号重试**：失败按分类决定是否换号（最多 3 次，不重复同号）。换号有用：
+  凭证失效 / 额度耗尽 / 限流 / 5xx / 风控；**不换号**：模型不可用、请求本身有问题
+  （换号只会把同一个错误烧两遍）；
+- **200 流内拒绝变现**：上游可能对「额度不足」返回 HTTP 200 然后在流里发 `event:error`。
+  网关预读流开头（诊断事件不算已应答），识别到错误就转成真实 HTTP 状态码——
+  否则客户端只看到「流意外结束」并自旋重试，每次都在烧风控额度；
+- **模型目录**：调 `/api/ide/v1/get_detail_param` 逐个 function 拉取，拿到真实的
+  `config_name` 归属、输出上限与上下文窗口（30 分钟缓存，失败回落内置目录）。
+  function 归属以上游为准，避免硬编码表漂移导致 4001。
 
 **运维层（P3）**
 
@@ -1086,6 +1107,32 @@ auths/
 - **错误分类与冷却**：1005 套餐额度用尽 → 12h 冷却；20403/20405 设备问题 → 摘出轮转并提示重新导入；
   4001/4023 模型不可用 → 不罚账号；401 → 需重新登录；429 → 60s；5xx → 5m；成功即清冷却；
 - **面板配置**：账号列表（状态标签 / 冷却剩余 / 启用开关 / 删除）、开关与 base 在线编辑、保存即热生效。
+
+**面板账号表（与「账号池」同构）**
+
+Trae 账号不进 CodeBuddy 账号池（两套账号体系互不相干），但面板按**同一套 9 列**展示，
+运维切换两个上游时不必重建心智模型：
+
+| 列 | 数据来源 | 说明 |
+|---|---|---|
+| 色条 | 禁用 / 冷却 | 绿=可用、黄=冷却、红=已禁用 |
+| 账号 | `trae-<uid>.json` | 勾选框 = 是否参与轮转（保存生效） |
+| 状态 | 冷却表 + 凭证 + 签到 | 冷却 > 禁用 > 无 token > 可用；另标 refresh / 设备密钥缺失与签到状态 |
+| 积分 | `notify_usage` 或积分查询 | 有额度上限时画进度条，否则只显示余额 |
+| 成功 / 失败 | `trae.Stats` | 终身累计，成功即清冷却 |
+| 在途 | `trae.Stats` | 当前并发请求数 |
+| 用量 | `trae.Stats` | 请求数 / 累计 token / 延迟 / 吞吐（与账号池同一套格式化） |
+| 最近成功 | `trae.Stats` | — |
+| 操作 | — | 签到 / 积分 / 删除 |
+
+统计是**进程内**的（与冷却表同样取舍：Trae 账号个位数，重启归零的代价远小于引入状态文件）。
+两个细节值得注意：
+
+- **积分口径**：`notify_usage` 只有 IDE/Work 分解、没有额度上限；面板「积分」查到的是权威数据
+  （含上限）。两者共用一份记录，后写入者覆盖，`credits_at` 标注观测时刻供前端显示「x 分钟前」。
+  只有 `notify_usage` 时**不画进度条**——把「上限未知」画成「0 额度」会误导。
+- **吞吐分母**是「总耗时 − TTFB」而非总耗时：等首字节的时间与解码速度无关。
+  生成期 < 100ms（极短回复）时不记录，避免除出百万级数字。
 
 **签到与积分（P4）**
 

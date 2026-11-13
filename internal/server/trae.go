@@ -1,10 +1,14 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -38,9 +42,17 @@ func (h *Handler) traeEnabled() bool {
 // traePickAccount 选一个可用账号（简单轮转，跳过 disabled 与冷却中）。
 // 返回 nil 表示无可用账号。
 func traePickAccount(cfg *trae.Config, cool *trae.Cooldowns) *trae.Account {
+	return traePickAccountExcluding(cfg, cool, nil)
+}
+
+// traePickAccountExcluding 同上，但跳过 exclude 里的 uid（换号重试用）。
+func traePickAccountExcluding(cfg *trae.Config, cool *trae.Cooldowns, exclude map[string]bool) *trae.Account {
 	usable := make([]trae.Account, 0, len(cfg.Accounts))
 	for _, a := range cfg.Accounts {
 		if a.Disabled || a.AccessToken == "" {
+			continue
+		}
+		if exclude != nil && exclude[a.UID] {
 			continue
 		}
 		if cool != nil && !cool.Available(a.UID) {
@@ -96,53 +108,88 @@ func (h *Handler) traeChat(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &peek)
 
-	acc := traePickAccount(cfg, h.traeCool)
+	st := newChatStat(time.Now(), body, peek.Stream)
+	defer st.done()
+
+	// 带换号重试地打开上游流。prepare 每次按当前账号重新构造请求体
+	// （user_id / device_id 等字段与账号绑定）。
+	attempt := h.traeOpenWithRotate(r.Context(), cfg, func(acc *trae.Account) ([]byte, error) {
+		return trae.PrepareChatBody(body, trae.PrepareOptions{
+			UID:            acc.UID,
+			DeviceID:       acc.DeviceID,
+			MachineID:      acc.MachineID,
+			IDEVersion:     cfg.IDEVersion,
+			IDEVersionCode: cfg.IDEVersionCode,
+			AppID:          cfg.AppID,
+			// function 归属以上游目录为准（硬编码表可能与上游不一致 → 4001）。
+			Function: h.traeFunctionFor(cfg, acc, peek.Model),
+		})
+	})
+	acc := attempt.acc
 	if acc == nil {
+		// 没有任何可用账号是「服务暂不可用」，不是上游错误。
+		st.status = http.StatusServiceUnavailable
 		writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account",
 			"no usable trae account (check trae.json)")
 		return
 	}
-
-	st := newChatStat(time.Now(), body, peek.Stream)
-	defer st.done()
 	st.uid = acc.UID
 	st.nick = acc.Name
 
-	chatBody, err := trae.PrepareChatBody(body, trae.PrepareOptions{
-		UID:            acc.UID,
-		DeviceID:       acc.DeviceID,
-		MachineID:      acc.MachineID,
-		IDEVersion:     cfg.IDEVersion,
-		IDEVersionCode: cfg.IDEVersionCode,
-		AppID:          cfg.AppID,
-	})
-	if err != nil {
-		st.status = http.StatusBadRequest
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
+	// 从这里起账号已确定：开启运行期计数，defer 保证任何 return 都结算一次
+	//（在途数必须归零，否则面板会永远显示「1 个在途」）。
+	finishStat := h.traeStats.Begin(acc.UID)
+	ok := false
+	var statDelta trae.UsageDelta
+	defer func() { finishStat(ok, statDelta) }()
 
-	rc, status, respBody, err := h.cfg.TraeClient.ChatStream(r.Context(), cfg, acc, chatBody)
-	if err != nil {
+	if attempt.err != nil {
 		st.status = http.StatusBadGateway
-		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", attempt.err.Error())
 		return
 	}
-	if status >= 400 {
-		cls := trae.Classify(status, respBody, 0, "")
-		h.traeApplyPolicy(acc.UID, cls)
-		st.status = status
-		writeOpenAIError(w, status, traeErrorCode(status), upstreamText(respBody))
+	if attempt.status >= 400 {
+		st.status = attempt.status
+		writeOpenAIError(w, attempt.status, traeErrorCode(attempt.status), upstreamText(attempt.body))
 		return
 	}
+	rc := attempt.rc
 	defer rc.Close()
+
+	// 200 但流内首个事件是 error（额度不足等）：必须在 HTTP 边界变现，
+	// 否则客户端只看到"流意外结束"然后重试多次，每次都在烧风控额度。
+	peeked, perr := trae.PeekStream(rc)
+	if perr != nil {
+		st.status = http.StatusBadGateway
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", perr.Error())
+		return
+	}
+	if peeked.Error != nil {
+		cls := trae.Classify(0, nil, peeked.Error.Code, peeked.Error.Message)
+		h.traeApplyPolicy(acc.UID, cls)
+		status := cls.HTTPStatus()
+		st.status = status
+		writeOpenAIError(w, status, traeErrorCode(status), pickNonEmpty(cls.Message, peeked.Error.Message))
+		return
+	}
+	// 排队过深：记录日志并给账号一个短冷却，让后续请求优先落到更空闲的号。
+	// 本轮请求已经拿到流，仍照常转发（中断它反而让用户多等一轮）。
+	if peeked.HasQueue {
+		h.traeNoteQueue(acc.UID, peeked.QueuePosition)
+	}
+	peekBody := peeked.Header
 
 	chatID := "chatcmpl-trae-" + shortID()
 	if peek.Stream {
-		h.traeForwardStream(w, rc, chatID, peek.Model, st)
+		streamStart := time.Now()
+		res := h.traeForwardStream(w, io.MultiReader(bytes.NewReader(peekBody), rc), chatID, peek.Model, st)
+		// 只有真的产出过内容才算成功：中途 error 事件（配额耗尽等）要计入失败，
+		// 否则面板会显示「全部成功」而实际一直在撞额度。
+		ok = res.ErrorCode == 0 && res.SentAny
+		statDelta = deltaFromStream(res, st.ttfb, time.Since(streamStart))
 		return
 	}
-	resp, streamErr, err := trae.Aggregate(rc, chatID, peek.Model)
+	resp, streamErr, err := trae.Aggregate(io.MultiReader(bytes.NewReader(peekBody), rc), chatID, peek.Model)
 	if err != nil {
 		st.status = http.StatusBadGateway
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
@@ -158,12 +205,15 @@ func (h *Handler) traeChat(w http.ResponseWriter, r *http.Request) {
 	h.traeCool.Clear(acc.UID)
 	st.status = http.StatusOK
 	st.toks = completionTokens(resp)
+	ok = true
+	statDelta = deltaFromResponse(resp, peek.Model)
 	h.traeRecord(acc.UID, peek.Model, resp)
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// traeForwardStream 把 SOLO SSE 转成 OpenAI SSE 边转边发。
-func (h *Handler) traeForwardStream(w http.ResponseWriter, rc io.Reader, chatID, model string, st *chatStat) {
+// traeForwardStream 把 SOLO SSE 转成 OpenAI SSE 边转边发，返回转换结果供调用方
+// 记账（成功/失败、token 用量、剩余额度）。
+func (h *Handler) traeForwardStream(w http.ResponseWriter, rc io.Reader, chatID, model string, st *chatStat) trae.StreamResult {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -184,7 +234,7 @@ func (h *Handler) traeForwardStream(w http.ResponseWriter, rc io.Reader, chatID,
 	})
 	if err != nil {
 		// 写失败（客户端断连）或上游读错误：状态码已发出，只能记日志。
-		return
+		return res
 	}
 	if res.SentAny {
 		st.ttfb = time.Since(start)
@@ -196,7 +246,107 @@ func (h *Handler) traeForwardStream(w http.ResponseWriter, rc io.Reader, chatID,
 		// 有内容成功产出：清冷却（账号已恢复）。
 		h.traeCool.Clear(st.uid)
 	}
+	// notify_usage 是唯一能区分 IDE / Work 积分的口径；额度见底时提前把账号
+	// 降温，避免后续请求都撞"额度不足"白烧风控额度。
+	if res.HasRemain {
+		h.traeNoteRemain(st.uid, res.RemainIDE, res.RemainWork)
+		h.traeStats.NoteRemain(st.uid, res.RemainIDE, res.RemainWork)
+	}
 	h.traeRecordUsage(st.uid, model, res.Usage)
+	return res
+}
+
+// deltaFromStream 从流式转换结果提取用量增量（供 trae.Stats 记账）。
+//
+// 上游 token_usage 的字段可能是 float64 / json.Number / 字符串，统一走
+// usageInt 宽容取值；缺失的字段不参与累计（Has* 为假）。
+//
+// ttfb / elapsed 由调用方计时（StreamResult 只装上游给的数据，不含本地时钟）。
+func deltaFromStream(res trae.StreamResult, ttfb, elapsed time.Duration) trae.UsageDelta {
+	var d trae.UsageDelta
+	if ttfb > 0 {
+		d.HasLatencyMs, d.LatencyMs = true, int64(ttfb/time.Millisecond)
+	}
+	u := res.Usage
+	if u == nil {
+		return d
+	}
+	if v, ok := usageInt(u["prompt_tokens"]); ok {
+		d.HasPromptTokens, d.PromptTokens = true, v
+	}
+	if v, ok := usageInt(u["completion_tokens"]); ok {
+		d.HasCompletionTokens, d.CompletionTokens = true, v
+	}
+	if v, ok := usageInt(u["total_tokens"]); ok {
+		d.HasTotalTokens, d.TotalTokens = true, v
+	}
+	// 吞吐只在「有完成 token 且生成期有效」时才有意义。
+	// 生成期 = 总耗时 - TTFB：把这算进分母会把等首字节的时间摊薄成"更快"，
+	// 首字节前的时间与解码速度无关。生成期过短（<100ms，常见于假上游/极短回复）
+	// 时除出来的数会荒谬地大，宁可不记。
+	gen := elapsed - ttfb
+	if d.HasCompletionTokens && d.CompletionTokens > 0 && gen >= 100*time.Millisecond {
+		d.HasTokensPerSecond = true
+		d.TokensPerSecond = float64(d.CompletionTokens) / gen.Seconds()
+	}
+	return d
+}
+
+// deltaFromResponse 从聚合后的 chat.completion 提取用量增量。
+//
+// 这里显式传 model（而不是从 resp["model"] 里取）：payload 会改写模型名，
+// 面板要展示的是客户端请求的那个名字，两者可能不同。
+func deltaFromResponse(resp map[string]any, model string) trae.UsageDelta {
+	d := trae.UsageDelta{Model: model}
+	u, _ := resp["usage"].(map[string]any)
+	if u == nil {
+		return d
+	}
+	if v, ok := usageInt(u["prompt_tokens"]); ok {
+		d.HasPromptTokens, d.PromptTokens = true, v
+	}
+	if v, ok := usageInt(u["completion_tokens"]); ok {
+		d.HasCompletionTokens, d.CompletionTokens = true, v
+	}
+	if v, ok := usageInt(u["total_tokens"]); ok {
+		d.HasTotalTokens, d.TotalTokens = true, v
+	}
+	return d
+}
+
+// usageInt 宽容取整（上游可能给 float64 / json.Number / 字符串数字）。
+func usageInt(v any) (int64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int64(n), true
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case json.Number:
+		i, err := n.Int64()
+		return i, err == nil
+	case string:
+		if i, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64); err == nil {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// traeRemainFloor IDE 积分低于该值时提前冷却账号。
+const traeRemainFloor = 50
+
+// traeNoteRemain 按 notify_usage 的余额决定是否提前冷却。
+func (h *Handler) traeNoteRemain(uid string, ideCredits, workCredits float64) {
+	if uid == "" {
+		return
+	}
+	if ideCredits > 0 && ideCredits < traeRemainFloor {
+		h.traeCool.Mark(uid, 30*time.Minute, trae.ErrPlanLimit,
+			fmt.Sprintf("IDE 积分仅剩 %.0f（Work 剩余 %.0f）", ideCredits, workCredits))
+		log.Printf("[trae] 账号 %s IDE 积分见底（%.0f），冷却 30 分钟", uid, ideCredits)
+	}
 }
 
 // traeResponses 处理 POST /trae/v1/responses：Responses → Chat → llm_utils_chat，
@@ -218,49 +368,70 @@ func (h *Handler) traeResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(raw, &peek)
 
-	acc := traePickAccount(cfg, h.traeCool)
-	if acc == nil {
-		writeResponsesError(w, http.StatusServiceUnavailable, "no_healthy_account",
-			"no usable trae account (check trae.json)")
-		return
-	}
-
 	chatBody, toolCtx, err := responses.ToChat(raw)
 	if err != nil {
 		writeResponsesError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	prepared, err := trae.PrepareChatBody(chatBody, trae.PrepareOptions{
-		UID:            acc.UID,
-		DeviceID:       acc.DeviceID,
-		MachineID:      acc.MachineID,
-		IDEVersion:     cfg.IDEVersion,
-		IDEVersionCode: cfg.IDEVersionCode,
-		AppID:          cfg.AppID,
+
+	st := newChatStat(time.Now(), raw, peek.Stream)
+	defer st.done()
+
+	attempt := h.traeOpenWithRotate(r.Context(), cfg, func(acc *trae.Account) ([]byte, error) {
+		return trae.PrepareChatBody(chatBody, trae.PrepareOptions{
+			UID:            acc.UID,
+			DeviceID:       acc.DeviceID,
+			MachineID:      acc.MachineID,
+			IDEVersion:     cfg.IDEVersion,
+			IDEVersionCode: cfg.IDEVersionCode,
+			AppID:          cfg.AppID,
+			Function:       h.traeFunctionFor(cfg, acc, peek.Model),
+		})
 	})
-	if err != nil {
-		writeResponsesError(w, http.StatusBadRequest, "invalid_request", err.Error())
+	acc := attempt.acc
+	if acc == nil {
+		st.status = http.StatusServiceUnavailable
+		writeResponsesError(w, http.StatusServiceUnavailable, "no_healthy_account",
+			"no usable trae account (check trae.json)")
 		return
 	}
-
-	st := newChatStat(time.Now(), prepared, peek.Stream)
-	defer st.done()
 	st.uid = acc.UID
 	st.nick = acc.Name
 
-	rc, status, respBody, err := h.cfg.TraeClient.ChatStream(r.Context(), cfg, acc, prepared)
-	if err != nil {
+	finishStat := h.traeStats.Begin(acc.UID)
+	ok := false
+	var statDelta trae.UsageDelta
+	defer func() { finishStat(ok, statDelta) }()
+
+	if attempt.err != nil {
 		st.status = http.StatusBadGateway
-		writeResponsesError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		writeResponsesError(w, http.StatusBadGateway, "upstream_error", attempt.err.Error())
 		return
 	}
-	if status >= 400 {
-		h.traeApplyPolicy(acc.UID, trae.Classify(status, respBody, 0, ""))
-		st.status = status
-		writeResponsesError(w, status, traeErrorCode(status), upstreamText(respBody))
+	if attempt.status >= 400 {
+		st.status = attempt.status
+		writeResponsesError(w, attempt.status, traeErrorCode(attempt.status), upstreamText(attempt.body))
 		return
 	}
+	rc := attempt.rc
 	defer rc.Close()
+
+	peeked, perr := trae.PeekStream(rc)
+	if perr != nil {
+		st.status = http.StatusBadGateway
+		writeResponsesError(w, http.StatusBadGateway, "upstream_error", perr.Error())
+		return
+	}
+	if peeked.Error != nil {
+		cls := trae.Classify(0, nil, peeked.Error.Code, peeked.Error.Message)
+		h.traeApplyPolicy(acc.UID, cls)
+		status := cls.HTTPStatus()
+		st.status = status
+		writeResponsesError(w, status, traeErrorCode(status),
+			pickNonEmpty(cls.Message, peeked.Error.Message))
+		return
+	}
+	rc = io.NopCloser(io.MultiReader(bytes.NewReader(peeked.Header), rc))
 
 	rw := newResponsesWriter(w, toolCtx)
 	chatID := "chatcmpl-trae-" + shortID()
@@ -268,7 +439,8 @@ func (h *Handler) traeResponses(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		st.status = http.StatusOK
-		_, _ = trae.ConvertStream(rc, chatID, peek.Model, func(b []byte) error {
+		streamStart := time.Now()
+		res, _ := trae.ConvertStream(rc, chatID, peek.Model, func(b []byte) error {
 			if len(b) == 0 {
 				return nil
 			}
@@ -279,6 +451,11 @@ func (h *Handler) traeResponses(w http.ResponseWriter, r *http.Request) {
 			return nil
 		})
 		rw.finish()
+		if res.HasRemain {
+			h.traeStats.NoteRemain(acc.UID, res.RemainIDE, res.RemainWork)
+		}
+		ok = res.ErrorCode == 0 && res.SentAny
+		statDelta = deltaFromStream(res, st.ttfb, time.Since(streamStart))
 		return
 	}
 	resp, streamErr, err := trae.Aggregate(rc, chatID, peek.Model)
@@ -296,6 +473,8 @@ func (h *Handler) traeResponses(w http.ResponseWriter, r *http.Request) {
 	h.traeCool.Clear(acc.UID)
 	st.status = http.StatusOK
 	st.toks = completionTokens(resp)
+	ok = true
+	statDelta = deltaFromResponse(resp, peek.Model)
 	b, _ := json.Marshal(resp)
 	w.Header().Set("Content-Type", "application/json")
 	if _, err := rw.Write(b); err != nil {
@@ -315,16 +494,44 @@ func (h *Handler) traeModels(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "trae upstream is disabled")
 		return
 	}
-	data := make([]map[string]any, 0, len(trae.KnownModels()))
-	for _, m := range trae.KnownModels() {
-		data = append(data, map[string]any{
-			"id":       m,
+	cfg := h.traeConfig()
+	// 优先用上游目录：新增模型免发版，且能拿到真实的 output/context 上限。
+	// 拉取失败自动回落到内置目录（FetchCatalog 内部处理）。
+	var cat *trae.Catalog
+	if acc := traePickAccount(cfg, h.traeCool); acc != nil {
+		cat = h.cfg.TraeClient.FetchCatalog(r.Context(), cfg, acc, r.URL.Query().Get("refresh") == "1")
+	}
+	if cat == nil {
+		cat = &trae.Catalog{}
+		for _, id := range trae.KnownModels() {
+			cat.Models = append(cat.Models, trae.CatalogModel{ID: id, DisplayName: id})
+		}
+	}
+	data := make([]map[string]any, 0, len(cat.Models))
+	for _, m := range cat.Models {
+		item := map[string]any{
+			"id":       m.ID,
 			"object":   "model",
 			"created":  1753600000,
 			"owned_by": "trae",
-		})
+		}
+		if m.DisplayName != "" && m.DisplayName != m.ID {
+			item["display_name"] = m.DisplayName
+		}
+		if m.MaxTokens > 0 {
+			item["max_output_tokens"] = m.MaxTokens
+		}
+		if m.PromptMaxTokens > 0 {
+			item["context_window"] = m.PromptMaxTokens
+		}
+		data = append(data, item)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"object": "list",
+		"data":   data,
+		// live=false 表示拉取失败、返回的是内置目录。
+		"live": cat.Live,
+	})
 }
 
 // traeRecord 非流式路径的用量记账（独立 realm="trae" 分账）。
@@ -382,6 +589,16 @@ func traeErrorCode(status int) string {
 }
 
 // upstreamText 上游错误体转可读文本（原文优先，空体给兜底）。
+// pickNonEmpty 返回第一个非空串。
+func pickNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func upstreamText(body []byte) string {
 	s := strings.TrimSpace(string(body))
 	if s == "" {
@@ -397,4 +614,122 @@ func shortID() string {
 		return "x"
 	}
 	return s
+}
+
+// traeChatAttempt 一次 chat 尝试的结果。
+type traeChatAttempt struct {
+	// acc 本次使用的账号。
+	acc *trae.Account
+	// rc 上游流（成功时非 nil，调用方负责关闭）。
+	rc io.ReadCloser
+	// status HTTP 状态（>=400 表示失败）。
+	status int
+	// body 失败响应体（用于分类）。
+	body []byte
+	// err 传输层错误（网络等）。
+	err error
+	// cls 失败分类（成功时为 ErrNone）。
+	cls trae.Classification
+}
+
+// traeOpenWithRotate 带换号重试地打开上游流。
+//
+// 换号规则（对齐 dsh 的 FAILOVER_KINDS）：
+//   - 只换 ShouldRotate() 为真的错误（凭证/额度/限流/5xx/风控）；
+//   - 模型不可用（4001/4023）与请求本身有问题（4xx）**不换号**——换号只会
+//     把同一个错误烧两遍，还白白消耗别的账号的风控额度；
+//   - 最多 trae.MaxRotate 次，且不重复用同一个账号。
+//
+// 返回的 attempt 里 status/err/cls 描述**最后一次**失败；成功时 rc 非 nil。
+// 调用方负责关闭 rc。
+func (h *Handler) traeOpenWithRotate(ctx context.Context, cfg *trae.Config,
+	prepare func(*trae.Account) ([]byte, error)) traeChatAttempt {
+
+	tried := make(map[string]bool, len(cfg.Accounts))
+	var last traeChatAttempt
+
+	for i := 0; i < trae.MaxRotate; i++ {
+		acc := traePickAccountExcluding(cfg, h.traeCool, tried)
+		if acc == nil {
+			if last.err == nil && last.status == 0 {
+				last.err = fmt.Errorf("no usable trae account")
+			}
+			return last
+		}
+		tried[acc.UID] = true
+
+		body, err := prepare(acc)
+		if err != nil {
+			// 请求体构造失败与账号无关，换号也没用。
+			last = traeChatAttempt{acc: acc, err: err}
+			return last
+		}
+
+		rc, status, respBody, err := h.cfg.TraeClient.ChatStream(ctx, cfg, acc, body)
+		if err != nil {
+			last = traeChatAttempt{acc: acc, err: err}
+			// 传输层错误（超时/连接）视为上游不可用：换号可能有用。
+			if i < trae.MaxRotate-1 {
+				log.Printf("WARN: [trae] 账号 %s 请求失败，尝试换号: %v", acc.UID, err)
+				continue
+			}
+			return last
+		}
+		if status < 400 {
+			return traeChatAttempt{acc: acc, rc: rc, status: status}
+		}
+
+		cls := trae.Classify(status, respBody, 0, "")
+		last = traeChatAttempt{acc: acc, status: status, body: respBody, cls: cls}
+		h.traeApplyPolicy(acc.UID, cls)
+		if !cls.ShouldRotate() || i == trae.MaxRotate-1 {
+			return last
+		}
+		log.Printf("[trae] 账号 %s 失败（%s），换号重试", acc.UID, cls.Kind)
+	}
+	return last
+}
+
+// traeFunctionFor 查模型对应的 function（以上游目录为准）。
+//
+// 目录查询本身是一次上游请求，所以失败/超时都静默回落到硬编码规则——
+// function 选错的代价是 4001，而查目录失败不该拖慢正常请求。
+func (h *Handler) traeFunctionFor(cfg *trae.Config, acc *trae.Account, model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return ""
+	}
+	cat := h.cfg.TraeClient.FetchCatalog(context.Background(), cfg, acc, false)
+	if cat == nil || !cat.Live {
+		return "" // 内置目录的 function 与硬编码规则一致，回落即可
+	}
+	// 目录里的 id 是 wire 名（不带 __dev），客户端可能传显示名或带后缀。
+	id := strings.TrimSuffix(model, "__dev")
+	if fn := cat.FunctionForConfigName(id); fn != "" {
+		return fn
+	}
+	// 再按展示名匹配一次（大小写不敏感）。
+	lower := strings.ToLower(id)
+	for _, m := range cat.Models {
+		if strings.ToLower(m.DisplayName) == lower {
+			return m.Function
+		}
+	}
+	return ""
+}
+
+// traeQueueFloor 排队位置超过该值时给账号短冷却。
+//
+// chat_v3 通用池实测常 1000+，solo 池较轻。排队深意味着这个号（或这个
+// function）当下不划算，短冷却能让轮转把后续请求分给更空闲的账号。
+const traeQueueFloor = 500
+
+// traeNoteQueue 按排队深度决定是否短冷却。
+func (h *Handler) traeNoteQueue(uid string, position int64) {
+	if uid == "" || position < traeQueueFloor {
+		return
+	}
+	h.traeCool.Mark(uid, 2*time.Minute, trae.ErrSoftRate,
+		fmt.Sprintf("排队 %d 位，短暂让出", position))
+	log.Printf("[trae] 账号 %s 排队 %d 位，冷却 2 分钟", uid, position)
 }

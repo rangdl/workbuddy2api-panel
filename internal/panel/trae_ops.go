@@ -118,6 +118,11 @@ func (p *Panel) traeAccountCredits(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "uid": uid, "message": err.Error()})
 		return
 	}
+	// 回写运行期统计：面板的积分列优先用这份权威数据（含额度上限），
+	// 直到下一次对话的 notify_usage 覆盖它。
+	if p.cfg.TraeStats != nil && sum != nil {
+		p.cfg.TraeStats.NoteCredits(uid, sum.General, sum.Work, sum.Total, sum.Limit)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "credits": sum})
 }
 
