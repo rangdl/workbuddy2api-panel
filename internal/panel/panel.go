@@ -190,7 +190,7 @@ func (p *Panel) Logs() *Ring { return p.logs }
 
 func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
-	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
+	p.mux.HandleFunc("GET /panel/js/{name}", p.jsScript)
 	p.mux.HandleFunc("GET /panel/mobile.css", p.mobileStyle)
 	p.mux.HandleFunc("GET /panel/mobile.js", p.mobileScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
