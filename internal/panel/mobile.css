@@ -117,11 +117,34 @@
   .acc .acts { grid-column: 1 / -1; display: flex; gap: 5px; }
   .acc .acts button { flex: 1 1 0; min-width: 0; padding: 5px 2px; font-size: 11.5px; white-space: nowrap; border-radius: 8px; }
 
-  /* 账号卡：① 标题/ID + 状态 ② 积分细条+积分+成功失败+在途 ③ 用量标签+最近成功 ④ 按钮 */
-  #accBody tr > .who { grid-column: 1 / 9; }
+  /* 账号卡：① 标题/ID + 状态 ② 限流块（整行）③ 积分+成功失败+在途 ④ 用量+最近成功 ⑤ 按钮
+     账号名格靠上对齐：限流块把卡片撑高时，垂直居中会在名字上下留白。 */
+  #accBody tr > .who { grid-column: 1 / 9; align-items: start; }
   #accBody tr > td:nth-child(3) { grid-column: 9 / 13; flex-direction: column; align-items: flex-end; gap: 1px; }
   #accBody tr > td:nth-child(3)::before { content: none; }
   #accBody tr > td:nth-child(3) .hint { font-size: 9.5px; margin-top: 0; text-align: right; }
+  /* 有内容的状态列（限流块 / 备注）整行铺开。
+     为什么必须整行：状态列原本只占右半 9/13，而限流块有十几行高，会把
+     「用户名 + 状态」那一行撑得极高；用户名又是垂直居中的，上下于是空出
+     大片区域（手机端实测近半屏是空白）。改成 1/13 后它自动落到下一行，
+     宽度占满整卡（左边顶到用户名起始位置），十几行也压成两三行。
+     用 :has() 精确命中——没有限流时保持「标签靠右」的紧凑布局；
+     不支持的浏览器退化为原布局（可用，只是标题行可能偏高）。 */
+  #accBody tr > td:nth-child(3):has(.rate-limits, .hint) {
+    grid-column: 1 / 13; align-items: stretch;
+  }
+  /* 状态列下移后，用户名可以横跨整行——否则它仍被限制在 1/9 而被截断
+     （截图里的 "6b50fc50-508c-49…" 就是窄列挤出来的省略号）。 */
+  #accBody tr:has(> td:nth-child(3) .rate-limits) > .who,
+  #accBody tr:has(> td:nth-child(3) .hint) > .who {
+    grid-column: 1 / 13;
+  }
+  #accBody tr:has(> td:nth-child(3) .rate-limits) > .who .id,
+  #accBody tr:has(> td:nth-child(3) .hint) > .who .id {
+    white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere;
+  }
+  #accBody tr > td:nth-child(3):has(.rate-limits, .hint) .rate-limits { margin-top: 2px; }
+  #accBody tr > td:nth-child(3):has(.rate-limits, .hint) .tag { align-self: flex-end; }
   #accBody tr > .cred { grid-column: 1 / 7; gap: 5px; }
   #accBody tr > .cred .n { font-size: 10.5px; }
   #accBody tr > td:nth-child(5) { grid-column: 7 / 10; }
@@ -132,7 +155,7 @@
 
   /* Trae 账号卡（列序与账号池完全一致，故复用同一套映射）：
      ① 标题/ID + 状态 ② 积分 + 成功失败 + 在途 ③ 用量 + 最近成功 ④ 按钮 */
-  #traeAccBody tr > .who { grid-column: 1 / 9; }
+  #traeAccBody tr > .who { grid-column: 1 / 9; align-items: start; }
   #traeAccBody tr > td:nth-child(3) { grid-column: 9 / 13; justify-content: flex-end; }
   #traeAccBody tr > td:nth-child(3)::before { content: none; }
   #traeAccBody tr > td:nth-child(3) .trae-tags { flex-direction: column; align-items: flex-end; gap: 2px; }
