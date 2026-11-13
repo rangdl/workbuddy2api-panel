@@ -77,12 +77,12 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应 |
 | 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级 |
 | 🔍 **联网搜索** | `POST /v1/search/messages` 把上游 `/agenttool/v1/search` 包成 Anthropic Messages 兼容形态（DSH 等客户端的搜索 provider 零改动接入）；复用账号池选号 / 在途租约 / token 刷新 / 错误冷却，出站请求头对齐官方客户端 |
-| 💬 **系统提示词体系** | 网关自有提示词替换客户端 system（默认 `custom`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试 |
+| 💬 **系统提示词体系** | 默认 `passthrough` 透传客户端 system；可切 `custom` 用网关自有提示词替换（从源头消灭 system 来源的内容误报）或 `append` 追加；`passthrough` 遇拦截自动降级重试 |
 | 🗑️ **指纹脱敏** | 出站请求体黑名单指纹字段清洗（可关闭），与提示词体系两层叠加 |
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
-| 🖥️ **Web 管理面板** | 内嵌单页面板（明暗主题，八个视图）：账号运维 / 用量与积分分析 / 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
-| 🔀 **第三方上游** | 除 CodeBuddy 外可挂任意 OpenAI 兼容上游，走独立前缀 `/tp/v1/*`（与 `/v1/*` 并存互不影响）；多上游按模型名匹配（支持兜底上游）、面板增删改 + 逐条连通性测试、保存即热生效，见 [第三方上游](#-第三方上游openai-兼容) |
+| 🖥️ **Web 管理面板** | 内嵌管理面板（明暗主题，九个视图，前端按视图拆分嵌入二进制）：账号运维 / 用量与积分分析 / 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
+| 🔀 **第三方上游** ⚠️已弃用 | 除 CodeBuddy 外可挂任意 OpenAI 兼容上游，走独立前缀 `/tp/v1/*`；多上游按模型名匹配、面板增删改 + 逐条连通性测试。**已弃用**（改用 new-api 中转），代码保留待移除，见 [第三方上游](#-第三方上游openai-兼容) |
 | 🚂 **Trae 上游** | Trae 账号接入（`/trae/v1/*` 独立前缀）：请求体改写为 `llm_utils_chat`、SOLO 自定义 SSE 转 OpenAI、设备凭证（tc 信封解密 + DeviceProof 签名），见 [Trae 上游](#-trae-上游协议层已实现) |
 
 ## 🎯 成长任务一键完成（17/18）
@@ -174,10 +174,10 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **Web 管理面板** | `internal/panel`，前端 go:embed 单文件进二进制，零外部依赖。账号池可视化（健康色条 / 积分量条 / 冷却倒计时）、积分到期分布、单号运维、批量任务、日志查看、明暗主题 |
 | **请求指标与脱敏日志** | 面板展示完成成功率 / HTTP 成功率 / 平均耗时 / 最近请求，响应带 `X-Request-Id`；JSONL 只归档请求元数据，不写提示词、响应正文或凭证 |
 | **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
-| **在线配置编辑（热生效）** | 面板直接改 `config.json`：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
+| **在线配置编辑（热生效）** | 面板直接改 `config/config.json`：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
 | **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **17 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 画布 / 专家召唤 / 技能尝鲜 / 主题 / 资料库 / 夜猫子等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
 | **限时补偿可观测（issue #189）** | 官方补偿（例：「模型服务异常额外补偿 500 积分」）在账号侧可见，网关改为**先查 `compensation-status` 再决定是否领**：面板「官方补偿」卡片列出待领账号 + 领取截止倒计时（≤48h 标红）+ 逐号/全量领取按钮；**查询失败的账号在卡片上显形为红色行，不会与「没有补偿」混为一谈**；每日签到排程同步走「查→领」，**状态查询失败与领取失败一律显式告警**（旧实现把「没有 / 已领 / 领取失败」三态压成同一形态，带截止日的补偿会静默过期） |
-| **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
+| **首启自动生成配置** | 目录下无 `config/config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开；配置收在 `config/`、运行状态在 `data/`，旧版平铺文件自动复制迁移 |
 | **粘性会话内容回退** | 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性 |
 | **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，冷却账号余额恢复自动解冻 |
 | **模型能力透出** | `/v1/models` 附带 `supported_efforts` / `default_effort` / 积分倍率 / 输入输出上限等上游真实字段 |
@@ -241,19 +241,25 @@ flowchart LR
 CI 会自动构建多架构镜像（`amd64` / `arm64`）并发布到 GHCR，`git clone` 之外的部署路径：
 
 ```bash
-# 1. 准备配置与数据目录
-mkdir -p auths data && cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+# 1. 准备目录（配置与数据分家：config/ 手改，data/ 程序自写）
+mkdir -p auths data config && cp config.example.json config/config.json
+#    也可以跳过这步：首次启动会自动生成 config/config.json（含随机 api_key，日志打印一次）
 
 # 2. 拉取并运行
 docker run -d --name workbuddy2api \
   -p 7863:7863 -e TZ=Asia/Shanghai \
-  -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
+  -v ./auths:/app/auths -v ./data:/app/data -v ./config:/app/config \
   ghcr.io/linguo2625469/workbuddy2api-panel:latest
 
 # 3. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
 ```
+
+> **从旧版升级**：旧版挂载的是 `./config.json:/app/config.json`。升级时把宿主机
+> 配置文件移进目录（`mkdir -p config && mv config.json config/`），否则 Docker 会把
+> 不存在的 `./config` 建成 root 所有的空目录，容器内写不进去。程序自身会在启动时
+> 把平铺在启动目录的旧配置**复制**进 `config/` 与 `data/`（不删除原文件）。
+> 详见 `docs/config-layout.md`。
 
 > **首次发布后须将包设为公开**：GitHub 仓库页 → Packages → `workbuddy2api-panel` →
 > Package settings → Change visibility → Public，否则拉取需要 `docker login ghcr.io`。
@@ -268,9 +274,9 @@ curl -s http://localhost:7863/healthz
 git clone https://github.com/linguo2625469/workbuddy2api-panel.git
 cd workbuddy2api-panel
 
-# 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
-cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+# 2. 准备配置目录（config/ 手改配置，data/ 程序自写状态）
+mkdir -p config && cp config.example.json config/config.json
+#    也可跳过：首次启动会自动生成 config/config.json（含随机 api_key）
 
 # 3. 启动（首次会构建镜像，约 1-2 分钟）
 docker compose up -d --build
@@ -296,8 +302,8 @@ docker compose down             # 停止并移除容器（数据在 ./auths 与 
 # 1) 下载 Release 中的 wb2api.exe，或从源码构建
 go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
 
-# 2) 直接运行：首次启动自动生成 config.json（含随机 api_key，日志打印一次）
-.\wb2api.exe -config config.json
+# 2) 直接运行：首次启动自动生成 config/config.json（含随机 api_key，日志打印一次）
+.\wb2api.exe
 
 # 3) 浏览器打开面板添加账号
 #    http://127.0.0.1:7863/panel/
@@ -311,7 +317,7 @@ exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到�
 go build ./...
 go vet ./...
 go test ./...                      # 完整测试套件
-go run ./cmd/server -config config.json
+go run ./cmd/server                 # 默认读 config/config.json
 ```
 
 构建全部二进制：
@@ -401,6 +407,12 @@ curl -s http://localhost:7863/v1/search/messages \
 | `schedule.activity_enabled` | `true` | 活跃上报总开关 |
 | `schedule.keepalive_enabled` | `true` | token 保活总开关 |
 | `schedule.blackcat_enabled` | `true` | 夜猫子总开关 |
+| `schedule.growth_hours` | `[1]` | 每日本地时区整点执行成长任务（自动接受 + 自动完成可达项） |
+| `schedule.growth_enabled` | `true` | 成长任务总开关 |
+| `schedule.balance_refresh_enabled` | `true` | 余额后台刷新总开关 |
+| `schedule.balance_refresh_minutes` | `5` | 余额后台刷新周期（分钟）；两次签到时点之间保持 credits 新鲜 |
+| `schedule.task_sweep_enabled` | `true` | 任务补领清扫开关（接受 / 领奖未落账的自动重试） |
+| `schedule.task_sweep_minutes` | `15` | 任务补领清扫周期（分钟） |
 | `schedule.include_disabled_in_tasks` | `false` | 让**保号类**四任务（签到 / 活跃上报 / token 保活 / 余额刷新）对**已禁用**账号也执行——「禁用」只关选号，不停保号。`false`（默认）保持「禁用的跳过」 |
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
@@ -408,7 +420,7 @@ curl -s http://localhost:7863/v1/search/messages \
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `models.hidden` | `[]` | 模型黑名单：不对外暴露的模型。裸名=两域都藏；`"cn:xxx"`/`"global:xxx"`=只藏该域。`GET /v1/models` 列表过滤 + `POST /v1/chat/completions` 点名拒绝（400 `model_unavailable`）。面板保存后热生效 |
-| `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
+| `prompt.mode` | `passthrough` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
@@ -733,18 +745,18 @@ baseURL 指向 `<网关>/v1/search`，即可零代码接入本网关的搜索能
 > `blocked_domains`（折成 `(-site:)` 拼进 query）在服务端均**静默失效**——传了不报错也
 > 不生效。本端点因此不接受这三个字段，避免调用方产生「已过滤」的错误预期。
 
-**余额后台刷新**（`schedule.balance_refresh_enabled`，缺省开启）：每 `balance_refresh_minutes`（缺省 5）分钟并发查询全部账号余额并更新池内积分——两次签到时点之间 credits 保持新鲜，余额恢复的冷却账号也会自动解冻（语义同签到，但不做签到不刷 token）。面板「立即刷新」按钮也是全量刷余额；5 秒自动轮询只读内存，不打上游。
+**余额后台刷新**（`schedule.balance_refresh_enabled`，缺省开启）：每 `balance_refresh_minutes`（缺省 5）分钟并发查询全部账号余额并更新池内积分——两次签到时点之间 credits 保持新鲜，余额恢复的冷却账号也会自动解冻（语义同签到，但不做签到不刷 token）。面板「立即刷新」按钮也是全量刷余额；面板轮询只读内存、不打上游（桌面 5 秒 / 移动端 15 秒，页面切到后台时暂停）。
 
 ## 🖥️ Web 管理面板
 
-内嵌式管理面板（`internal/panel`，前端 go:embed 单文件打进二进制，无外部构建依赖），服务启动后访问：
+内嵌式管理面板（`internal/panel`，前端 go:embed 打进二进制，无外部构建依赖），服务启动后访问：
 
 ```
 http://127.0.0.1:7863/panel/
 ```
 
 鉴权与 API 同口径：`api_key` 非空时面板要求输入一次密钥（浏览器 localStorage 记住）；为空则直接可用。
-界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航八个视图：
+界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航九个视图：
 
 | 视图 | 功能 |
 |---|---|
@@ -753,11 +765,12 @@ http://127.0.0.1:7863/panel/
 | **积分构成** | **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
 | **任务中心** | 成长任务队列：一键扫描全部账号待办 → 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询。详见 [任务中心](#-任务中心面板新视图) |
 | **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
-| **配置** | 在线编辑 config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关）；同页含 **Responses / Codex 接入**（独立 `responses.json`）与 **Anthropic / Claude Code 接入**（独立 `anthropic.json`） |
-| **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道，可开关自动滚动；新增 **积分历史**（每次真实查到余额与上次比对，变动即留痕） |
-| **上游接入** | 第三方 OpenAI 兼容上游的增删改（名称 / 接口地址 / API Key / 模型列表 / 超时）、启用开关、逐条「测试连接」；同页含 **Trae 上游**配置（`/trae/v1/*` 开关、接口地址、设备与 IDE 版本、账号导入 / 登录 / 签到）；保存后热生效 |
+| **配置** | 在线编辑 config/config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关）；同页含 **Responses / Codex 接入**（`responses.json`）与 **Anthropic / Claude Code 接入**（`anthropic.json`）——均 ⚠️已弃用 |
+| **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道 + 关键词筛选，默认只渲染最新 50 条，「更早」按游标翻页（环形缓冲淘汰旧行不会导致重复或漏行），「自动滚动」仅在看最新一页且原本在底部时生效；底部 **积分历史**（每次真实查到余额与上次比对，变动即留痕） |
+| **上游接入** | **Trae 上游**配置（`/trae/v1/*` 开关、接口地址、设备与 IDE 版本、账号导入 / 登录 / 签到）；同页含第三方 OpenAI 兼容上游的增删改（⚠️已弃用，改用 new-api 中转）；保存后热生效 |
+| **协议接入** | ⚠️**整页已弃用**：Responses / Codex 接入与 Anthropic / Claude Code 接入的开关、模型映射拖拽排序、默认模型；保存后热生效。改用 new-api 中转后不再维护，后续计划移除 |
 
-顶部另有「刷新」（向上游全量查询真实余额并回写；5 秒自动轮询只读内存，不打上游）与「添加账号」（浏览器内完成 OAuth 设备授权：显示授权链接 + 自动轮询，登录后凭证落盘并**热加载进池，免重启**，也支持导入 cockpit tools 导出的 JSON）。
+顶部另有「刷新」（向上游全量查询真实余额并回写；面板轮询只读内存、不打上游，桌面 5 秒 / 移动端 15 秒）与「添加账号」（浏览器内完成 OAuth 设备授权：显示授权链接 + 自动轮询，登录后凭证落盘并**热加载进池，免重启**，也支持导入 cockpit tools 导出的 JSON）。
 
 ### 手机端（≤760px）
 
@@ -767,7 +780,7 @@ http://127.0.0.1:7863/panel/
 - **宽表 → 卡片**：表头隐藏，每列字段名由 `mobile.js` 从 `<th>` 的纯文本抄进同列 `td[data-l]`，CSS 用 `content: attr(data-l)` 渲染——写死在 CSS 里会随表头改名漂移
 - **Token 时序图窄屏重画**：上游那张图固定 viewBox `1200×200` 靠 `width:100%` 缩放，360px 宽下缩放比只剩 ~0.28（内部 10px 刻度实际 ~2.8px，看着是一排小点）；窄屏改画 `440×230` 并抽稀刻度，tooltip 同样跟随柱子
 - 顶栏 / 筛选栏 / 弹层 / 统计条 / KPI 卡按同一密度口径收紧；`color-scheme: only light|dark` 退出手机浏览器的「自动暗化」（否则主题按钮显示浅色、页面实际还是黑的）
-- 实现全在 `mobile.css` / `mobile.js` 两个独立文件里（`index.html` 只多一行 `<link>`、一行 `<script>`），改手机端不会与上游对 `index.html` / `app.js` 的改动冲突
+- 实现全在 `mobile.css` / `mobile.js` 两个独立文件里（`index.html` 只多一行 `<link>`、一行 `<script>`），改手机端不会与上游对 `index.html` / `js/*.js` 的改动冲突
 
 ### 时间范围查询
 
@@ -796,16 +809,18 @@ http://127.0.0.1:7863/panel/
 
 | 分组 | 端点 |
 |---|---|
-| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
-| 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
+| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs`（`limit` / `cursor` / `ch` / `q`，分页与筛选；不带参数时返回全量快照）· `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET credit_history`（`limit` / `uid`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` · `GET compensation` |
+| 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `pause` · `resume` · `remove`；`POST checkin_all` · `travel_all` · `blindbox_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 补偿 | `GET compensation`（逐号查补偿状态，**只读**）；`POST accounts/{uid}/compensation`（单号领）；`POST compensation_all`（全量领，返回 `summary{claimed,skipped,errored,credit}`——**先看 `errored` 再看 `claimed`**，否则会把「全部查询失败」说成「没有待领补偿」） |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
 | 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` |
+| 接入配置 | `GET`/`POST responses_config` · `anthropic_config` · `thirdparty_config` · `trae_config`；`POST thirdparty_test`（单条上游连通性测试） |
+| Trae 运维 | `POST trae/import` · `trae/login/start` · `trae/login/finish` · `trae/accounts/{uid}/remove` · `trae/accounts/{uid}/checkin` · `trae/accounts/{uid}/credits` · `trae/checkin_all`；`GET trae/checkin_status` |
 | 写入 | `POST config`（校验 → 落盘 → 热应用，返回需重启字段清单）· `POST usage/save`（立即把内存用量落盘） |
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
 
-**安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-ancestors 'none'` 禁嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器。
+**安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-ancestors 'none'` 禁嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本按视图拆为同源 `js/*.js`（`/panel/js/{name}.js`，白名单路由），不含内联脚本与内联事件处理器。
 
 **鉴权实现**：`internal/httpauth` 统一 server 与 panel 的 Bearer 校验，使用 SHA-256 摘要 + `subtle.ConstantTimeCompare` 常量时间比较（避免逐字节比较泄露密钥信息）；上游返回的 `uid` 经白名单校验（`[A-Za-z0-9_-]`，长度 ≤64）后才用于拼凭证文件名，防止路径穿越。
 
@@ -816,14 +831,14 @@ http://127.0.0.1:7863/panel/
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
-| `POST /v1/messages` | `x-api-key` / Bearer | **Anthropic Messages 协议接入**（Claude Code）：Anthropic → Chat 转发，回程投影回 Anthropic（含工具/思考块/SSE 六事件族）；仅在启用时可用（见「Anthropic / Claude Code 接入」，默认禁用） |
+| `POST /v1/messages` | `x-api-key` / Bearer | ⚠️**已弃用** **Anthropic Messages 协议接入**（Claude Code）：Anthropic → Chat 转发，回程投影回 Anthropic（含工具/思考块/SSE 六事件族）；仅在启用时可用（见「Anthropic / Claude Code 接入」，默认禁用） |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
-| `POST /tp/v1/chat/completions` | Bearer | **第三方上游**（OpenAI 兼容）转发；流式/非流式；仅在启用第三方时可用（否则 404） |
-| `POST /tp/v1/responses` | Bearer | 第三方上游的 Responses 协议接入（内部转为 Chat 转发，回程投影回 Responses） |
-| `POST /tp/v1/messages` | `x-api-key` / Bearer | 第三方上游的 Anthropic Messages 协议接入（Claude Code 直连第三方；内部转为 Chat 转发，回程投影回 Anthropic） |
-| `GET /tp/v1/models` | Bearer | 第三方上游模型列表（来自 `third_party.json` 的 `models` 声明） |
+| `POST /tp/v1/chat/completions` | Bearer | ⚠️**已弃用** **第三方上游**（OpenAI 兼容）转发；流式/非流式；仅在启用第三方时可用（否则 404） |
+| `POST /tp/v1/responses` | Bearer | ⚠️**已弃用** 第三方上游的 Responses 协议接入（内部转为 Chat 转发，回程投影回 Responses） |
+| `POST /tp/v1/messages` | `x-api-key` / Bearer | ⚠️**已弃用** 第三方上游的 Anthropic Messages 协议接入（Claude Code 直连第三方；内部转为 Chat 转发，回程投影回 Anthropic） |
+| `GET /tp/v1/models` | Bearer | ⚠️**已弃用** 第三方上游模型列表（来自 `third_party.json` 的 `models` 声明） |
 | `POST /trae/v1/chat/completions` | Bearer | **Trae 上游**：OpenAI Chat → `llm_utils_chat`，回程 SOLO SSE → OpenAI |
 | `POST /trae/v1/responses` | Bearer | Trae 上游的 Responses 协议接入（Chat 中转 + 回程投影） |
 | `GET /trae/v1/models` | Bearer | Trae 内置模型目录 |
@@ -884,6 +899,11 @@ http://127.0.0.1:7863/panel/
 
 ## 🔀 第三方上游（OpenAI 兼容）
 
+> **⚠️ 已弃用（2026-11-13）**：作者已改用 [new-api](https://github.com/Calcium-Ion/new-api)
+> 做上游中转，本功能**不再维护**，代码保留但不再演进，后续计划移除。
+> 保留原因：作为 new-api 不可用时的退路，且移除会牵动面板「上游接入」页（与 Trae 共用）。
+> 弃用与移除计划见 `docs/deprecated.md`。下面内容按现状记录，可能随代码演进失准。
+
 除内置的 CodeBuddy 上游外，网关可同时挂载任意 **OpenAI 兼容**上游（DeepSeek / OpenAI / 自建 vLLM / Ollama / 各类中转），走**独立前缀**，与现有链路完全隔离。
 
 ### 路由与隔离
@@ -898,7 +918,7 @@ http://127.0.0.1:7863/panel/
 
 ### 快速开始
 
-1. 用面板左侧「**上游接入**」页维护，或手工创建 `third_party.json`（与 `config.json` 同目录，可从 `third_party.example.json` 复制）：
+1. 用面板左侧「**上游接入**」页维护，或手工创建 `config/third_party.json`（与 `config/config.json` 同目录，可从 `third_party.example.json` 复制）：
 
 ```json
 {
@@ -950,6 +970,11 @@ http://127.0.0.1:7863/panel/
 
 ## 🤖 Anthropic / Claude Code 接入
 
+> **⚠️ 已弃用（2026-11-13）**：作者已改用 [new-api](https://github.com/Calcium-Ion/new-api)
+> 做上游中转，本功能**不再维护**，代码保留但不再演进，后续计划移除。
+> 保留原因：作为 new-api 不可用时的退路；移除需同时拆掉面板「协议接入」页。
+> 弃用与移除计划见 `docs/deprecated.md`。下面内容按现状记录，可能随代码演进失准。
+
 Claude Code CLI / Claude Desktop 讲 Anthropic Messages 协议（`/v1/messages`），与 OpenAI 系协议不互通。网关内置双向转换（Anthropic → Chat 转发，回程投影回 Anthropic），支持：
 
 - 纯文本对话（流式/非流式）、多模态图片（base64/URL）；
@@ -958,7 +983,7 @@ Claude Code CLI / Claude Desktop 讲 Anthropic Messages 协议（`/v1/messages`�
 - Anthropic SSE 六事件族（`message_start` → `content_block_*` → `message_delta` → `message_stop`），`message_delta` 严格单发（重复会导致 Claude Code 中断连接）；
 - usage 缓存桶换算（`input = prompt − cached − cache_write`，防双计）。
 
-### 配置（`anthropic.json`，与 `config.json` 同目录；推荐直接用面板「配置」页）
+### 配置（`config/anthropic.json`，与 `config/config.json` 同目录；推荐直接用面板「配置」页）
 
 面板「配置」页含 **Anthropic / Claude Code 接入** 卡片（与 Responses / Codex 接入同款交互：启用开关 + 模型映射拖拽排序 + 默认模型），保存后**热生效**，无需重启。手写配置可从 **`anthropic.example.json`** 复制起步（已内置一套合理的默认映射）。
 
@@ -1008,7 +1033,7 @@ Trae 接入使用**独立前缀 `/trae/v1/*`**，与 `/v1/*`（CodeBuddy）、`/
 | `POST /trae/v1/responses` | Responses → Chat → SOLO，回程投影回 Responses |
 | `GET /trae/v1/models` | 内置模型目录（与请求构造的模型映射同源） |
 
-### 配置（`trae.json`，与 `config.json` 同目录）
+### 配置（`config/trae.json`，与 `config/config.json` 同目录）
 
 ```json
 {
@@ -1113,10 +1138,10 @@ Trae 的 token 续期（ExchangeToken）要求 **DeviceProof 签名**（ECDSA P-
 
 - **wb2api**（主服务）、**signin_bin**、**login**、**credit** + 脚本（`login.sh` / `signin.sh` / `credit.sh` / `scripts/probe_active.py`）
 - 以 `app` 用户（uid 10001）运行，`app/auths` 与 `app/data` 预建
-- 镜像内默认落 `config.example.json` 作为空配置（不含密钥），生产用挂载卷覆盖 `/app/config.json`
+- 镜像内默认落 `config.example.json` 作为 `config/config.json`（不含密钥），生产用挂载卷覆盖 `/app/config/`
 - 内置 `HEALTHCHECK`（`wget /healthz`，30s 间隔）
 
-账号 / 数据通过 `docker-compose.yml` 卷挂载持久化：`./auths`、`./data`、`./config.json`。
+账号 / 配置 / 数据通过 `docker-compose.yml` 卷挂载持久化：`./auths`、`./config`、`./data`。
 
 ### 工具脚本
 
@@ -1170,7 +1195,7 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 - **位置**：`./auths`（`auth_dir` 可配），文件名 `workbuddy-<uid>.json`
 - **内容**：明文 `accessToken` / `refreshToken` + 账号元信息（`account.uid` / `enterpriseId` / `nickname`）
 - **权限**：容器内以 `app` 用户（uid 10001）运行；token 刷新由 `SaveAtomic` 以 `0600` 原子写回（tmp + rename）；`login.sh` 首次落盘遵循登录 umask，建议手动 `chmod 600 auths/*.json`
-- **切勿提交 git**：`.gitignore` 已排除 `auths/`、`data/`、`backups/`、`config.json`、`*.key`、`*.pem`、`*.env`、`docs/` 及除 README 外的全部 `*.md` 工作文档
+- **切勿提交 git**：`.gitignore` 已排除 `auths/`、`data/`、`config/`、`backups/`、`*.key`、`*.pem`、`*.env`、`docs/` 及除 README 外的全部 `*.md` 工作文档
 
 ### 2. 网络暴露与日志敏感度
 
@@ -1221,7 +1246,7 @@ PUID=$(id -u) PGID=$(id -g) docker compose up -d --force-recreate
 #   echo "PUID=1000" > .env && echo "PGID=1000" >> .env
 
 # 方案 2：把挂载目录属主交给容器默认用户（需要 sudo）
-sudo chown -R 10001:10001 ./auths ./data ./config.json
+sudo chown -R 10001:10001 ./auths ./data ./config
 
 # 方案 3：compose 设 user: "0:0" 以 root 运行（NAS/群晖不便 chown 时用）
 ```
@@ -1235,7 +1260,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 
 ### 系统提示词被内容策略误杀怎么办？
 
-默认 `prompt.mode=custom` 已用网关自有提示词替换客户端 system，从源头消除大部分误报；用户 / assistant 消息中的指纹串由 `features.sanitize_blacklist_fingerprints` 清洗，两层叠加。`passthrough` 模式下首遇拦截会自动换 Degraded 中性提示词同请求重试一次。
+默认 `prompt.mode=passthrough`（透传客户端原始 system，与上游行为对齐）。若被内容策略误杀，可改为 `custom`：网关用自己的提示词替换客户端 system，从源头消除大部分误报；用户 / assistant 消息中的指纹串另由 `features.sanitize_blacklist_fingerprints` 清洗，两层叠加。`passthrough` 模式下首遇拦截会自动换 Degraded 中性提示词同请求重试一次。
 
 ### 如何让官网「使用端」列显示为 WorkBuddy？
 
@@ -1245,28 +1270,31 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 
 | 断言 | 出处 |
 |---|---|
-| `prompt.mode` 默认 `custom` | `cmd/server/config.go:148` |
+| `prompt.mode` 默认 `passthrough` | `cmd/server/config.go` 的 `Default()` |
 | 请求体无网关侧上限（max_body_mb 已移除） | `internal/server/handler.go` chatCompletions 读 body 段 |
-| 出站强制 `stream:true` | `internal/upstream/payload.go:28` |
-| DeepSeek 思维链注入（`thinking.type=enabled`） | `internal/upstream/thinking.go:110` |
-| 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go:32` |
-| `reasoning_content` 多轮回填（assistant 消息） | `internal/upstream/thinking.go:54` |
-| Degraded 中性提示词常量 | `internal/prompt/prompt.go:25` |
-| 降级触发与次日 00:00 CST 重置 | `internal/server/degrade.go:30`（Trigger）、`:46`（nextMidnightCST） |
-| 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go:127`、`internal/upstream/client.go:147` |
-| `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:114-115`；处理分支 `internal/server/handler.go:489` |
-| 出站 UA 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`） | `cmd/server/config.go:73`；接线 `cmd/server/main.go:96` |
-| session-dead 连续阈值 3 才禁用 | `internal/pool/pool.go:249-253`（`sessionDeadThreshold`） |
-| `ReviveDisabled` 人工复活 | `internal/pool/pool.go:951` |
-| disabled 账号透出 `disabled_reason` | `internal/pool/pool.go:1162-1165` |
-| 硬冷却至次日 04:00 | `internal/pool/pool.go:882`（`CooldownUntilTomorrow4AM`） |
-| 软冷却退避封顶 2h | `internal/pool/pool.go:247`（`defaultSoftRateMax`） |
-| Top-5 候选短名单 | `internal/pool/pool.go:584` |
-| `activity_hours` 默认 `[10]` | `cmd/server/config.go:135` |
-| 活跃自检回读 streak | `internal/scheduler/scheduler.go:227`（`checkActivityStreak`） |
-| streak 端点 `activity/growth/streak` | `internal/upstream/travel.go:24`（常量）、`:139`（`GrowthStreak`） |
-| Redis 粘性镜像 7 天 TTL | `internal/redisstore/redisstore.go:21` |
-| 静态模型表含 `deepseek-v4-flash` 等 | `internal/server/handler.go:146` |
+| 出站强制 `stream:true` | `internal/upstream/payload.go`（文件头注释 + 改写管线） |
+| DeepSeek 思维链注入（`thinking.type=enabled`） | `internal/upstream/thinking.go` 的 `thinking.type` |
+| 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go` 的 `defaultEfforts` |
+| `reasoning_content` 多轮回填（assistant 消息） | `internal/upstream/thinking.go` 的 `reasoning_content` |
+| Degraded 中性提示词常量 | `internal/prompt/prompt.go` 的 Degraded 常量 |
+| 降级触发与次日 00:00 CST 重置 | `internal/server/degrade.go` 的 `Trigger` / `nextMidnightCST` |
+| 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go`（`6004` 常量与 `reset_at` 解析） |
+| `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go` 的 11101 分支；处理见 `internal/server/handler.go` |
+| 出站 UA 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`） | `cmd/server/config.go` 的 `Upstream.UserAgent`；接线 `cmd/server/main.go` |
+| session-dead 连续阈值 3 才禁用 | `internal/pool/transition.go` 的 `sessionDeadFails` |
+| `ReviveDisabled` 人工复活 | `internal/pool/state.go` 的 `ReviveDisabled` |
+| disabled 账号透出 `disabled_reason` | `internal/pool/state.go` / `entry.go` 的状态字段 |
+| 硬冷却至次日 04:00 | `internal/pool/cooldown.go` 的 `CooldownUntilTomorrow4AM` |
+| 软冷却退避封顶 2h | `internal/pool/cooldown.go` 的 `defaultSoftRateMax` |
+| Top-5 候选短名单 | `internal/pool/pick.go`（文件头「按权重取前 5 名」） |
+| `activity_hours` 默认 `[10]` | `cmd/server/config.go` 的 `Default()` |
+| 活跃自检回读 streak | `internal/scheduler/scheduler.go` 的 `checkActivityStreak` |
+| streak 端点 `activity/growth/streak` | `internal/upstream/travel.go` 的 `GrowthStreak` 常量与实现 |
+| Redis 粘性镜像 7 天 TTL | `internal/redisstore/redisstore.go` 的 `keyTTL` |
+
+> 本表刻意只写**文件 + 符号名**而不写行号：`pool` 等包已按职责拆成多个文件
+> （`pick.go` / `cooldown.go` / `transition.go` / `state.go` …），行号会随任何一次
+> 重构失效，符号名不会。
 
 ## 免责声明
 
