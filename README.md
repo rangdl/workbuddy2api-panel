@@ -1084,14 +1084,46 @@ Trae 接入使用**独立前缀 `/trae/v1/*`**，与 `/v1/*`（CodeBuddy）、`/
 
 - **签到**：`checkin_credits/status` 预检（已签则跳过）→ `checkin_credits/claim` 领取，解析本次奖励；
   支持单账号签到与「全部签到」，账号间限速 800ms；
+- **签到前按需续期**：access token 剩余有效期 < 2h 时先走 `ExchangeToken` 刷新，
+  轮换后的 `refreshToken` 立刻落盘（轮换链断掉 = 后续续期全废）。可用
+  `refresh_before_checkin: false` 关闭；
+- **签到结果语义**（与参考实现对齐）：
+
+  | 业务码 | 含义 | 处理 |
+  |---|---|---|
+  | `9004` | 请求缺设备头，上游按已签处理 | `already` / `device_already`（**不是失败**） |
+  | `9095` | 该**设备**今日已签 | `device_already`，并**立即停止本批**剩余账号 |
+  | `9074` | 排队限流 / 设备号不被认可 | 30 分钟冷却，**本轮不重试**，等下一轮排程 |
+
+- **claim 后回查确认**（`verify_claim`，缺省开）：`code=0` 可能是「假成功」——
+  当日已签的账号对任何设备号都回 0。领取后以同一设备号回查 `checked_in` 是否翻转，
+  未翻转标 `unverified`（不报成功、下轮重试）；
 - **每日自动签到**：面板可配开关与时点（默认 `[9]`），独立调度器按点执行、同日去重；
   失败按错误分类写入冷却（与 chat 链路共用同一张冷却表）；
 - **积分查询**：`pay/ide_user_ent_usage` 拉取积分包明细，按 `product_id` 动态分类
   （209 = Work 积分，其余归通用积分——签到积分归属曾变更，不可写死来源），
   面板展示通用 / Work / 合计 / 额度。
 
+> ⚠️ **签到限额按「设备」算，不按账号。** 返回码 `9095` 的主语是设备：
+> 多个账号共用同一个 `device_id` 时，一天只有第一个能签成，其余全部 9095。
+> 另外**自己生成的设备号必然被拒成 9074**——设备号必须是 Trae 客户端在服务端
+> 注册过的那串十进制数字（`storage.json` 里 `iCubeAuthInfo://icube-dc:<数字>`
+> 键名中的数字），长度 15/16 位都见过，**不是必须 16 位**。
+
 > 签到与积分走 **`api.trae.cn`**（与对话的 `trae-api-cn.mchost.guru` 不同域），
-> 请求头族也不同（VSCode UA + market/session 头），已在实现中分别处理。
+> 请求头族也不同（market/session 头），已在实现中分别处理。
+>
+> 2026-11 客户端合并（TraeWork + TraeCode → 统一 TRAE，桌面端改名 Trae CN）后，
+> 签到 UA 缺省改为新版形态 `Trae/0.1.52`。若上游行为变化需要回退旧形态，
+> 在 `trae.json` 里设：
+>
+> ```json
+> { "checkin_user_agent": "VSCode 1.107.1 (TRAE SOLO CN)", "checkin_market_client_id": "VSCode 1.107.1" }
+> ```
+>
+> 另有两个可选覆盖项：`checkin_req_source`（缺省 `0` = 发 `{}`；填 `1` / `2` 则发
+> `{"req_source":N}`——两个参考实现对取值结论相反，故做成可配置）与
+> `verify_claim` / `refresh_before_checkin`（缺省均 `true`）。
 
 > **凭证安全**：面板**永不回显凭证**——只返回"是否已配置"与 token 尾 4 位；
 > 凭证写入只有两条路径（OAuth 换取、用户粘贴设备密文），落盘权限 `0600`，`trae.json` 已 gitignore。

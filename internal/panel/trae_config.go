@@ -188,6 +188,12 @@ func (p *Panel) saveTraeConfig(w http.ResponseWriter, r *http.Request) {
 		TimeoutSeconds:    req.TimeoutSeconds,
 		AuthDir:           old.AuthDir,
 		APITraeBase:       old.APITraeBase,
+		// 签到链路可调项：面板不编辑，但保存时必须原样带过去，
+		// 否则用户手改过 trae.json 的这些字段会被一次面板保存清空。
+		VerifyClaim:          old.VerifyClaim,
+		RefreshBeforeCheckin: old.RefreshBeforeCheckin,
+		CheckinUserAgent:     old.CheckinUserAgent,
+		CheckinReqSource:     old.CheckinReqSource,
 		Schedule: trae.CheckinSchedule{
 			Enabled: req.Schedule.Enabled,
 			Hours:   req.Schedule.Hours,

@@ -96,11 +96,18 @@ func TestCheckinAlready(t *testing.T) {
 
 // TestCheckinClaimReward 奖励字段提取（候选键 + 包裹层）。
 func TestCheckinClaimReward(t *testing.T) {
+	var claimed bool
 	srv, seen := newAPIServer(t, func(path string, _ map[string]any) (int, string) {
 		switch path {
 		case EndpointCheckinStatus:
+			// 回查确认会再查一次 status：claim 之后 checked_in 必须翻转，
+			// 否则会被判 unverified（模拟真实上游的"到账"）。
+			if claimed {
+				return 200, `{"code":0,"checked_in":true}`
+			}
 			return 200, `{"code":0,"checked_in":false}`
 		default:
+			claimed = true
 			return 200, `{"code":0,"message":"签到成功","data":{"reward_credits":150}}`
 		}
 	})
@@ -111,18 +118,107 @@ func TestCheckinClaimReward(t *testing.T) {
 	if res.Already {
 		t.Fatal("未签到不应报 already")
 	}
+	if res.Unverified {
+		t.Fatalf("回查已翻转，不应判未确认: %+v", res)
+	}
 	if res.Reward != 150 {
 		t.Errorf("Reward = %d, want 150（包裹层里的 reward_credits）", res.Reward)
 	}
 	if res.Message != "签到成功" {
 		t.Errorf("Message = %q", res.Message)
 	}
-	if len(*seen) != 2 {
-		t.Errorf("应发两次请求（status + claim），实际 %d", len(*seen))
+	// status → claim → status（回查确认）
+	if len(*seen) != 3 {
+		t.Errorf("应发三次请求（status + claim + 回查 status），实际 %d", len(*seen))
 	}
 	// body 必须是 {}（上游要求空对象）
 	if b, _ := json.Marshal((*seen)[1]); string(b) != "{}" {
 		t.Errorf("claim body = %s, want {}", b)
+	}
+}
+
+// TestCheckinDeviceAlreadyFromClaim 9095（设备今日已签）→ Already + DeviceAlready，
+// 不是错误（这是多账号共用设备号时最常见的返回）。
+func TestCheckinDeviceAlreadyFromClaim(t *testing.T) {
+	srv, _ := newAPIServer(t, func(path string, _ map[string]any) (int, string) {
+		if path == EndpointCheckinStatus {
+			return 200, `{"code":0,"checked_in":false}`
+		}
+		return 200, `{"code":9095,"message":"当前设备今日已经签到，请明日再来哦～"}`
+	})
+	res, err := NewClient().Checkin(context.Background(), apiCfg(srv.URL), testAccount())
+	if err != nil {
+		t.Fatalf("9095 不应返回错误: %v", err)
+	}
+	if !res.Already || !res.DeviceAlready {
+		t.Fatalf("res = %+v, want Already+DeviceAlready", res)
+	}
+	if res.Message == "" {
+		t.Error("Message 应保留上游原文")
+	}
+}
+
+// TestCheckinAlreadyFromStatusDidCheckedIn status 只回 did_checked_in=true（设备维度）
+// 时也应判为已签，避免对已签设备重复 claim。
+func TestCheckinAlreadyFromStatusDidCheckedIn(t *testing.T) {
+	var claimCalled bool
+	srv, _ := newAPIServer(t, func(path string, _ map[string]any) (int, string) {
+		if path == EndpointCheckinClaim {
+			claimCalled = true
+		}
+		return 200, `{"code":0,"did_checked_in":true}`
+	})
+	res, err := NewClient().Checkin(context.Background(), apiCfg(srv.URL), testAccount())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Already || !res.DeviceAlready {
+		t.Fatalf("res = %+v, want Already+DeviceAlready", res)
+	}
+	if claimCalled {
+		t.Error("did_checked_in=true 时不应再 claim")
+	}
+}
+
+// TestCheckinUnverified claim 成功但回查未翻转 → Unverified（不能报成功）。
+func TestCheckinUnverified(t *testing.T) {
+	srv, _ := newAPIServer(t, func(path string, _ map[string]any) (int, string) {
+		if path == EndpointCheckinStatus {
+			return 200, `{"code":0,"checked_in":false}` // 回查仍为 false
+		}
+		return 200, `{"code":0,"data":{"reward":150}}`
+	})
+	res, err := NewClient().Checkin(context.Background(), apiCfg(srv.URL), testAccount())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Unverified {
+		t.Fatalf("res = %+v, want Unverified", res)
+	}
+}
+
+// TestCheckinVerifyDisabled VerifyClaim=false 时不做回查（只发 status + claim）。
+func TestCheckinVerifyDisabled(t *testing.T) {
+	cfgOff := false
+	var claimCalled bool
+	srv, seen := newAPIServer(t, func(path string, _ map[string]any) (int, string) {
+		if path == EndpointCheckinStatus {
+			return 200, `{"code":0,"checked_in":false}`
+		}
+		claimCalled = true
+		return 200, `{"code":0,"data":{"reward":150}}`
+	})
+	cfg := apiCfg(srv.URL)
+	cfg.VerifyClaim = &cfgOff
+	res, err := NewClient().Checkin(context.Background(), cfg, testAccount())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimCalled || res.Unverified || res.Reward != 150 {
+		t.Fatalf("res = %+v", res)
+	}
+	if len(*seen) != 2 {
+		t.Errorf("请求数 = %d, want 2（关闭回查）", len(*seen))
 	}
 }
 
@@ -216,7 +312,7 @@ func TestAPIHTTPError(t *testing.T) {
 	}
 }
 
-// TestAPIRequestHeaders 签到接口的头族（VSCode UA + market/session 头）。
+// TestAPIRequestHeaders 签到接口的头族（2026-11 合并客户端形态的 UA + market/session 头）。
 func TestAPIRequestHeaders(t *testing.T) {
 	var got http.Header
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -231,7 +327,7 @@ func TestAPIRequestHeaders(t *testing.T) {
 	}
 	checks := map[string]string{
 		"Authorization":      "Cloud-IDE-JWT tok-1",
-		"User-Agent":         checkinUserAgent,
+		"User-Agent":         "Trae/0.1.52",
 		"X-Device-Id":        "dev-1",
 		"X-User-Region":      "CN",
 		"Package-Type":       "stable_cn",
@@ -245,6 +341,48 @@ func TestAPIRequestHeaders(t *testing.T) {
 	}
 	if got.Get("X-Request-Id") == "" || got.Get("X-Tt-Trace-Id") == "" {
 		t.Error("追踪头未设置")
+	}
+}
+
+// TestCheckinHeaderOverrides 配置覆盖 UA（回退旧形态的出口）。
+func TestCheckinHeaderOverrides(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0}`))
+	}))
+	defer srv.Close()
+
+	cfg := apiCfg(srv.URL)
+	cfg.CheckinUserAgent = LegacyCheckinUserAgent
+	if _, err := NewClient().CheckinStatus(context.Background(), cfg, testAccount()); err != nil {
+		t.Fatal(err)
+	}
+	if v := got.Get("User-Agent"); v != LegacyCheckinUserAgent {
+		t.Errorf("User-Agent = %q, want %q", v, LegacyCheckinUserAgent)
+	}
+	// X-Market-Client-Id 不随 UA 覆盖变化（保持真实指纹）。
+	if v := got.Get("X-Market-Client-Id"); v != "VSCode 1.107.1" {
+		t.Errorf("X-Market-Client-Id = %q", v)
+	}
+}
+
+// TestCheckinReqSourceOverride req_source 缺省发 {}，配置后发 {"req_source":N}。
+func TestCheckinReqSourceOverride(t *testing.T) {
+	srv, seen := newAPIServer(t, func(string, map[string]any) (int, string) {
+		return 200, `{"code":0,"checked_in":true}`
+	})
+	cfg := apiCfg(srv.URL)
+	cfg.CheckinReqSource = 2
+	if _, err := NewClient().CheckinStatus(context.Background(), cfg, testAccount()); err != nil {
+		t.Fatal(err)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("请求数 = %d", len(*seen))
+	}
+	if v, ok := (*seen)[0]["req_source"]; !ok || v != float64(2) {
+		t.Errorf("body = %v, want req_source=2", (*seen)[0])
 	}
 }
 

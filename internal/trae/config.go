@@ -85,6 +85,34 @@ type Config struct {
 	Accounts []Account `json:"accounts"`
 	// Schedule 签到排程（缺省不启用；由 trae.Scheduler 消费）。
 	Schedule CheckinSchedule `json:"schedule"`
+
+	// ---- 签到链路可调项（全部有安全缺省，一般不需要动）----
+
+	// VerifyClaim claim 成功后是否同设备号回查确认（缺省 true）。
+	//
+	// 背景：claim 返回 code=0 可能是"假成功"——当日已签过的账号对任何
+	// device_id 都回 0（L0NE-6 实测）。开着它多一次只读请求，但能避免
+	// "面板亮绿灯、实际没到账"。用指针区分"未配置"与显式 false。
+	VerifyClaim *bool `json:"verify_claim"`
+	// RefreshBeforeCheckin 签到前是否先按需续期 access_token（缺省 true）。
+	//
+	// 签到链路此前完全没有续期入口：token 过期会被分类成 ErrSessionDead
+	// 直接摘号 24h，而实际上刷新一下就能签。开着它会先看 NeedsRefresh，
+	// 需要时走 ExchangeRefresh 并立刻把轮换后的 refreshToken 落盘。
+	RefreshBeforeCheckin *bool `json:"refresh_before_checkin"`
+	// CheckinUserAgent 签到/积分接口的 UA（缺省 Trae/0.1.52，新版合并客户端形态）。
+	// 需要回退旧版形态时填 LegacyCheckinUserAgent（"VSCode 1.107.1 (TRAE SOLO CN)"）。
+	CheckinUserAgent string `json:"checkin_user_agent"`
+	// CheckinReqSource 签到请求体的 req_source（缺省 0 = 发 `{}`）。
+	// 参考实现互相矛盾（1 / 2），故可配置；发 `{}` 是本项目已实测可用的形态。
+	CheckinReqSource int `json:"checkin_req_source"`
+
+	// SaveHook 续期成功后把轮换后的凭证落盘的钩子（由启动方注入，不参与 JSON）。
+	//
+	// 为什么需要：Trae 的 refreshToken 是**轮换链**——每次续期产生新值、旧值作废。
+	// 若只在内存里更新，进程重启后拿旧值续期会直接失败（参考实现都强调这点）。
+	// trae 包不直接写配置文件，是为了不把"哪个文件、什么权限"的知识搬进 provider。
+	SaveHook func(*Config) error `json:"-"`
 }
 
 // Account 一个 Trae 账号。
@@ -141,9 +169,27 @@ func (c *Config) Normalize() {
 	if c.Schedule.GapMS <= 0 {
 		c.Schedule.GapMS = 800
 	}
+	// 签到链路的两个布尔开关缺省为 true（用指针区分"未配置"与显式 false）。
+	if c.VerifyClaim == nil {
+		c.VerifyClaim = boolPtr(true)
+	}
+	if c.RefreshBeforeCheckin == nil {
+		c.RefreshBeforeCheckin = boolPtr(true)
+	}
+	c.CheckinUserAgent = strings.TrimSpace(c.CheckinUserAgent)
 	for i := range c.Accounts {
 		c.Accounts[i].normalize()
 	}
+}
+
+// VerifyClaimEnabled / RefreshBeforeCheckinEnabled 读布尔开关（nil 视为 true）。
+func (c *Config) VerifyClaimEnabled() bool {
+	return c == nil || c.VerifyClaim == nil || *c.VerifyClaim
+}
+
+// RefreshBeforeCheckinEnabled 签到前是否先续期（nil 视为 true）。
+func (c *Config) RefreshBeforeCheckinEnabled() bool {
+	return c == nil || c.RefreshBeforeCheckin == nil || *c.RefreshBeforeCheckin
 }
 
 func (a *Account) normalize() {
@@ -229,6 +275,28 @@ func (c *Config) LogSummary() {
 	if usable > 0 && proof == 0 {
 		log.Printf("[trae] WARN: 无账号具备设备私钥，refresh 只能走无 proof 兜底变体（上游可能拒绝）")
 	}
+	// 设备号形态提示（只在启动/热重载打一次，不放进 Validate——调度器每分钟都读配置）。
+	for _, a := range c.Accounts {
+		if a.Disabled || a.DeviceID == "" || IsValidDeviceID(a.DeviceID) {
+			continue
+		}
+		log.Printf("[trae] WARN: 账号 %s 的 device_id %q 不像客户端注册过的十进制设备号，"+
+			"签到大概率返回 9074；请从 storage.json 的 iCubeAuthInfo://icube-dc:<数字> 键名重新导入",
+			a.UID, a.DeviceID)
+	}
+	// 多账号共用同一设备号时，一天只有第一个能签成（9095 的主语是设备）。
+	devOwner := make(map[string]string, len(c.Accounts))
+	for _, a := range c.Accounts {
+		if a.Disabled || a.DeviceID == "" {
+			continue
+		}
+		if prev, ok := devOwner[a.DeviceID]; ok {
+			log.Printf("[trae] WARN: 账号 %s 与 %s 共用设备号 %s——签到限额按设备算，"+
+				"一天只有第一个能签成，其余会返回 9095", prev, a.UID, a.DeviceID)
+			continue
+		}
+		devOwner[a.DeviceID] = a.UID
+	}
 }
 
 // AccountByUID 按 uid 查账号（返回副本，避免调用方误改配置）。
@@ -245,8 +313,7 @@ func (c *Config) AccountByUID(uid string) *Account {
 	return nil
 }
 
-// AccessTokenHeader 返回可直接用于 Authorization 头的 token 值
-// （裸 JWT 自动补 "Cloud-IDE-JWT " 前缀）。
+// AccessTokenHeader 返回可直接用于 Authorization 头的 token 值// （裸 JWT 自动补 "Cloud-IDE-JWT " 前缀）。
 func (a *Account) AccessTokenHeader() string {
 	t := strings.TrimSpace(a.AccessToken)
 	if t == "" {

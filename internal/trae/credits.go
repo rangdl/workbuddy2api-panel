@@ -3,6 +3,7 @@ package trae
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,7 +36,14 @@ const (
 	// EndpointEntUsage 积分包查询。
 	EndpointEntUsage = "/trae/api/v2/pay/ide_user_ent_usage"
 	// checkinUserAgent 签到接口的 UA（对齐真实客户端形态）。
-	checkinUserAgent = "VSCode 1.107.1 (TRAE SOLO CN)"
+	//
+	// 2026-11 客户端合并（TraeWork + TraeCode → 统一 TRAE，桌面端改名 Trae CN）后，
+	// 新版客户端（Trae CN 1.107.x / IDE 构建 0.1.52）的 UA 是 `Trae/<ide_version>`，
+	// 不再是旧版的 `VSCode 1.107.1 (TRAE SOLO CN)`。旧值保留在
+	// LegacyCheckinUserAgent，可用 Config.CheckinUserAgent 一键回退。
+	checkinUserAgent = "Trae/0.1.52"
+	// LegacyCheckinUserAgent 合并前的旧 UA（回退用）。
+	LegacyCheckinUserAgent = "VSCode 1.107.1 (TRAE SOLO CN)"
 	// checkinAppVersion 签到接口的 app-version（实测值，与 chat 的 IDE 版本不同）。
 	checkinAppVersion = "0.1.45"
 	// unwrapMaxDepth 信封深挖的最大层数。
@@ -61,16 +69,25 @@ type CheckinStatus struct {
 	Credits int64
 	// Message 上游 message（原文）。
 	Message string
+	// DeviceAlready 该设备今日已签（did_checked_in=true 或 9095）。
+	// 与 CheckedIn 的区别：CheckedIn 是账号维度，DeviceAlready 是设备维度。
+	DeviceAlready bool
 }
 
 // CheckinResult 一次签到的结果。
 type CheckinResult struct {
-	// Already 今日已签到（预检命中或上游按"已签"语义返回）。
+	// Already 今日已签到（预检命中或上游按"已签"语义返回 9004/9095）。
 	Already bool
 	// Reward 本次奖励积分（上游返回奖励字段时 > 0）。
 	Reward int64
 	// Message 上游 message（原文优先）。
 	Message string
+	// DeviceAlready 该**设备**今日已签（9095）。限额按设备算，多账号共用
+	// 同一设备号时只有第一个能签成；调用方据此停止本批后续账号。
+	DeviceAlready bool
+	// Unverified claim 返回成功但同设备号回查未确认（可能是"假成功"）。
+	// 见 Config.VerifyClaim。
+	Unverified bool
 }
 
 // CreditPack 一个积分包。
@@ -122,43 +139,92 @@ type CreditsSummary struct {
 //
 // 预检失败（网络/鉴权）直接返回错误，不盲目 claim——避免在凭证失效时
 // 反复打上游（与参考实现同取舍）。
+//
+// 「今日已签」有两条来源，都必须当成功分支而不是失败：
+//   - 预检 checked_in / did_checked_in 为真；
+//   - claim 返回业务码 9004（缺设备头）或 9095（该设备今日已签）。
 func (c *Client) Checkin(ctx context.Context, cfg *Config, acc *Account) (*CheckinResult, error) {
 	st, err := c.CheckinStatus(ctx, cfg, acc)
 	if err != nil {
 		return nil, err
 	}
 	if st.CheckedIn != nil && *st.CheckedIn {
-		return &CheckinResult{Already: true, Message: orDefault(st.Message, "今日已签到")}, nil
+		return &CheckinResult{
+			Already:       true,
+			DeviceAlready: st.DeviceAlready,
+			Message:       orDefault(st.Message, "今日已签到"),
+		}, nil
 	}
-	return c.CheckinClaim(ctx, cfg, acc)
+	res, err := c.CheckinClaim(ctx, cfg, acc)
+	if err != nil {
+		// 9004 / 9095：上游按「已签」语义拒绝领取，不是失败。
+		if cls := classifyAPIError(err); cls.Already {
+			return &CheckinResult{
+				Already:       true,
+				DeviceAlready: cls.Code == "9095" || cls.Code == "9004",
+				Message:       cls.Message,
+			}, nil
+		}
+		return nil, err
+	}
+	// 回查确认：claim 返回 code=0 可能是「假成功」——当日已签过的账号对
+	// 任何 device_id 都会回 0（L0NE-6 实测）。以同设备号回查 checked_in
+	// 翻转才算真到账；明确未翻转才标 Unverified（字段缺失时无法判断，按成功处理）。
+	if cfg != nil && cfg.VerifyClaimEnabled() {
+		if again, aerr := c.CheckinStatus(ctx, cfg, acc); aerr == nil &&
+			again.CheckedIn != nil && !*again.CheckedIn {
+			res.Unverified = true
+			res.Message = "领取接口返回成功，但同设备号回查未确认（可能未到账，下轮重试）"
+		}
+	}
+	return res, nil
 }
 
 // CheckinStatus 查询今日签到状态（只读，可用于探活凭证）。
 func (c *Client) CheckinStatus(ctx context.Context, cfg *Config, acc *Account) (*CheckinStatus, error) {
-	body, err := c.apiPost(ctx, cfg, acc, EndpointCheckinStatus, nil)
+	body, err := c.apiPost(ctx, cfg, acc, EndpointCheckinStatus, checkinBody(cfg))
 	if err != nil {
+		// 9004/9095 在预检接口上等价于"已签"，不能当失败。
+		if cls := classifyAPIError(err); cls.Already {
+			return &CheckinStatus{CheckedIn: boolPtr(true), Message: cls.Message}, nil
+		}
 		return nil, err
 	}
 	scopes := unwrapScopes(body)
 	out := &CheckinStatus{Message: str(body["message"])}
-	if v, ok := findPayloadField(scopes, "checked_in"); ok {
-		switch t := v.(type) {
-		case bool:
-			out.CheckedIn = &t
-		case float64:
-			b := t != 0
-			out.CheckedIn = &b
+	// checked_in 与 did_checked_in 都要看：前者是账号维度，后者是**设备**维度。
+	// 两者任一为真即视为今日已签，避免"账号没签过但设备签过了"被误判为可签。
+	for _, key := range []string{"checked_in", "did_checked_in"} {
+		if v, ok := findPayloadField(scopes, key); ok {
+			if b := asBoolTolerant(v); b != nil && *b {
+				out.CheckedIn = boolPtr(true)
+				out.DeviceAlready = key == "did_checked_in" || out.DeviceAlready
+				break
+			}
+		}
+	}
+	if out.CheckedIn == nil {
+		if v, ok := findPayloadField(scopes, "checked_in"); ok {
+			out.CheckedIn = asBoolTolerant(v)
 		}
 	}
 	if v, ok := findPayloadField(scopes, "credits"); ok {
 		out.Credits, _ = asIntTolerant(v)
+	}
+	// credits=0 但 extra_credits>0 时展示值应取后者（两者并列，绝不相加）。
+	if out.Credits <= 0 {
+		if v, ok := findPayloadField(scopes, "extra_credits"); ok {
+			if n, ok := asIntTolerant(v); ok && n > 0 {
+				out.Credits = n
+			}
+		}
 	}
 	return out, nil
 }
 
 // CheckinClaim 执行签到并解析奖励。
 func (c *Client) CheckinClaim(ctx context.Context, cfg *Config, acc *Account) (*CheckinResult, error) {
-	body, err := c.apiPost(ctx, cfg, acc, EndpointCheckinClaim, nil)
+	body, err := c.apiPost(ctx, cfg, acc, EndpointCheckinClaim, checkinBody(cfg))
 	if err != nil {
 		return nil, err
 	}
@@ -317,14 +383,62 @@ func (e *APIError) Classification() Classification {
 	return Classify(e.StatusCode, nil, e.Code, e.Message)
 }
 
-// applyCheckinHeaders 签到/积分接口的头族（与 chat 链路不同：VSCode UA + market/session 头）。
+// classifyAPIError 尽力把任意错误转成 Classification（非 APIError 返回空分类）。
+func classifyAPIError(err error) Classification {
+	if err == nil {
+		return Classification{}
+	}
+	// 直接类型断言优先：APIError 只以 *APIError 形式产生，
+	// 用 errors.As 反而会漏（*APIError 与 error 接口的匹配在个别包装下不稳定）。
+	if e, ok := err.(*APIError); ok {
+		return e.Classification()
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Classification()
+	}
+	return Classification{}
+}
+
+// boolPtr 取 bool 指针（CheckinStatus.CheckedIn 用 nil 表示"上游没给这个字段"）。
+func boolPtr(b bool) *bool { return &b }
+
+// asBoolTolerant 宽容读取 bool（上游可能给 bool / 数字 / "true"）。
+func asBoolTolerant(v any) *bool {
+	switch t := v.(type) {
+	case bool:
+		return boolPtr(t)
+	case float64:
+		return boolPtr(t != 0)
+	case string:
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "true", "1", "yes":
+			return boolPtr(true)
+		case "false", "0", "no":
+			return boolPtr(false)
+		}
+	}
+	return nil
+}
+
+// applyCheckinHeaders 签到/积分接口的头族（与 chat 链路不同：market/session 头）。
+//
+// 只把 UA 换成新版合并客户端的 `Trae/<ide_version>` 形态——这是唯一有实证来源的
+// 变化（Trae CN 1.107.1 / IDE 0.1.52 客户端）。X-Market-Client-Id 保持原有的
+// VSCode 形态不动：上游没有证据表明它跟着改名，跟着改反而可能偏离真实指纹。
 func applyCheckinHeaders(req *http.Request, cfg *Config, acc *Account, tokenWithPrefix string) {
+	ua := checkinUserAgent
+	if cfg != nil {
+		if v := strings.TrimSpace(cfg.CheckinUserAgent); v != "" {
+			ua = v
+		}
+	}
 	h := req.Header
 	h.Set("Accept", "*/*")
 	h.Set("Accept-Language", "zh-CN")
 	h.Set("Authorization", tokenWithPrefix)
 	h.Set("Content-Type", "application/json")
-	h.Set("User-Agent", checkinUserAgent)
+	h.Set("User-Agent", ua)
 	h.Set("X-Market-Client-Id", "VSCode 1.107.1")
 	h.Set("X-Market-User-Id", acc.UID)
 	h.Set("X-User-Region", "CN")
@@ -345,6 +459,18 @@ func applyCheckinHeaders(req *http.Request, cfg *Config, acc *Account, tokenWith
 	}
 	// vscode-sessionid 用设备 id 兜底（无独立 session 时上游不校验其内容）。
 	h.Set("Vscode-Sessionid", acc.DeviceID)
+}
+
+// checkinBody 签到类接口的请求体。
+//
+// 缺省 `{}`（本项目实测可用）；Config.CheckinReqSource 非 0 时改为
+// `{"req_source":N}`——两个参考实现对 N 取值矛盾（1 / 2），故做成可配置，
+// 不把任何一方的结论硬编码成默认。
+func checkinBody(cfg *Config) map[string]any {
+	if cfg != nil && cfg.CheckinReqSource != 0 {
+		return map[string]any{"req_source": cfg.CheckinReqSource}
+	}
+	return nil
 }
 
 // apiBase 生效的签到/积分接口 base。

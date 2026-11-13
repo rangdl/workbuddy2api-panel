@@ -7,6 +7,9 @@ import (
 	"time"
 )
 
+// checkinRefreshWindow 签到前续期的提前量：剩余有效期低于该值就先刷新。
+const checkinRefreshWindow = 2 * time.Hour
+
 // scheduler.go Trae 签到调度器。
 //
 // 为什么独立而不接入 internal/scheduler：那个包是 CodeBuddy 账号池专用
@@ -28,7 +31,11 @@ type CheckinSchedule struct {
 type CheckinOutcome struct {
 	UID  string `json:"uid"`
 	Name string `json:"name"`
-	// Status success / already / fail / skipped。
+	// Status success / already / device_already / unverified / fail / skipped。
+	//
+	//	already        今日已签（账号维度）
+	//	device_already 该**设备**今日已签（9095）——撞到即停止本批后续账号
+	//	unverified     claim 成功但回查未确认，下轮重试
 	Status string `json:"status"`
 	// Reward 本次奖励积分。
 	Reward int64 `json:"reward"`
@@ -140,7 +147,24 @@ func (s *Scheduler) RunOnce(ctx context.Context) []CheckinOutcome {
 		if ctx.Err() != nil {
 			break // 优雅停机：不再开新一轮
 		}
-		outcomes = append(outcomes, s.checkinOne(ctx, cfg, &acc))
+		out := s.checkinOne(ctx, cfg, &acc)
+		outcomes = append(outcomes, out)
+		// 该设备今日已签（9095）：后续账号共用同一设备号只会逐个撞同一面墙，
+		// 直接停止本批（dsh 的 device-already 语义），剩余账号标记 skipped。
+		if out.Status == "device_already" {
+			for j := i + 1; j < len(cfg.Accounts); j++ {
+				rest := cfg.Accounts[j]
+				if rest.Disabled || rest.AccessToken == "" {
+					continue
+				}
+				outcomes = append(outcomes, CheckinOutcome{
+					UID: rest.UID, Name: rest.Name, Status: "skipped",
+					Message: "同一设备号今日已签，本批剩余账号跳过",
+				})
+			}
+			log.Printf("[trae] 设备 %s 今日已签，本批剩余账号跳过", acc.DeviceID)
+			break
+		}
 		if i < len(cfg.Accounts)-1 {
 			select {
 			case <-ctx.Done():
@@ -155,19 +179,52 @@ func (s *Scheduler) RunOnce(ctx context.Context) []CheckinOutcome {
 	return outcomes
 }
 
-// checkinOne 单账号签到（含错误分类与冷却回写）。
+// checkinOne 单账号签到（含续期、错误分类与冷却回写）。
 func (s *Scheduler) checkinOne(ctx context.Context, cfg *Config, acc *Account) CheckinOutcome {
 	start := time.Now()
 	out := CheckinOutcome{UID: acc.UID, Name: acc.Name, Status: "fail"}
+	// 签到前按需续期：token 快过期就先 ExchangeRefresh（轮换结果会落盘）。
+	// 不做这一步的话，过期 token 会被分类成 session_dead 直接摘号 24h，
+	// 而实际上刷新一下就能签。
+	if cfg.RefreshBeforeCheckinEnabled() {
+		if refreshed, rerr := s.Client.EnsureTokenFresh(ctx, cfg, acc, checkinRefreshWindow); rerr != nil {
+			cls := classifyAPIError(rerr)
+			out.ErrorType = string(orKind(cls.Kind, ErrSessionDead))
+			out.Message = "签到前续期失败: " + orDefault(cls.Message, rerr.Error())
+			if s.Cooldowns != nil {
+				s.Cooldowns.Mark(acc.UID, 24*time.Hour, ErrSessionDead, out.Message)
+			}
+			out.Elapsed = time.Since(start).Seconds()
+			log.Printf("WARN: [trae] 签到前续期失败 %s: %s", acc.UID, out.Message)
+			return out
+		} else if refreshed {
+			log.Printf("[trae] 账号 %s 签到前已续期 access_token", acc.UID)
+		}
+	}
 	res, err := s.Client.Checkin(ctx, cfg, acc)
 	out.Elapsed = time.Since(start).Seconds()
 	if err != nil {
-		cls := Classification{Kind: ErrNone}
-		if apiErr, ok := err.(*APIError); ok {
-			cls = apiErr.Classification()
-		}
+		cls := classifyAPIError(err)
 		out.ErrorType = string(cls.Kind)
 		out.Message = orDefault(cls.Message, err.Error())
+		switch {
+		case cls.Already:
+			// 9004 / 9095：上游按「已签」语义拒绝，不是失败。
+			out.Status = "already"
+			if cls.Code == "9095" || cls.Code == "9004" {
+				out.Status = "device_already"
+			}
+			log.Printf("[trae] 签到 %s: %s（%s）", acc.UID, out.Message, cls.Code)
+			return out
+		case cls.RateLimited:
+			// 9074：本轮不重试，冷却后交给下一轮排程。
+			out.ErrorType = string(ErrCheckinBusy)
+			if s.Cooldowns != nil && cls.Cooldown > 0 {
+				s.Cooldowns.Mark(acc.UID, cls.Cooldown, ErrCheckinBusy, out.Message)
+			}
+			log.Printf("WARN: [trae] 签到限流 %s: %s", acc.UID, out.Message)
+			return out
+		}
 		if s.Cooldowns != nil && cls.Kind != ErrNone {
 			if cls.Disable {
 				s.Cooldowns.Mark(acc.UID, 24*time.Hour, cls.Kind, out.Message)
@@ -178,8 +235,18 @@ func (s *Scheduler) checkinOne(ctx context.Context, cfg *Config, acc *Account) C
 		log.Printf("WARN: [trae] 签到失败 %s: %s", acc.UID, out.Message)
 		return out
 	}
+	if res.Unverified {
+		// claim 说成功但回查没翻转：不报成功，也不清冷却，交下一轮重试。
+		out.Status = "unverified"
+		out.Message = res.Message
+		log.Printf("WARN: [trae] 签到未确认 %s: %s", acc.UID, out.Message)
+		return out
+	}
 	if res.Already {
 		out.Status = "already"
+		if res.DeviceAlready {
+			out.Status = "device_already"
+		}
 		out.Message = res.Message
 		return out
 	}
@@ -191,6 +258,14 @@ func (s *Scheduler) checkinOne(ctx context.Context, cfg *Config, acc *Account) C
 	}
 	log.Printf("[trae] 签到成功 %s: +%d（%s）", acc.UID, out.Reward, out.Message)
 	return out
+}
+
+// orKind 空分类时回落默认值。
+func orKind(k, def ErrKind) ErrKind {
+	if k == ErrNone {
+		return def
+	}
+	return k
 }
 
 // LastOutcomes 返回最近一次执行结果与时刻（面板展示用）。

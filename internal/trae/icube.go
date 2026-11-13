@@ -150,6 +150,24 @@ func pkcs7Unpad(b []byte, blockSize int) ([]byte, error) {
 	return b[:len(b)-n], nil
 }
 
+// IsValidDeviceID 判断设备号是否像客户端注册过的那串十进制数字。
+//
+// 长度**不是**服务端的判据（wallechfox 实测有 15 位真实号，早期版本按 16 位
+// 校验把真实号误判成"没有设备号"）。这里只挡住 UUID / 32 位 hex 之类必然
+// 含字母的形态，12~20 位作为防呆上下界。
+func IsValidDeviceID(d string) bool {
+	d = strings.TrimSpace(d)
+	if len(d) < 12 || len(d) > 20 {
+		return false
+	}
+	for _, c := range d {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // DecryptICubeValue 解密单个 iCubeAuthInfo 值，返回设备凭证。
 // deviceID 由调用方从 storage.json 的键名给出（值本身不含设备 id）。
 func DecryptICubeValue(deviceID, b64 string) (*DeviceCredential, error) {

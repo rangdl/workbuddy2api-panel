@@ -9,9 +9,13 @@ import (
 )
 
 // newSchedServer 假 api 上游：按 X-Device-Id 区分账号行为。
-// dev-bad 的账号返回 401（验证错误分类与冷却回写）。
+//   - dev-bad  → 401（验证错误分类与冷却回写）
+//   - dev-busy → claim 返回 9074（验证限流不重试）
+//   - dev-already-status → status 返回 did_checked_in=true（设备维度已签）
+//   - 其余     → status 未签、claim 成功且回查翻转（验证回查确认）
 func newSchedServer(t *testing.T) *httptest.Server {
 	t.Helper()
+	claimed := map[string]bool{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		dev := r.Header.Get("X-Device-Id")
 		w.Header().Set("Content-Type", "application/json")
@@ -22,13 +26,17 @@ func newSchedServer(t *testing.T) *httptest.Server {
 		}
 		switch r.URL.Path {
 		case EndpointCheckinStatus:
-			// dev-already 已签到
-			if dev == "dev-already" {
+			if dev == "dev-already-status" || claimed[dev] {
 				_, _ = w.Write([]byte(`{"code":0,"checked_in":true}`))
 				return
 			}
 			_, _ = w.Write([]byte(`{"code":0,"checked_in":false}`))
 		case EndpointCheckinClaim:
+			if dev == "dev-busy" {
+				_, _ = w.Write([]byte(`{"code":9074,"message":"当前参与用户太多"}`))
+				return
+			}
+			claimed[dev] = true
 			_, _ = w.Write([]byte(`{"code":0,"data":{"reward":150}}`))
 		default:
 			_, _ = w.Write([]byte(`{"code":0}`))
@@ -55,7 +63,7 @@ func TestSchedulerRunOnce(t *testing.T) {
 	srv := newSchedServer(t)
 	cfg := schedCfg(srv.URL,
 		Account{UID: "u-ok", AccessToken: "t1", DeviceID: "dev-ok"},
-		Account{UID: "u-already", AccessToken: "t2", DeviceID: "dev-already"},
+		Account{UID: "u-already", AccessToken: "t2", DeviceID: "dev-already-status"},
 		Account{UID: "u-bad", AccessToken: "t3", DeviceID: "dev-bad"},
 	)
 	cool := NewCooldowns()
@@ -126,6 +134,129 @@ func TestSchedulerSuccessClearsCooldown(t *testing.T) {
 	}
 	if !cool.Available("u-ok") {
 		t.Error("成功后不应处于冷却")
+	}
+}
+
+// TestSchedulerDeviceAlreadyStopsBatch 撞 9095（设备今日已签）后立即停止本批，
+// 剩余账号标 skipped 且不再发请求——多账号共用同一设备号时只有第一个能签成。
+func TestSchedulerDeviceAlreadyStopsBatch(t *testing.T) {
+	var claims int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case EndpointCheckinStatus:
+			_, _ = w.Write([]byte(`{"code":0,"checked_in":false}`))
+		case EndpointCheckinClaim:
+			claims++
+			_, _ = w.Write([]byte(`{"code":9095,"message":"当前设备今日已经签到，请明日再来哦～"}`))
+		}
+	}))
+	defer srv.Close()
+
+	cfg := schedCfg(srv.URL,
+		Account{UID: "u1", AccessToken: "t1", DeviceID: "dev-shared"},
+		Account{UID: "u2", AccessToken: "t2", DeviceID: "dev-shared"},
+		Account{UID: "u3", AccessToken: "t3", DeviceID: "dev-shared"},
+	)
+	s := NewScheduler(func() *Config { return cfg }, NewClient(), NewCooldowns())
+	outcomes := s.RunOnce(context.Background())
+
+	if len(outcomes) != 3 {
+		t.Fatalf("结果数 = %d, want 3（含 skipped）", len(outcomes))
+	}
+	if outcomes[0].Status != "device_already" {
+		t.Errorf("首个账号 = %+v, want device_already", outcomes[0])
+	}
+	for _, o := range outcomes[1:] {
+		if o.Status != "skipped" {
+			t.Errorf("%s = %+v, want skipped", o.UID, o)
+		}
+	}
+	if claims != 1 {
+		t.Errorf("claim 次数 = %d, want 1（撞设备墙后应停批）", claims)
+	}
+}
+
+// TestSchedulerBusyDoesNotRetry 9074 本轮不重试，只写短冷却。
+func TestSchedulerBusyDoesNotRetry(t *testing.T) {
+	var claims int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case EndpointCheckinStatus:
+			_, _ = w.Write([]byte(`{"code":0,"checked_in":false}`))
+		case EndpointCheckinClaim:
+			claims++
+			_, _ = w.Write([]byte(`{"code":9074,"message":"当前参与用户太多"}`))
+		}
+	}))
+	defer srv.Close()
+
+	cfg := schedCfg(srv.URL, Account{UID: "u1", AccessToken: "t1", DeviceID: "dev-1"})
+	cool := NewCooldowns()
+	s := NewScheduler(func() *Config { return cfg }, NewClient(), cool)
+	out := s.checkinOne(context.Background(), cfg, &cfg.Accounts[0])
+
+	if out.Status != "fail" || out.ErrorType != string(ErrCheckinBusy) {
+		t.Errorf("outcome = %+v, want fail/checkin_busy", out)
+	}
+	if claims != 1 {
+		t.Errorf("claim 次数 = %d, want 1（9074 不应重试）", claims)
+	}
+	if cool.Available("u1") {
+		t.Error("9074 应写冷却，交给下一轮")
+	}
+}
+
+// TestSchedulerRefreshesExpiredToken 签到前 token 快过期 → 先续期再签到；
+// 续期得到的轮换 refreshToken 通过 SaveHook 落盘。
+func TestSchedulerRefreshesExpiredToken(t *testing.T) {
+	var sawProof, claimed bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/trae/api/v3/oauth/ExchangeToken", "/cloudide/api/v3/trae/oauth/ExchangeToken":
+			sawProof = true
+			if r.Header.Get("Authorization") == "" {
+				// 续期成功后签到要用新 token；这里只校验新 token 已被使用。
+			}
+			_, _ = w.Write([]byte(`{"Result":{"Token":"new-token","RefreshToken":"rotated-rt"}}`))
+		case EndpointCheckinStatus:
+			if r.Header.Get("Authorization") != "Cloud-IDE-JWT new-token" {
+				t.Errorf("签到应使用续期后的新 token，得到 %q", r.Header.Get("Authorization"))
+			}
+			_, _ = w.Write([]byte(`{"code":0,"checked_in":true}`))
+		case EndpointCheckinClaim:
+			claimed = true
+			_, _ = w.Write([]byte(`{"code":0}`))
+		}
+	}))
+	defer srv.Close()
+
+	cfg := schedCfg(srv.URL, Account{
+		UID: "u1", AccessToken: "old-token", RefreshToken: "old-rt",
+		DeviceID: "dev-1", ExpiresAt: 1, // 已过期 → NeedsRefresh
+	})
+	cfg.OAuthHost = srv.URL // ExchangeToken 也打这台假上游
+	var savedRT string
+	cfg.SaveHook = func(c *Config) error {
+		savedRT = c.Accounts[0].RefreshToken
+		return nil
+	}
+	s := NewScheduler(func() *Config { return cfg }, NewClient(), NewCooldowns())
+	out := s.checkinOne(context.Background(), cfg, &cfg.Accounts[0])
+
+	if !sawProof {
+		t.Error("过期 token 应先走 ExchangeToken 续期")
+	}
+	if claimed {
+		t.Error("status 已签时不应再 claim")
+	}
+	if out.Status != "already" {
+		t.Errorf("outcome = %+v, want already", out)
+	}
+	if savedRT != "rotated-rt" {
+		t.Errorf("轮换后的 refreshToken 未落盘，得到 %q", savedRT)
 	}
 }
 

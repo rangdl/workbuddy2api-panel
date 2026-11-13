@@ -288,6 +288,83 @@ func (c *Client) ExchangeAuthCode(ctx context.Context, cfg *Config, authCode, ve
 	return nil, fmt.Errorf("全部交换变体失败 → %s", strings.Join(errs, " | "))
 }
 
+// EnsureTokenFresh 在 acc 的 access_token 即将过期时先续期，并落盘轮换结果。
+//
+// 返回 (是否发生过续期, error)。语义（对齐 L0NE-6 / wallechfox 的做法）：
+//   - access_token 仍有效（剩余 > within）：什么都不做；
+//   - 需要续期但续期失败、旧 token 尚未过期：沿用旧 token，返回 (false, nil)
+//     —— 让调用方照常发请求，由上游判定；
+//   - 需要续期、续期失败且旧 token 已不可用：返回错误。
+//
+// 续期成功后会**立刻**通过 cfg.SaveHook 落盘：refreshToken 是轮换链，
+// 只在内存更新会让重启后的续期全部失败。
+func (c *Client) EnsureTokenFresh(ctx context.Context, cfg *Config, acc *Account, within time.Duration) (bool, error) {
+	if acc == nil {
+		return false, fmt.Errorf("trae: nil account")
+	}
+	if within <= 0 {
+		within = 2 * time.Hour
+	}
+	// 过期时间未知时用 JWT 里的 exp 兜底，避免"永远不提前续期"。
+	exp := acc.ExpiresAt
+	if exp == 0 {
+		exp = ExpiryFromJWT(acc.AccessToken)
+	}
+	if !acc.NeedsRefresh(within) || (exp > 0 && time.Now().Add(within).Unix() < exp) {
+		if acc.AccessToken != "" {
+			return false, nil
+		}
+	}
+	if strings.TrimSpace(acc.RefreshToken) == "" {
+		if strings.TrimSpace(acc.AccessToken) != "" {
+			return false, nil // 没有 refresh 能力，只能沿用现有 token
+		}
+		return false, fmt.Errorf("账号 %s 既无 access_token 也无 refresh_token", acc.UID)
+	}
+	pair, err := c.ExchangeRefresh(ctx, cfg, acc)
+	if err != nil {
+		// 旧 token 还有效就继续用（与参考实现同取舍）。
+		if acc.AccessToken != "" && (exp == 0 || exp > time.Now().Unix()) {
+			return false, nil
+		}
+		return false, err
+	}
+	acc.AccessToken = pair.AccessToken
+	if pair.RefreshToken != "" {
+		acc.RefreshToken = pair.RefreshToken
+	}
+	acc.ExpiresAt = pair.ExpiresAt
+	if acc.ExpiresAt == 0 {
+		acc.ExpiresAt = ExpiryFromJWT(pair.AccessToken)
+	}
+	c.persistRotated(cfg, acc)
+	return true, nil
+}
+
+// persistRotated 把续期结果写回 cfg.Accounts 并调用 SaveHook 落盘。
+//
+// acc 可能是调用方持有的副本（例如 AccountByUID 返回的拷贝），所以按 UID
+// 回写到 cfg.Accounts 再保存，避免"内存里更新了、文件里还是旧值"。
+func (c *Client) persistRotated(cfg *Config, acc *Account) {
+	if cfg == nil || acc == nil {
+		return
+	}
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].UID == acc.UID {
+			cfg.Accounts[i].AccessToken = acc.AccessToken
+			cfg.Accounts[i].RefreshToken = acc.RefreshToken
+			cfg.Accounts[i].ExpiresAt = acc.ExpiresAt
+			break
+		}
+	}
+	if cfg.SaveHook == nil {
+		return
+	}
+	if err := cfg.SaveHook(cfg); err != nil && c.Trace != nil {
+		c.Trace("persist/rotated-token", false, err)
+	}
+}
+
 // ExchangeRefresh 用 refresh_token 换新 token。
 //
 // 变体链（主 → 兜底）：

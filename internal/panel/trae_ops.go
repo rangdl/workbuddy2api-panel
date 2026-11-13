@@ -46,13 +46,32 @@ func (p *Panel) traeAccountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "账号不存在: "+uid)
 		return
 	}
+	// 与调度器走同一条链路：先按需续期，再签到（含 9004/9095 识别与回查确认）。
 	ctx, cancel := context.WithTimeout(r.Context(), traeOpTimeout)
 	defer cancel()
+	if cfg.RefreshBeforeCheckinEnabled() {
+		if _, rerr := p.cfg.TraeClient.EnsureTokenFresh(ctx, cfg, acc, 2*time.Hour); rerr != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": false, "uid": uid, "error_type": "session_dead",
+				"message": "签到前续期失败: " + rerr.Error(),
+			})
+			return
+		}
+	}
 	res, err := p.cfg.TraeClient.Checkin(ctx, cfg, acc)
 	if err != nil {
 		// 错误分类后一并回传，便于面板给出可操作提示。
 		if apiErr, ok := err.(*trae.APIError); ok {
 			cls := apiErr.Classification()
+			if cls.Already {
+				// 9004 / 9095 不是失败：按「今日已签」回传。
+				writeJSON(w, http.StatusOK, map[string]any{
+					"ok": true, "uid": uid, "already": true,
+					"device_already": cls.Code == "9095" || cls.Code == "9004",
+					"message":        cls.Message,
+				})
+				return
+			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"ok": false, "uid": uid, "error_type": string(cls.Kind),
 				"message": cls.Message, "disable": cls.Disable,
@@ -62,11 +81,12 @@ func (p *Panel) traeAccountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "uid": uid, "message": err.Error()})
 		return
 	}
-	if p.cfg.TraeCooldowns != nil {
+	if p.cfg.TraeCooldowns != nil && !res.Already {
 		p.cfg.TraeCooldowns.Clear(uid) // 签到成功即清冷却
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "uid": uid, "already": res.Already,
+		"device_already": res.DeviceAlready, "unverified": res.Unverified,
 		"reward": res.Reward, "message": res.Message,
 	})
 }

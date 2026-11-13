@@ -330,6 +330,10 @@ func main() {
 		if err != nil {
 			return nil
 		}
+		if cfg != nil {
+			// 续期轮换后的 refreshToken 必须落盘（否则重启后续期全废）。
+			cfg.SaveHook = saveTraeConfigFunc(trae.ConfigPath(*cfgPath))
+		}
 		return cfg
 	}, traeClient, traeCool)
 

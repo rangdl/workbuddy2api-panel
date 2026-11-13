@@ -421,7 +421,9 @@ function traeAccountRow(a, cool) {
     ck.textContent = '签到中…';
     try {
       const d = await api('trae/accounts/' + encodeURIComponent(a.uid) + '/checkin', { method: 'POST' });
-      if (d.ok) toast(a.uid + (d.already ? ' 今日已签到' : ' 签到成功' + (d.reward > 0 ? ' +' + d.reward : '')), 'ok');
+      if (d.ok && d.device_already) toast(a.uid + ' 该设备今日已签到（签到限额按设备算，不是按账号）', 'warn');
+      else if (d.ok && d.unverified) toast(a.uid + ' 领取返回成功但回查未确认，下轮自动重试', 'warn');
+      else if (d.ok) toast(a.uid + (d.already ? ' 今日已签到' : ' 签到成功' + (d.reward > 0 ? ' +' + d.reward : '')), 'ok');
       else toast('签到失败：' + (d.message || '未知错误'), 'err');
       loadTraeConfig();
     } catch (e) { toast('签到失败：' + e.message, 'err'); }
@@ -587,10 +589,15 @@ $('btnTraeImport').onclick = async () => {
 function renderTraeCheckinNote(results, lastRun) {
   const parts = [];
   for (const r of results) {
-    const tag = r.status === 'success' ? '✓' : (r.status === 'already' ? '=' : (r.status === 'skipped' ? '-' : '✗'));
+    let tag = '✗';
+    if (r.status === 'success') tag = '✓';
+    else if (r.status === 'already') tag = '=';
+    else if (r.status === 'device_already') tag = '☑';
+    else if (r.status === 'unverified') tag = '?';
+    else if (r.status === 'skipped') tag = '-';
     let s = tag + ' ' + (r.uid || '');
     if (r.status === 'success' && r.reward > 0) s += ' +' + r.reward;
-    if (r.status === 'fail') s += ' ' + (r.message || '');
+    if (r.status === 'fail' || r.status === 'unverified') s += ' ' + (r.message || '');
     parts.push(s);
   }
   $('traeCheckinNote').textContent = (lastRun ? '[' + lastRun + '] ' : '') + parts.join('　');
@@ -603,13 +610,19 @@ $('btnTraeCheckinAll').onclick = async () => {
   try {
     const d = await api('trae/checkin_all', { method: 'POST' });
     const rs = d.results || [];
-    let ok = 0, already = 0, fail = 0;
+    let ok = 0, already = 0, devAlready = 0, unverified = 0, fail = 0;
     for (const r of rs) {
       if (r.status === 'success') ok++;
       else if (r.status === 'already') already++;
+      else if (r.status === 'device_already') devAlready++;
+      else if (r.status === 'unverified') unverified++;
       else if (r.status === 'fail') fail++;
     }
-    toast('签到完成：成功 ' + ok + '，已签 ' + already + '，失败 ' + fail, fail ? 'err' : 'ok');
+    let msg = '签到完成：成功 ' + ok + '，已签 ' + already;
+    if (devAlready) msg += '，设备今日已签 ' + devAlready;
+    if (unverified) msg += '，待确认 ' + unverified;
+    msg += '，失败 ' + fail;
+    toast(msg, (fail || unverified) ? 'err' : 'ok');
     renderTraeCheckinNote(rs);
     loadTraeConfig();
   } catch (e) { toast('签到失败：' + e.message, 'err'); }

@@ -32,13 +32,26 @@ const (
 	ErrServer ErrKind = "server"
 	// ErrClient 其他 4xx（请求本身有问题）：不冷却（换号也一样错）。
 	ErrClient ErrKind = "client"
+	// ErrCheckinAlready 签到接口的「今日已签」语义（9004 / 9095）。
+	//
+	// 这不是失败：9004 = 请求缺 x-device-id（上游按"今日已签"处理），
+	// 9095 = 该**设备**今日已签（限额按设备算，不按账号，见 docs）。
+	// 签到链路必须把它当成功分支处理，而不是冷却/判失败。
+	ErrCheckinAlready ErrKind = "checkin_already"
+	// ErrCheckinBusy 签到接口的排队限流（9074「当前参与用户太多」）。
+	//
+	// 参考 L0NE-6 / wallechfox 的实测结论：9074 多数时候是设备号不被认可
+	// （生成号必 9074），少部分是真正的排队限流。两种情况都**不该当场重试**——
+	// 连打会延长惩罚，交给下一轮排程即可。
+	ErrCheckinBusy ErrKind = "checkin_busy"
 )
 
 // 冷却时长（分类 → 时长；0 表示不冷却）。
 const (
-	planLimitCooldown = 12 * time.Hour
-	softRateCooldown  = 60 * time.Second
-	serverCooldown    = 5 * time.Minute
+	planLimitCooldown  = 12 * time.Hour
+	softRateCooldown   = 60 * time.Second
+	serverCooldown     = 5 * time.Minute
+	checkinBusyCooling = 30 * time.Minute
 )
 
 // Classification 一次错误分类的结果。
@@ -52,6 +65,10 @@ type Classification struct {
 	Code string
 	// Message 可读原因（优先上游原文）。
 	Message string
+	// Already 签到接口的「今日已签」（9004 / 9095）：调用方应判成功而非失败。
+	Already bool
+	// RateLimited 9074 排队限流 / 设备号不被认可：本轮不重试，等下轮排程。
+	RateLimited bool
 }
 
 // Classify 按 HTTP 状态 + 响应体（或流内 error 事件）分类。
@@ -59,8 +76,12 @@ type Classification struct {
 // status 为 0 表示错误来自流内 error 事件（此时用 streamCode/streamMsg）。
 func Classify(status int, body []byte, streamCode int64, streamMsg string) Classification {
 	// 流内错误：优先按业务码判定。
-	if status == 0 && (streamCode != 0 || streamMsg != "") {
-		return classifyBizCode(streamCode, streamMsg, status)
+	// streamCode 也可能来自 *APIError.Classification()（此时 status 是真实 HTTP 码，
+	// 而业务码 9095/9074 等出现在 HTTP 200 的响应体里），所以不能只在 status==0 时看它。
+	if streamCode != 0 || streamMsg != "" {
+		if c := classifyBizCode(streamCode, streamMsg, status); c.Kind != ErrNone {
+			return c
+		}
 	}
 	// 业务码可能出现在响应体里（HTTP 200/400 均可能）。
 	if code, msg := bizCodeFromBody(body); code != 0 {
@@ -116,6 +137,22 @@ func classifyBizCode(code int64, msg string, status int) Classification {
 		return Classification{
 			Kind: ErrModelUnknown, Code: itoa64(code),
 			Message: orDefault(m, "模型在该账号不可用"),
+		}
+	// 9004 / 9095 都是「今日已签」，不是失败：
+	//   - 9004 = 请求未带 x-device-id，上游按已签处理（dsh 实测 2026-09-24）；
+	//   - 9095 = 该**设备**今日已签（限额按设备算，多账号共用设备号时第二个起必撞）。
+	case 9004, 9095:
+		return Classification{
+			Kind: ErrCheckinAlready, Already: true, Code: itoa64(code),
+			Message: orDefault(m, "今日已签到"),
+		}
+	// 9074 = 「当前参与用户太多」。实测多数是设备号不被认可（生成号必拒），
+	// 少数是真排队；两种情况都当场重试无益，冷却后交给下一轮。
+	case 9074:
+		return Classification{
+			Kind: ErrCheckinBusy, RateLimited: true,
+			Cooldown: checkinBusyCooling, Code: "9074",
+			Message: orDefault(m, "签到排队限流或设备号不被认可，稍后重试"),
 		}
 	case 401:
 		return Classification{

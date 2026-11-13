@@ -44,14 +44,21 @@ func newTraeOpsPanel(t *testing.T, upstreamURL string) (*Panel, string) {
 }
 
 // newTraeOpsUpstream 假上游：签到成功 + 积分包响应。
+// claim 之后 status 会翻转成 checked_in=true，满足回查确认（VerifyClaim）。
 func newTraeOpsUpstream(t *testing.T) *httptest.Server {
 	t.Helper()
+	var claimed bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case trae.EndpointCheckinStatus:
+			if claimed {
+				_, _ = w.Write([]byte(`{"code":0,"checked_in":true}`))
+				return
+			}
 			_, _ = w.Write([]byte(`{"code":0,"checked_in":false}`))
 		case trae.EndpointCheckinClaim:
+			claimed = true
 			_, _ = w.Write([]byte(`{"code":0,"message":"签到成功","data":{"reward":150}}`))
 		case trae.EndpointEntUsage:
 			_, _ = w.Write([]byte(`{"code":0,"data":{"user_entitlement_pack_list":[

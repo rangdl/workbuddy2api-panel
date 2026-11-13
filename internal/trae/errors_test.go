@@ -33,6 +33,13 @@ func TestClassifyBizCodes(t *testing.T) {
 		{"500 上游异常", http.StatusInternalServerError, ``, 0, ErrServer, serverCooldown, false},
 		{"400 请求问题（不冷却）", http.StatusBadRequest, `bad request`, 0, ErrClient, 0, false},
 		{"404 请求问题", http.StatusNotFound, ``, 0, ErrClient, 0, false},
+		// 签到域三个核心码（HTTP 200 + 业务码，参考实现实测）。
+		{"9004 缺设备头按已签", http.StatusOK, `{"code":9004,"message":"请携带设备信息"}`, 0,
+			ErrCheckinAlready, 0, false},
+		{"9095 设备今日已签", http.StatusOK, `{"code":9095,"message":"当前设备今日已经签到"}`, 0,
+			ErrCheckinAlready, 0, false},
+		{"9074 排队限流", http.StatusOK, `{"code":9074,"message":"当前参与用户太多"}`, 0,
+			ErrCheckinBusy, checkinBusyCooling, false},
 		{"无错误", http.StatusOK, ``, 0, ErrNone, 0, false},
 	}
 	for _, c := range cases {
@@ -60,6 +67,33 @@ func TestClassifyErrorObjectForm(t *testing.T) {
 	got := Classify(http.StatusOK, []byte(`{"error":{"code":1005,"message":"quota"}}`), 0, "")
 	if got.Kind != ErrPlanLimit {
 		t.Fatalf("Kind = %q, want %q", got.Kind, ErrPlanLimit)
+	}
+}
+
+// TestAPIErrorClassificationUsesBizCode APIError 携带 HTTP 200 + 业务码时，
+// 必须按业务码分类而不是落在状态码分支（这是 9095/9074 曾失效的根因）。
+func TestAPIErrorClassificationUsesBizCode(t *testing.T) {
+	cases := []struct {
+		code     int64
+		wantKind ErrKind
+		already  bool
+		busy     bool
+	}{
+		{9095, ErrCheckinAlready, true, false},
+		{9004, ErrCheckinAlready, true, false},
+		{9074, ErrCheckinBusy, false, true},
+	}
+	for _, c := range cases {
+		got := (&APIError{StatusCode: http.StatusOK, Code: c.code}).Classification()
+		if got.Kind != c.wantKind {
+			t.Errorf("code=%d Kind = %q, want %q", c.code, got.Kind, c.wantKind)
+		}
+		if got.Already != c.already {
+			t.Errorf("code=%d Already = %v, want %v", c.code, got.Already, c.already)
+		}
+		if got.RateLimited != c.busy {
+			t.Errorf("code=%d RateLimited = %v, want %v", c.code, got.RateLimited, c.busy)
+		}
 	}
 }
 

@@ -158,3 +158,26 @@ func TestParseStorageJSON(t *testing.T) {
 		t.Error("非 JSON 应报错")
 	}
 }
+
+// TestIsValidDeviceID 设备号形态：12~20 位十进制；含字母 / 长度越界一律拒绝。
+// 长度不是服务端判据（15 位真实号存在），只作防呆。
+func TestIsValidDeviceID(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"1234567890123456", true},       // 16 位（多数机器）
+		{"123456789012345", true},        // 15 位真实号
+		{" 123456789012 ", true},         // 前后空白应被裁掉
+		{"12345678901", false},           // 11 位：太短
+		{"123456789012345678901", false}, // 21 位：太长
+		{"12345678-1234-1234", false},    // UUID 含连字符
+		{"abcdef1234567890", false},      // 含字母
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := IsValidDeviceID(c.in); got != c.want {
+			t.Errorf("IsValidDeviceID(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
