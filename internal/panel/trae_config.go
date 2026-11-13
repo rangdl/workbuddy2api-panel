@@ -263,14 +263,34 @@ func (p *Panel) importTraeDevice(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "未在输入中找到 iCubeAuthInfo 设备凭证条目")
 		return
 	}
-	// 预览模式：只回报解析到的设备 id（不含私钥）。
+	// uid 留空 = 按设备号自动匹配账号（只有一个可匹配项时才应用，
+	// 避免把凭证写到错误账号上）；匹配不到或有多项时返回候选让人确认。
 	if req.UID == "" {
+		cfg0, _ := trae.Load(path)
+		if cfg0 == nil {
+			writeErr(w, http.StatusBadRequest, "trae.json 不存在：请先完成一次登录或手工创建配置")
+			return
+		}
+		cred := creds[0]
+		var matched []string
+		for _, a := range cfg0.Accounts {
+			// 同一账号（同设备号）或空白设备号的账号都可以接收这份凭证。
+			if a.DeviceID == "" || a.DeviceID == cred.DeviceID {
+				matched = append(matched, a.UID)
+			}
+		}
 		ids := make([]string, 0, len(creds))
 		for _, c := range creds {
 			ids = append(ids, c.DeviceID)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "device_ids": ids})
-		return
+		if len(matched) != 1 {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": true, "device_ids": ids, "matched_uids": matched,
+				"message": "请填写要绑定到哪个 uid（当前有一项以上或没有可匹配的账号）",
+			})
+			return
+		}
+		req.UID = matched[0]
 	}
 
 	cfg, err := trae.Load(path)
@@ -294,6 +314,9 @@ func (p *Panel) importTraeDevice(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.Accounts[i].DeviceID = cred.DeviceID
 		cfg.Accounts[i].PrivateKeyPEM = cred.PrivateKeyPEM
+		if cred.PublicKeyPEM != "" {
+			cfg.Accounts[i].PublicKeyPEM = cred.PublicKeyPEM
+		}
 		if cred.MachineID != "" {
 			cfg.Accounts[i].MachineID = cred.MachineID
 		}
@@ -351,9 +374,13 @@ func (p *Panel) traeLoginStart(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DeviceID  string `json:"device_id"`
 		MachineID string `json:"machine_id"`
+		// StorageJSON 可选：粘贴 Trae 客户端 storage.json 内容。
+		// 解析出设备号 + 公钥（+ 私钥）后，AuthCode 兑换才能构造 DeviceInfo——
+		// 没有它就只带平铺 DeviceID，上游会拒成 20405 Device proof required。
+		StorageJSON string `json:"storage_json"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&req)
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req)
 	}
 	req.DeviceID = strings.TrimSpace(req.DeviceID)
 	req.MachineID = strings.TrimSpace(req.MachineID)
@@ -362,6 +389,42 @@ func (p *Panel) traeLoginStart(w http.ResponseWriter, r *http.Request) {
 			"device_id 应为一串 12~20 位十进制数字（Trae 客户端 storage.json 里 "+
 				"iCubeAuthInfo://icube-dc:<数字> 键名中的数字）")
 		return
+	}
+
+	// 粘贴了 storage.json：解出设备身份（公钥/私钥），并以其设备号为准。
+	var cred *trae.DeviceCredential
+	if strings.TrimSpace(req.StorageJSON) != "" {
+		creds, err := trae.ParseStorageJSON([]byte(req.StorageJSON))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "storage.json 解析失败: "+err.Error())
+			return
+		}
+		if len(creds) == 0 {
+			writeErr(w, http.StatusBadRequest,
+				"storage.json 里没有 iCubeAuthInfo://icube-dc:<数字> 条目——"+
+					"请确认是在已登录 Trae 客户端的机器上复制的，且客户端版本未改变存储布局")
+			return
+		}
+		// 多条时优先用户显式指定的设备号，否则取第一条。
+		cred = creds[0]
+		if req.DeviceID != "" {
+			for _, c := range creds {
+				if c.DeviceID == req.DeviceID {
+					cred = c
+					break
+				}
+			}
+		}
+		if req.DeviceID != "" && cred.DeviceID != req.DeviceID {
+			writeErr(w, http.StatusBadRequest,
+				"指定的 device_id 与 storage.json 中的设备号不一致（storage 里是 "+
+					cred.DeviceID+"），请留空或改成一致")
+			return
+		}
+		req.DeviceID = cred.DeviceID
+		if req.MachineID == "" {
+			req.MachineID = cred.MachineID
+		}
 	}
 
 	cfg, _ := trae.Load(path)
@@ -428,6 +491,12 @@ func (p *Panel) traeLoginStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 把设备身份带进会话，finish 阶段直接用来构造 DeviceInfo（免再贴一次）。
+	if cred != nil {
+		sess.PublicKeyPEM = cred.PublicKeyPEM
+		sess.PrivateKeyPEM = cred.PrivateKeyPEM
+		sess.MachineID = orDefaultStr(machineID, cred.MachineID)
+	}
 	traeLoginMu.Lock()
 	traeLoginSessions[sess.State] = sess
 	// 顺带清理过期会话（数量有界，惰性清理即可）。
@@ -438,12 +507,16 @@ func (p *Panel) traeLoginStart(w http.ResponseWriter, r *http.Request) {
 	}
 	traeLoginMu.Unlock()
 
+	if cred != nil {
+		deviceSource = "storage"
+	}
 	resp := map[string]any{
 		"ok": true, "url": url, "state": sess.State,
 		"callback_url":     orDefaultStr(callback, trae.DefaultRedirectURI),
 		"device_id":        deviceID,
 		"device_source":    deviceSource,
 		"device_generated": generated,
+		"has_device_key":   cred != nil && cred.PublicKeyPEM != "",
 	}
 	if generated {
 		resp["warning"] = "设备号是自动生成的占位值，用它签到会被拒（9074）。" +
@@ -500,7 +573,7 @@ func (p *Panel) traeLoginFinish(w http.ResponseWriter, r *http.Request) {
 	if cfg == nil {
 		cfg = &trae.Config{}
 	}
-	// 设备身份以本次请求的覆盖值为准（未带则用发起登录时的登记值）。
+	// 设备身份来源优先级：请求体覆盖 > 登录时粘贴的 storage.json > 会话登记值。
 	devID, machID := sess.DeviceID, sess.MachineID
 	if v := strings.TrimSpace(req.DeviceID); v != "" {
 		devID = v
@@ -508,12 +581,19 @@ func (p *Panel) traeLoginFinish(w http.ResponseWriter, r *http.Request) {
 	if v := strings.TrimSpace(req.MachineID); v != "" {
 		machID = v
 	}
-	cred := &trae.DeviceCredential{DeviceID: devID, MachineID: machID}
-	// 已有同设备账号的私钥时复用它（设备身份一致才不会被拒）。
-	for _, a := range cfg.Accounts {
-		if a.DeviceID == devID && a.PrivateKeyPEM != "" {
-			cred.PrivateKeyPEM = a.PrivateKeyPEM
-			break
+	cred := &trae.DeviceCredential{
+		DeviceID:      devID,
+		MachineID:     machID,
+		PublicKeyPEM:  sess.PublicKeyPEM,
+		PrivateKeyPEM: sess.PrivateKeyPEM,
+	}
+	// 会话里没带公钥时，退回复用同设备账号已导入的凭证（设备身份须一致）。
+	if cred.PublicKeyPEM == "" && cred.PrivateKeyPEM == "" {
+		for _, a := range cfg.Accounts {
+			if a.DeviceID == devID && a.PrivateKeyPEM != "" {
+				cred.PrivateKeyPEM = a.PrivateKeyPEM
+				break
+			}
 		}
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)

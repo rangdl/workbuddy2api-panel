@@ -1128,6 +1128,24 @@ Trae 接入使用**独立前缀 `/trae/v1/*`**，与 `/v1/*`（CodeBuddy）、`/
 > **凭证安全**：面板**永不回显凭证**——只返回"是否已配置"与 token 尾 4 位；
 > 凭证写入只有两条路径（OAuth 换取、用户粘贴设备密文），落盘权限 `0600`，`trae.json` 已 gitignore。
 
+**OAuth 登录与设备凭证（重要）**
+
+登录区支持直接粘贴 Trae 客户端的 `storage.json`。**这是登录成功的关键**：
+
+- AuthCode 兑换要求请求体带 `DeviceInfo`（设备号 + 公钥），否则上游返回
+  `20405 Device proof required`；
+- 只带平铺 `DeviceID` 的旧兜底形态必须发**旧端点**
+  `/cloudide/api/v3/trae/oauth/ExchangeToken`，发到新端点会被拒成
+  `10101 无效参数: {__Message.field}`；
+- `storage.json` 只用于提取 `iCubeAuthInfo://icube-dc:<数字>` 条目与
+  `telemetry.machineId`，其余内容不会被读取或上传。
+
+推荐流程：粘贴 `storage.json` → 生成授权链接 → 浏览器授权 → 粘贴回调 URL。
+成功后设备号与公私钥会一并写入账号，签到与续期都具备完整能力。
+
+已有账号补凭证用下方的「给已有账号补设备凭证」，`uid` 留空时会尝试按设备号
+自动匹配（只有一个可匹配账号时才写入）。
+
 ### 未实现
 
 - 账号级会话粘性（当前是简单轮转）。

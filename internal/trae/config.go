@@ -136,6 +136,11 @@ type Account struct {
 	// PrivateKeyPEM 设备 EC P-256 私钥（PEM）。空 = 无 DeviceProof 能力，
 	// refresh 只能走无 proof 的兜底变体（上游可能拒绝）。
 	PrivateKeyPEM string `json:"private_key_pem"`
+	// PublicKeyPEM 设备 EC P-256 公钥（PEM）。
+	//
+	// AuthCode 兑换只需要公钥（服务端校验 DeviceInfo.DevicePublicKey 与登录时
+	// 登记的指纹一致），不需要私钥——所以它要能独立于私钥存在。
+	PublicKeyPEM string `json:"public_key_pem,omitempty"`
 	// AppVersion 客户端版本（DeviceInfo.ClientVersion）。
 	AppVersion string `json:"app_version"`
 	// Disabled 手动禁用（保留在列表但不参与轮转）。

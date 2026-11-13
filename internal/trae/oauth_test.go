@@ -342,3 +342,77 @@ func TestNeedsRefresh(t *testing.T) {
 		}
 	}
 }
+
+// TestExchangeAuthCodePublicKeyOnly 只有公钥（无设备私钥）也必须走主变体。
+//
+// AuthCode 兑换不需要私钥（L0NE-6 实测），服务端只校验 DeviceInfo 里的公钥。
+// 旧实现要求 PrivateKeyPEM 非空，导致「粘贴 storage.json 但没导入私钥」的
+// 机器直接跳过这条唯一有把握的路径，落到必然 20405 的兜底变体上。
+func TestExchangeAuthCodePublicKeyOnly(t *testing.T) {
+	srv, seen := newExchangeServer(t, func(body map[string]any) bool {
+		return body["DeviceInfo"] != nil
+	})
+	key := newTestKey(t)
+	pub, err := PublicKeyPEM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := &DeviceCredential{DeviceID: "dev-1", MachineID: "m-1", PublicKeyPEM: pub}
+	cfg := &Config{ChatBase: srv.URL, OAuthHost: srv.URL, AppID: DefaultAppID}
+
+	pair, err := NewClient().ExchangeAuthCode(context.Background(), cfg, "AC-3", "v", cred, "dev-1", "m-1")
+	if err != nil {
+		t.Fatalf("只有公钥时应走主变体: %v", err)
+	}
+	if pair.AccessToken != "jwt-new" {
+		t.Fatalf("token = %q", pair.AccessToken)
+	}
+	di, _ := (*seen)[0]["DeviceInfo"].(map[string]any)
+	if di == nil {
+		t.Fatalf("首个变体应为 DeviceInfo 形态: %v", (*seen)[0])
+	}
+	if got, _ := di["DevicePublicKey"].(string); strings.TrimSpace(got) != strings.TrimSpace(pub) {
+		t.Error("DeviceInfo 应携带传入的公钥")
+	}
+	// OSInfo 不能是空串——bluechonk 实测空串会被拒成 20405。
+	if di["OSInfo"] == "" {
+		t.Error("OSInfo 不应为空串")
+	}
+}
+
+// TestExchangeAuthCodeFallbackUsesLegacyEndpoint 兜底变体必须发旧端点。
+//
+// 新端点（/trae/api/v3）要求 DeviceInfo/DeviceProof，只带平铺 DeviceID 的
+// payload 会被拒成 `10101 无效参数`。旧端点是兜底形态的唯一正确去处。
+func TestExchangeAuthCodeFallbackUsesLegacyEndpoint(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == OAuthExchangePathLegacy {
+			_, _ = w.Write([]byte(`{"Result":{"Token":"jwt-legacy","RefreshToken":"rt-legacy"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"ResponseMetadata":{"Error":{"Code":"10101","Message":"invalid"}}}`))
+	}))
+	defer srv.Close()
+	cfg := &Config{ChatBase: srv.URL, OAuthHost: srv.URL, AppID: DefaultAppID}
+
+	pair, err := NewClient().ExchangeAuthCode(context.Background(), cfg, "AC-4", "v", nil, "dev-9", "m-9")
+	if err != nil {
+		t.Fatalf("旧端点应成功: %v", err)
+	}
+	if pair.AccessToken != "jwt-legacy" {
+		t.Errorf("token = %q", pair.AccessToken)
+	}
+	var sawLegacy bool
+	for _, p := range paths {
+		if p == OAuthExchangePathLegacy {
+			sawLegacy = true
+		}
+	}
+	if !sawLegacy {
+		t.Errorf("兜底变体未请求旧端点，实际路径: %v", paths)
+	}
+}

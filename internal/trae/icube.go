@@ -48,6 +48,12 @@ type DeviceCredential struct {
 	DeviceID string `json:"device_id"`
 	// PrivateKeyPEM EC P-256 私钥（PKCS#8 或 SEC1 PEM）。
 	PrivateKeyPEM string `json:"private_key_pem"`
+	// PublicKeyPEM EC P-256 公钥（SPKI PEM）。
+	//
+	// AuthCode 兑换只校验公钥（L0NE-6 实测：该场景不需要私钥），
+	// 所以即便私钥缺失也要把公钥带出来。storage.json 的 tc 明文里两者都有，
+	// 缺失时由私钥推导。
+	PublicKeyPEM string `json:"public_key_pem"`
 	// MachineID 遥测机器 id（DeviceInfo 构造用；storage.json 的 telemetry.machineId）。
 	MachineID string `json:"machine_id"`
 	// AppVersion 客户端版本（安装目录 package.json 的 version）。
@@ -170,6 +176,9 @@ func IsValidDeviceID(d string) bool {
 
 // DecryptICubeValue 解密单个 iCubeAuthInfo 值，返回设备凭证。
 // deviceID 由调用方从 storage.json 的键名给出（值本身不含设备 id）。
+//
+// 明文里同时含 privateKeyPEM / publicKeyPEM。**只有私钥是必需的**：
+// 公钥缺失时由私钥推导；私钥缺失但有公钥时也返回（AuthCode 兑换只用公钥）。
 func DecryptICubeValue(deviceID, b64 string) (*DeviceCredential, error) {
 	plain, err := TCDecrypt(b64, false)
 	if err != nil {
@@ -177,16 +186,28 @@ func DecryptICubeValue(deviceID, b64 string) (*DeviceCredential, error) {
 	}
 	var parsed struct {
 		PrivateKeyPEM string `json:"privateKeyPEM"`
+		PublicKeyPEM  string `json:"publicKeyPEM"`
 	}
 	if err := json.Unmarshal([]byte(plain), &parsed); err != nil {
 		return nil, fmt.Errorf("tc 明文非预期 JSON: %w", err)
 	}
-	if !strings.Contains(parsed.PrivateKeyPEM, "BEGIN") {
-		return nil, fmt.Errorf("tc 明文中缺少 privateKeyPEM 字段")
+	priv := strings.TrimSpace(parsed.PrivateKeyPEM)
+	pub := strings.TrimSpace(parsed.PublicKeyPEM)
+	if priv == "" && pub == "" {
+		return nil, fmt.Errorf("tc 明文中既无 privateKeyPEM 也无 publicKeyPEM")
+	}
+	// 公钥缺失时由私钥推导（DeviceInfo.DevicePublicKey 需要它）。
+	if pub == "" {
+		if key, kerr := ParseECPrivateKey(priv); kerr == nil {
+			if p, perr := PublicKeyPEM(key); perr == nil {
+				pub = p
+			}
+		}
 	}
 	return &DeviceCredential{
 		DeviceID:      strings.TrimSpace(deviceID),
-		PrivateKeyPEM: strings.TrimSpace(parsed.PrivateKeyPEM),
+		PrivateKeyPEM: priv,
+		PublicKeyPEM:  pub,
 	}, nil
 }
 

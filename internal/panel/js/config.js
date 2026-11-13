@@ -532,18 +532,27 @@ $('btnTraeSave').onclick = async () => {
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '保存 Trae 配置'; }
 };
+/* traeLoginBody 收集登录发起参数：storage.json 优先（它自带设备号）。 */
+function traeLoginBody() {
+  const body = {};
+  const storage = ($('traeLoginStorage').value || '').trim();
+  const devId = ($('traeLoginDeviceId').value || '').trim();
+  if (storage) body.storage_json = storage;
+  if (devId) body.device_id = devId;
+  return body;
+}
 $('btnTraeLogin').onclick = async () => {
   const btn = $('btnTraeLogin');
   btn.disabled = true;
   try {
-    const devId = ($('traeLoginDeviceId').value || '').trim();
-    const d = await api('trae/login/start', {
-      method: 'POST',
-      body: JSON.stringify(devId ? { device_id: devId } : {}),
-    });
-    const src = d.device_source === 'generated' ? '自动生成，签到会被拒'
-      : (d.device_source === 'shared' ? '与已有账号共用，一天只有一个能签成'
-        : (d.device_source === 'imported' ? '沿用已导入设备' : '手动指定'));
+    const d = await api('trae/login/start', { method: 'POST', body: JSON.stringify(traeLoginBody()) });
+    const src = {
+      storage: '来自 storage.json',
+      explicit: '手动指定',
+      imported: '沿用已导入设备',
+      shared: '与已有账号共用，一天只有一个能签成',
+      generated: '自动生成，登录会被拒（20405）',
+    }[d.device_source] || d.device_source;
     $('traeLoginHint').innerHTML = '授权链接已生成（设备 ' + esc(d.device_id || '') +
       ' · ' + esc(src) + '）：' +
       '<a href="' + esc(d.url) + '" target="_blank" rel="noopener">打开授权页</a>。' +
@@ -560,12 +569,13 @@ $('btnTraeFinish').onclick = async () => {
   btn.disabled = true;
   btn.textContent = '登录中…';
   try {
-    const devId = ($('traeLoginDeviceId').value || '').trim();
     const body = { callback_url: cb };
+    const devId = ($('traeLoginDeviceId').value || '').trim();
     if (devId) body.device_id = devId;
     const d = await api('trae/login/finish', { method: 'POST', body: JSON.stringify(body) });
     toast('登录成功：' + d.uid + (d.has_device_key ? '（含设备签名能力）' : '（无设备密钥，续期可能受限）'), 'ok');
     $('traeCallback').value = '';
+    $('traeLoginStorage').value = '';
     loadTraeConfig();
   } catch (e) { toast('登录失败：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '完成登录'; }
@@ -574,7 +584,6 @@ $('btnTraeImport').onclick = async () => {
   const raw = $('traeStorage').value.trim();
   const uid = $('traeStorageUid').value.trim();
   if (!raw) { toast('请粘贴 storage.json 内容或单条 icube 密文', 'err'); return; }
-  if (!uid) { toast('请填写要绑定的 uid', 'err'); return; }
   // 两种形态：整文件（{ 开头）或单条 "deviceId:密文"。
   let body;
   if (raw.startsWith('{')) {
@@ -590,6 +599,14 @@ $('btnTraeImport').onclick = async () => {
   btn.disabled = true;
   try {
     const d = await api('trae/import', { method: 'POST', body: JSON.stringify(body) });
+    if (d.matched_uids && !d.uid) {
+      // 未能自动确定账号：把候选展示出来让人确认（但不自动写入）。
+      const ids = (d.device_ids || []).join('、');
+      const cand = (d.matched_uids || []).join('、');
+      toast('已解析设备 ' + (ids || '?') + '；' + (cand ? '可绑定账号：' + cand : '没有可匹配的账号') +
+        '。请填写 uid 后重试', 'warn');
+      return;
+    }
     toast(d.message || '设备凭证已导入', 'ok');
     $('traeStorage').value = '';
     loadTraeConfig();

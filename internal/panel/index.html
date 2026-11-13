@@ -1220,20 +1220,28 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="hr"></div>
           <div class="fld"><span class="lb">添加账号（OAuth 登录）</span>
             <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-              <input id="traeLoginDeviceId" placeholder="设备号（可留空，见下方说明）" style="width:220px">
               <button type="button" class="xs" id="btnTraeLogin">1. 生成授权链接</button>
               <input id="traeCallback" placeholder="2. 浏览器完成授权后，粘贴地址栏完整 URL" style="flex:1;min-width:240px">
               <button type="button" class="xs" id="btnTraeFinish">完成登录</button>
             </div>
-            <span class="hint" id="traeLoginHint">Trae 用授权码 + PKCE 流程：生成链接 → 浏览器授权 → 复制地址栏 URL 粘贴回来。</span>
-            <span class="hint">设备号 = Trae 客户端 <code>storage.json</code> 里 <code>iCubeAuthInfo://icube-dc:&lt;数字&gt;</code> 键名中的那串数字（12~20 位，15/16 位都见过）。
-              <b>签到限额按设备算</b>：留空会用已导入的设备号或自动生成一个占位号，占位号签到必被拒（9074）——要签到就必须填真实设备号。</span></div>
-          <div class="fld"><span class="lb">导入设备凭证（可选，但强烈建议）</span>
+            <textarea id="traeLoginStorage" rows="3" placeholder="可选，但强烈建议：粘贴 Trae 客户端的 storage.json 全文（或只粘贴含 iCubeAuthInfo://icube-dc: 的那几行）&#10;留空的话登录会被上游拒成 20405 Device proof required" style="width:100%;margin-top:6px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px"></textarea>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px">
+              <input id="traeLoginDeviceId" placeholder="设备号（留空则从 storage.json 自动读取）" style="width:280px">
+            </div>
+            <span class="hint" id="traeLoginHint">Trae 用授权码 + PKCE 流程：填 storage.json → 生成链接 → 浏览器授权 → 复制地址栏 URL 粘贴回来。</span>
+            <span class="hint"><b>storage.json 是登录成功的关键</b>：AuthCode 兑换要求带 <code>DeviceInfo</code>（设备号 + 公钥），
+              没有它上游会拒成 <code>20405 Device proof required</code>。
+              文件位置（Windows）：<code>%APPDATA%\Trae CN\User\globalStorage\storage.json</code>。
+              只读取 <code>iCubeAuthInfo://icube-dc:</code> 条目与 <code>telemetry.machineId</code>，不会上传其它内容。</span>
+            <span class="hint"><b>签到限额按设备算</b>：一个设备号一天只有第一个账号能签成。
+              设备号 = 上面 <code>storage.json</code> 里 <code>iCubeAuthInfo://icube-dc:&lt;数字&gt;</code> 键名中的数字（12~20 位，15/16 位都见过）。</span></div>
+          <div class="fld"><span class="lb">给已有账号补设备凭证（可选）</span>
             <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
               <input id="traeStorage" placeholder="粘贴 Trae 客户端 storage.json 内容，或单条 icube 密文" style="flex:1;min-width:240px">
               <input id="traeStorageUid" placeholder="绑定到 uid" style="width:150px">
               <button type="button" class="xs" id="btnTraeImport">导入</button>
             </div>
+            <span class="hint">uid 是<b>已存在账号</b>的标识，在上方账号列表每行最左边（等宽字体）。新账号请用上面的登录流程，那里可以直接带 storage.json。</span>
             <span class="hint">设备私钥用于 token 续期签名（DeviceProof）。未导入时续期走无签名兜底变体，可能被上游拒绝。</span></div>
           <div class="hint" style="margin-top:10px">保存后立即生效（启用开关 / base / 账号列表热重载，无需重启）。</div>
         </div>

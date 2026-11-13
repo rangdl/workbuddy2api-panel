@@ -3,10 +3,14 @@ package trae
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha512"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"strings"
 	"testing"
 )
@@ -179,5 +183,75 @@ func TestIsValidDeviceID(t *testing.T) {
 		if got := IsValidDeviceID(c.in); got != c.want {
 			t.Errorf("IsValidDeviceID(%q) = %v, want %v", c.in, got, c.want)
 		}
+	}
+}
+
+// TestDecryptICubeDerivesPublicKey 明文只带私钥时，公钥应由私钥推导出来
+// （AuthCode 兑换要用 DevicePublicKey）。
+func TestDecryptICubeDerivesPublicKey(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemStr := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
+	body, _ := json.Marshal(map[string]string{"privateKeyPEM": pemStr})
+	env := encryptTC(t, string(body), false)
+
+	cred, err := DecryptICubeValue("1234567890123456", env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cred.PrivateKeyPEM == "" {
+		t.Error("私钥缺失")
+	}
+	if !strings.Contains(cred.PublicKeyPEM, "BEGIN PUBLIC KEY") {
+		t.Errorf("公钥未推导: %q", cred.PublicKeyPEM)
+	}
+	// 推导出的公钥必须与私钥配对。
+	parsed, err := ParseECPrivateKey(cred.PrivateKeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := PublicKeyPEM(parsed)
+	if cred.PublicKeyPEM != want {
+		t.Error("推导出的公钥与私钥不配对")
+	}
+}
+
+// TestDecryptICubePublicKeyOnly 只有公钥（无私钥）也应可用——AuthCode 兑换
+// 只需要公钥；旧实现会因为"缺少 privateKeyPEM"直接报错。
+func TestDecryptICubePublicKeyOnly(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := PublicKeyPEM(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]string{"publicKeyPEM": pub})
+	env := encryptTC(t, string(body), false)
+
+	cred, err := DecryptICubeValue("1234567890123456", env)
+	if err != nil {
+		t.Fatalf("只有公钥时不应报错: %v", err)
+	}
+	if cred.PrivateKeyPEM != "" {
+		t.Error("不应凭空产生私钥")
+	}
+	if strings.TrimSpace(cred.PublicKeyPEM) != strings.TrimSpace(pub) {
+		t.Error("公钥未原样保留")
+	}
+}
+
+// TestDecryptICubeNoKeys 公私钥都缺才报错。
+func TestDecryptICubeNoKeys(t *testing.T) {
+	env := encryptTC(t, `{"deviceId":"123"}`, false)
+	if _, err := DecryptICubeValue("1234567890123456", env); err == nil {
+		t.Error("公私钥都缺应报错")
 	}
 }

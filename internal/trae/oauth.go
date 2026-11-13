@@ -53,6 +53,11 @@ type LoginSession struct {
 	// DeviceID / MachineID 本次登录使用的设备标识（与签名私钥同源）。
 	DeviceID  string `json:"device_id"`
 	MachineID string `json:"machine_id"`
+	// PublicKeyPEM 设备公钥（来自登录时粘贴的 storage.json）。
+	// AuthCode 兑换需要它构造 DeviceInfo——没有公钥就会被上游拒成 20405。
+	PublicKeyPEM string `json:"public_key_pem"`
+	// PrivateKeyPEM 设备私钥（同上，仅用于后续 refresh 的 DeviceProof 签名）。
+	PrivateKeyPEM string `json:"private_key_pem"`
 	// CreatedAt 会话创建时刻（调用方据此判超时）。
 	CreatedAt time.Time `json:"created_at"`
 }
@@ -224,45 +229,67 @@ func (c *Client) ExchangeAuthCode(ctx context.Context, cfg *Config, authCode, ve
 
 	type variant struct {
 		tag     string
+		url     string // 空 = 新端点
 		payload map[string]any
 		withDev bool // 是否带 x-cloudide-token 空串头
 	}
 	var variants []variant
 
-	if cred != nil && cred.PrivateKeyPEM != "" {
-		priv, err := ParseECPrivateKey(cred.PrivateKeyPEM)
-		if err == nil {
-			pubPEM, _ := PublicKeyPEM(priv)
-			variants = append(variants, variant{
-				tag: "AuthCode+DeviceInfo",
-				payload: map[string]any{
-					"ClientID":     clientID,
-					"AuthCode":     authCode,
-					"CodeVerifier": verifier,
-					"DeviceInfo": map[string]any{
-						"DeviceID":        cred.DeviceID,
-						"MachineID":       cred.MachineID,
-						"PlatformCode":    PlatformCode,
-						"DeviceType":      "PC",
-						"DeviceName":      "",
-						"DeviceModel":     "",
-						"ClientVersion":   appVersion,
-						"DevicePublicKey": pubPEM,
-						"DeviceBrand":     "",
-						"DeviceCPU":       "",
-						"OSInfo":          "",
-						"OSVersion":       "",
-					},
-					"IDEVersion": appVersion,
-				},
-				withDev: true,
-			})
+	// 主变体：DeviceInfo（含 DevicePublicKey）。
+	//
+	// 关键：AuthCode 兑换**不需要设备私钥**（L0NE-6 实测），服务端只校验
+	// DeviceInfo 里的公钥与设备号是否匹配登录时登记的指纹。所以触发条件是
+	// 「有公钥」而不是「有私钥」——本地早先要求私钥，导致没导入凭证的机器
+	// 直接跳过这条唯一有把握的路径，落到必然失败的兜底变体上。
+	pubPEM := ""
+	if cred != nil {
+		pubPEM = strings.TrimSpace(cred.PublicKeyPEM)
+		if pubPEM == "" && cred.PrivateKeyPEM != "" {
+			if priv, err := ParseECPrivateKey(cred.PrivateKeyPEM); err == nil {
+				pubPEM, _ = PublicKeyPEM(priv)
+			}
 		}
 	}
-	// 兜底变体：无 DeviceInfo（本机无客户端凭证时的唯一路径）。
+	if cred != nil && pubPEM != "" {
+		variants = append(variants, variant{
+			tag: "AuthCode+DeviceInfo",
+			payload: map[string]any{
+				"ClientID":     clientID,
+				"AuthCode":     authCode,
+				"CodeVerifier": verifier,
+				"DeviceInfo": map[string]any{
+					"DeviceID":        cred.DeviceID,
+					"MachineID":       cred.MachineID,
+					"PlatformCode":    PlatformCode,
+					"DeviceType":      "PC",
+					"DeviceName":      "",
+					"DeviceModel":     "",
+					"ClientVersion":   appVersion,
+					"DevicePublicKey": pubPEM,
+					"DeviceBrand":     "",
+					"DeviceCPU":       "",
+					// 实测（bluechonk 2026-10）：服务端按**登录时登记的指纹**校验
+					// OSInfo/OSVersion，空串会被拒成 20405。
+					// 真实客户端在 Windows 上发的是 "Windows" + os.release()。
+					"OSInfo":    "Windows",
+					"OSVersion": "",
+				},
+				"IDEVersion": appVersion,
+			},
+			withDev: true,
+		})
+	}
+	// 兜底变体：无 DeviceInfo（本机无客户端凭证时的路径）。
+	//
+	// 关键：这两个形态**只能发旧端点**。新端点（/trae/api/v3）会校验 DeviceInfo
+	// 与 DeviceProof，只带平铺 DeviceID 的 payload 会被拒成
+	// `10101 无效参数: {__Message.field}`（实测）。L0NE-6 的三段链也是
+	// 「新端点 + DeviceInfo」→「旧端点 + AuthCode」→「旧端点 + Code」。
+	legacyURL := host + OAuthExchangePathLegacy
 	for _, key := range []string{"AuthCode", "Code"} {
 		variants = append(variants, variant{
-			tag: "AuthCode/" + key,
+			tag: "Legacy/" + key,
+			url: legacyURL,
 			payload: map[string]any{
 				"ClientID":     clientID,
 				key:            authCode,
@@ -276,7 +303,11 @@ func (c *Client) ExchangeAuthCode(ctx context.Context, cfg *Config, authCode, ve
 
 	var errs []string
 	for _, v := range variants {
-		pair, err := c.exchangeOnce(ctx, cfg, host+OAuthExchangePathNew, v.payload, deviceID, v.withDev)
+		url := v.url
+		if url == "" {
+			url = host + OAuthExchangePathNew
+		}
+		pair, err := c.exchangeOnce(ctx, cfg, url, v.payload, deviceID, v.withDev)
 		if c.Trace != nil {
 			c.Trace(v.tag, err == nil, err)
 		}
