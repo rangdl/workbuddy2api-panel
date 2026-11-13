@@ -1148,18 +1148,20 @@ func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
 //
 // 逐个账号向上游查（并发有上限，避免瞬时打满上游限流），失败只在对应账号上
 // 标 error，不影响其它账号——一个号 token 失效不该让整页空白。
+// packagesRow 「积分构成」单账号一行。
+type packagesRow struct {
+	UID      string                   `json:"uid"`
+	Nickname string                   `json:"nickname"`
+	Realm    string                   `json:"realm"`
+	Remain   int64                    `json:"remain"`
+	Size     int64                    `json:"size"`
+	Packages []upstream.CreditPackage `json:"packages"`
+	Error    string                   `json:"error,omitempty"`
+}
+
 func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	accts := p.cfg.Pool.List()
-	type row struct {
-		UID      string                   `json:"uid"`
-		Nickname string                   `json:"nickname"`
-		Realm    string                   `json:"realm"`
-		Remain   int64                    `json:"remain"`
-		Size     int64                    `json:"size"`
-		Packages []upstream.CreditPackage `json:"packages"`
-		Error    string                   `json:"error,omitempty"`
-	}
-	out := make([]row, len(accts))
+	out := make([]packagesRow, len(accts))
 
 	sem := make(chan struct{}, 3)
 	var wg sync.WaitGroup
@@ -1170,7 +1172,14 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			it := row{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
+			it := packagesRow{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
+			// Trae 账号走自己的积分接口：它的包结构与 CodeBuddy 完全不同
+			// （IDE/Work 双轨 product_id、周期制），不能共用 CreditPackages。
+			if s.Backend == "trae" {
+				p.fillTraePackages(&it, s.UID)
+				out[i] = it
+				return
+			}
 			a := p.cfg.Pool.AuthByUID(s.UID)
 			if a == nil {
 				it.Error = "account not loaded"

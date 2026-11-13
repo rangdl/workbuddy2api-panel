@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"log"
 	"strings"
 	"sync"
@@ -326,4 +327,61 @@ func (p *Panel) refreshTraeCredits() {
 		}
 		wg.Wait()
 	}()
+}
+
+// fillTraePackages 把 Trae 的积分包填进「积分构成」的行。
+//
+// 与 CodeBuddy 的差异：
+//   - 包按 product_id 分两类（208/其余 = IDE 通用积分，209 = Work 积分），
+//     面板上分开展示比混成一个数更有用；
+//   - 包是**周期制**（start_time/end_time），到期即失效，与一次性发放的包不同；
+//   - 上游给的是「已用」（usage.credits_amount），剩余 = 额度 - 已用。
+//
+// 失败只标 error 不影响其它账号——与本接口既有语义一致。
+func (p *Panel) fillTraePackages(it *packagesRow, uid string) {
+	if p.cfg.TraeClient == nil || p.cfg.TraePath == "" {
+		it.Error = "trae client not available"
+		return
+	}
+	cfg, err := trae.Load(p.cfg.TraePath, p.cfg.AuthDir)
+	if err != nil || cfg == nil {
+		it.Error = "trae.json 不存在或无法读取"
+		return
+	}
+	acc := cfg.AccountByUID(uid)
+	if acc == nil {
+		it.Error = "account not found in trae.json"
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), traeOpTimeout)
+	defer cancel()
+	sum, qerr := p.cfg.TraeClient.QueryCredits(ctx, cfg, acc)
+	if qerr != nil {
+		it.Error = qerr.Error()
+		return
+	}
+	packs := make([]upstream.CreditPackage, 0, len(sum.Packs))
+	for _, pk := range sum.Packs {
+		name := pk.GroupName
+		if name == "" {
+			name = "积分包"
+		}
+		// 标明 IDE / Work 归属：两者不可互换（对话只消耗 IDE 额度）。
+		if pk.IsWork() {
+			name += "（Work）"
+		} else {
+			name += "（通用）"
+		}
+		packs = append(packs, upstream.CreditPackage{
+			Name:   name,
+			Remain: int64(pk.Remaining()),
+			Used:   int64(pk.CreditsUsed),
+			Size:   int64(pk.CreditsLimit),
+			// EndTime 上游是 "2026-09-14 15:52:38" 形态，前端取日期部分展示。
+			EndTime: pk.EndTime,
+		})
+	}
+	it.Packages = packs
+	it.Remain = int64(sum.General) // 可用余额 = 通用积分（不含 Work）
+	it.Size = int64(sum.Limit)
 }
