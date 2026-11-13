@@ -338,6 +338,32 @@ func (p *Panel) refreshTraeCredits() {
 //   - 上游给的是「已用」（usage.credits_amount），剩余 = 额度 - 已用。
 //
 // 失败只标 error 不影响其它账号——与本接口既有语义一致。
+// normalizeTraeTime 把上游的「2026-09-14 15:52:38」转成前端约定形态
+// 「2026-09-14T15:52:38」。
+//
+// 为什么必须转：前端对 created_at 做 slice(0,16).replace('T',' ')，
+// 对 end_time 做 slice(0,10)。原样串里第 10 位是空格而非 'T'，
+// 直接透传会让「发放日期」列显示成 "2026-09-14 15:52" 之外的东西
+// （多余内容被截掉或残留），与 CodeBuddy 的展示对不齐。
+// 解析失败时原样返回，由前端兜底显示。
+func normalizeTraeTime(s string) string {
+	t, ok := trae.ParsePackTime(s)
+	if !ok {
+		return s
+	}
+	return t.Format("2006-01-02T15:04:05")
+}
+
+// traePackExpiresAt 到期时刻的 Unix 毫秒值（前端按它排序与计算剩余天数）。
+// 解析失败返回 0，前端会回落到 EndTime 字符串。
+func traePackExpiresAt(s string) int64 {
+	t, ok := trae.ParsePackTime(s)
+	if !ok {
+		return 0
+	}
+	return t.UnixMilli()
+}
+
 func (p *Panel) fillTraePackages(it *packagesRow, uid string) {
 	if p.cfg.TraeClient == nil || p.cfg.TraePath == "" {
 		it.Error = "trae client not available"
@@ -377,8 +403,13 @@ func (p *Panel) fillTraePackages(it *packagesRow, uid string) {
 			Remain: int64(pk.Remaining()),
 			Used:   int64(pk.CreditsUsed),
 			Size:   int64(pk.CreditsLimit),
-			// EndTime 上游是 "2026-09-14 15:52:38" 形态，前端取日期部分展示。
-			EndTime: pk.EndTime,
+			// 发放日期：Trae 的 StartTime 就是周期起算点（「2026-09-14 15:52:38」）。
+			// 前端按 created_at.slice(0,16) 展示，格式必须一致，否则会显示原样串。
+			CreatedAt: normalizeTraeTime(pk.StartTime),
+			// 到期日期：EndTime 同格式。
+			EndTime: normalizeTraeTime(pk.EndTime),
+			// ExpiresAt 是与 EndTime 同源的毫秒时间戳，供前端按精确剩余天数排序。
+			ExpiresAt: traePackExpiresAt(pk.EndTime),
 		})
 	}
 	it.Packages = packs

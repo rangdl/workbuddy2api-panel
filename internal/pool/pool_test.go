@@ -1142,9 +1142,16 @@ func TestFlushIdempotentWhenClean(t *testing.T) {
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
 	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
-	p.Flush() // 无 dirty，不应写盘
-	if _, err := os.Stat(fp); !os.IsNotExist(err) {
-		t.Fatalf("flush on clean pool should not write: %v", err)
+	p.Flush() // 首次：Add 置了 dirty，会写盘
+	if _, err := os.Stat(fp); err != nil {
+		t.Fatalf("首次 flush 应写盘: %v", err)
+	}
+	// 第二次：无变更，不应重写（mtime 不变）。
+	before, _ := os.Stat(fp)
+	p.Flush()
+	after, _ := os.Stat(fp)
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Error("无变更时 flush 不应重写文件")
 	}
 }
 

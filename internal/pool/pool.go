@@ -367,10 +367,18 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
+//
+// 必须置 dirty：否则新加入的账号（尤其是 Trae 这类不靠 SyncToDir 装载的）
+// 永远不会写进 state.json，其暂停/禁用等状态重启即丢。此前只调 upsertLocked，
+// 于是 Trae 账号在 state.json 里根本没有记录——面板暂停后重启变回未暂停。
 func (p *Pool) Add(a gateway.Account) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	before := len(p.byUID)
 	p.upsertLocked(a)
+	if len(p.byUID) != before {
+		p.dirty.Store(true) // 新账号：等待 flusher 落盘
+	}
 }
 
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
