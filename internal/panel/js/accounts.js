@@ -12,6 +12,34 @@ function setTableHTML(el, html) {
   el.innerHTML = html;
 }
 
+/* BACKEND_LABEL 上游标识 → 展示名。
+   多上游合池后，账号表按上游分组：调度虽然是统一的，但凭证形态、积分口径、
+   可用的运维动作都不一样，混在一起排会让人分不清哪一行能用哪些按钮。 */
+const BACKEND_LABEL = { codebuddy: 'WorkBuddy', trae: 'Trae' };
+
+/* groupByBackend 按上游分组，保持组内原有顺序。
+   未知 backend（将来新增的）归到「其他」，不会被吞掉。 */
+function groupByBackend(list) {
+  const order = [], groups = {};
+  for (const s of list) {
+    const k = s.backend || 'codebuddy';
+    if (!groups[k]) { groups[k] = []; order.push(k); }
+    groups[k].push(s);
+  }
+  return order.map(k => ({ backend: k, rows: groups[k] }));
+}
+
+/* backendSectionRow 组头行：上游名 + 该组账号数与可用数。 */
+function backendSectionRow(backend, rows) {
+  const label = BACKEND_LABEL[backend] || backend;
+  const usable = rows.filter(s => !s.disabled && !s.paused &&
+    !(s.cool_remaining_sec > 0)).length;
+  return '<tr class="acc-group"><td colspan="9">' +
+    '<span class="acc-group-name">' + esc(label) + '</span>' +
+    '<span class="acc-group-meta">' + rows.length + ' 个账号 · ' + usable + ' 可用</span>' +
+    '</td></tr>';
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
@@ -20,7 +48,12 @@ function renderAccounts(list) {
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
   const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
-  const html = list.map(s => {
+  const groups = groupByBackend(list);
+  // 只有一个上游时不出组头：单组的分组标签是纯噪音，还会把表格撑高一行。
+  const showGroups = groups.length > 1;
+  const html = groups.map(g => {
+    const head = showGroups ? backendSectionRow(g.backend, g.rows) : '';
+    return head + g.rows.map(s => {
     const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
     const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
@@ -68,7 +101,8 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') +
+        (s.backend === 'trae' ? ' <span class="realm-tag">Trae</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -81,13 +115,15 @@ function renderAccounts(list) {
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
-        // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
-        // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
-        // upstream 的 get-enterprise-user-usage 口径填充。
-        (s.enterprise ? '' :
+        // CodeBuddy 专属的三个按钮：签到 / 余额 / 任务。
+        // 不上 Trae 的原因：它的签到走面板「Trae 签到」区块（限额按设备算，
+        // 与账号维度不同），余额是 IDE/Work 双轨，任务体系完全不存在。
+        // 企业版同样不渲染（上游不支持个人成长体系）。
+        ((s.enterprise || s.backend === 'trae') ? '' :
           '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
-        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
-        (s.enterprise ? '' :
+        (s.backend === 'trae' ? '' :
+          '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>') +
+        ((s.enterprise || s.backend === 'trae') ? '' :
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
@@ -95,6 +131,7 @@ function renderAccounts(list) {
         (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
+    }).join('');
   }).join('');
   setTableHTML(tb, html);
 }

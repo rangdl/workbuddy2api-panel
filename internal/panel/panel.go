@@ -777,6 +777,14 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 }
 
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
+// traeAuthDir Trae 账号凭证目录（与 CodeBuddy 共用 auths/，文件名前缀区分）。
+func (p *Panel) traeAuthDir() string {
+	if p.cfg.AuthDir != "" {
+		return p.cfg.AuthDir
+	}
+	return trae.DefaultAuthDir(p.cfg.TraePath)
+}
+
 func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	acc := p.cfg.Pool.Remove(uid)
@@ -784,10 +792,15 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	// Remove 返回 gateway.Account；CodeBuddy 账号取出原始凭证以删除文件。
-	a := pool.UnwrapAuth(acc)
+	// 按上游删各自的凭证文件：CodeBuddy 是 auths/workbuddy-<uid>.json，
+	// Trae 是 auths/trae-<uid>.json。只删池条目不删文件会让账号在下次
+	// 扫描/热重载时"复活"。
 	fileMsg := ""
-	if a != nil && a.FilePath != "" {
+	if acc.Backend() == "trae" {
+		if err := trae.RemoveAccount(p.traeAuthDir(), acc.UID()); err != nil {
+			fileMsg = err.Error()
+		}
+	} else if a := pool.UnwrapAuth(acc); a != nil && a.FilePath != "" {
 		if err := os.Remove(a.FilePath); err != nil && !os.IsNotExist(err) {
 			fileMsg = err.Error()
 		}

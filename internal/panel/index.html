@@ -293,6 +293,12 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .rate-limit span { color: var(--ink-2); }
 .acts { display: flex; gap: 5px; justify-content: flex-end; white-space: nowrap; }
 .acts button { padding: 3.5px 8px; font-size: 12.5px; white-space: nowrap; flex: none; }
+/* 账号表的上游分组行：多上游合池后按 WorkBuddy / Trae 分组。
+   单上游时不渲染（见 accounts.js 的 showGroups），所以不影响既有观感。 */
+.acc-group td { padding: 10px 11px 6px; border-bottom: 1px solid var(--line); background: var(--surface-2); }
+.acc-group-name { font-weight: 600; font-size: 12.5px; color: var(--ink-2); }
+.acc-group-meta { margin-left: 8px; font-size: 11.5px; color: var(--ink-3); }
+
 /* Trae 账号表与账号池同构，但状态列标签更多（凭证/签到），给足宽度免挤压。 */
 .trae-acc-tbl td:nth-child(3) { min-width: 190px; }
 .trae-tags { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
