@@ -20,7 +20,7 @@ type anthropicFileConfig struct {
 	DefaultModel string            `json:"default_model"`
 }
 
-// anthropicConfigPath 返回 anthropic.json 的完整路径（与 config.json 同目录）。
+// anthropicConfigPath 返回 anthropic.json 的完整路径（与主配置同目录，即 config/）。
 func anthropicConfigPath(configPath string) string {
 	return filepath.Join(filepath.Dir(configPath), anthropicFileName)
 }

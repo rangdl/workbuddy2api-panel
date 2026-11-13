@@ -42,6 +42,8 @@ func usagePathFor(stateFile string) string { return stateSibling(stateFile, "usa
 
 // stateSibling 返回与 state 文件同目录的指定文件名路径（相对路径场景回落当前目录）。
 // usage.json（用量记录）与 output_probes.json（模型上限探测）共用本规则。
+// 注意：state 文件属于 data/ 类，副配置（responses/anthropic/...）不走这里，
+// 它们用 configFile 跟随 config/ 目录。
 func stateSibling(stateFile, name string) string {
 	dir := filepath.Dir(stateFile)
 	if dir == "" || dir == "." {
@@ -51,8 +53,22 @@ func stateSibling(stateFile, name string) string {
 }
 
 func main() {
-	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
+	cfgPath := flag.String("config", filepath.Join(configDirName, "config.json"),
+		"配置文件路径（默认 config/config.json；不存在时自动生成推荐配置并创建目录）")
 	flag.Parse()
+
+	// 布局与迁移：必须在 Load 之前。
+	//   - 旧版把配置文件平铺在启动目录，新版收进 config/ 与 data/。
+	//   - 只有用默认路径时才做迁移；显式 -config 是调用方的明确意图，不该被改写。
+	lay := newLayout(*cfgPath)
+	if err := lay.Ensure(); err != nil {
+		log.Printf("WARN: 创建配置目录失败（继续尝试启动）: %v", err)
+	}
+	if *cfgPath == filepath.Join(configDirName, "config.json") {
+		if n := lay.Migrate(); n > 0 {
+			log.Printf("[migrate] 共迁移 %d 个文件到 %s/ 与 %s/（旧文件已保留）", n, lay.ConfigDir, lay.DataDir)
+		}
+	}
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
@@ -74,6 +90,9 @@ func main() {
 			log.Fatalf("load config: %v", err)
 		}
 	}
+	// 副配置补齐：responses / anthropic / third_party / trae 缺失时写默认样例。
+	// 放在主配置加载之后（此时目录已确保存在），各 load*Config 之前。
+	ensureAllConfigs(*cfgPath)
 
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
@@ -184,9 +203,9 @@ func main() {
 		log.Printf("DNS: 出站解析用 %v（不走系统 /etc/resolv.conf）", cfg.DNSServers)
 	}
 	// model.json 本地缓存接线（context_length/max_output_tokens 四级查找链第 3 级）：
-	// 数据目录与 state.json 同风格（Docker volume 持久化路径）。首次缺失/损坏自动
-	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
-	upstream.SetModelCatalogPath(stateSibling(cfg.StateFile, "model.json"))
+	// 归到 config/ 而不是 data/——它虽是缓存，但用户会手改模型上限，属于「人读人改」类。
+	// 首次缺失/损坏自动回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
+	upstream.SetModelCatalogPath(lay.File(lay.ConfigDir, "model.json"))
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
