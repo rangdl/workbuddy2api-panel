@@ -191,7 +191,7 @@ func (b *Backend) Credits(ctx context.Context, acc gateway.Account) (*gateway.Cr
 		if p.IsWork() || p.Remaining() <= 0 {
 			continue
 		}
-		if t, ok := parsePackTime(p.EndTime); ok {
+		if t, ok := traepkg.ParsePackTime(p.EndTime); ok {
 			if out.Earliest.IsZero() || t.Before(out.Earliest) {
 				out.Earliest = t
 			}

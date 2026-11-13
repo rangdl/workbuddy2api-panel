@@ -5,14 +5,16 @@ package panel
 
 import (
 	"context"
-	"net/http"
-	"time"
-
-	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"log"
+	"net/http"
+	"sort"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // traeOpTimeout 单次运维操作的超时（签到含 status 预检 + claim，两个上游往返）。
@@ -140,9 +142,7 @@ func (p *Panel) traeAccountCredits(w http.ResponseWriter, r *http.Request) {
 		// 与 CodeBuddy 同口径：credits 存"可用于对话的额度"。
 		// Trae 必须用 General（product_id != 209），不能用 Total——
 		// Total 含 Work 积分，而对话只消耗 IDE 额度，会让快耗尽的号看起来满额。
-		if p.cfg.Pool != nil {
-			p.cfg.Pool.SetCredits(uid, int64(sum.General), int64(sum.Limit))
-		}
+		p.applyTraeCreditsToPool(uid, sum)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "credits": sum})
 }
@@ -384,4 +384,92 @@ func (p *Panel) fillTraePackages(it *packagesRow, uid string) {
 	it.Packages = packs
 	it.Remain = int64(sum.General) // 可用余额 = 通用积分（不含 Work）
 	it.Size = int64(sum.Limit)
+}
+
+// applyTraeCreditsToPool 把 Trae 的积分与**到期批次**写进池。
+//
+// 为什么不能只调 SetCredits：池里给面板用的还有「积分到期提醒」（首页卡片）
+// 与「积分构成」的到期排布，两者的数据源都是 Status.CreditsExpiryBuckets。
+// 只设余额不设批次，Trae 账号在这两处就永远显示「无近期到期批次」。
+//
+// 转换要点：
+//   - Trae 的包是**周期制**，EndTime 是「2026-09-14 15:52:38」这类上游原样
+//     字符串而非 RFC3339，需要单独解析（ParsePackTime 已处理多种形态）；
+//   - 只统计**通用积分**（product_id != 209）：Work 积分不能用于对话，
+//     混进到期提醒会让用户以为那部分也能抵扣对话；
+//   - 同一自然日的多个包合并成一个批次（与 CodeBuddy 的同口径聚合一致）；
+//   - 已过期或零剩余的包不计入。
+func (p *Panel) applyTraeCreditsToPool(uid string, sum *trae.CreditsSummary) {
+	if p.cfg.Pool == nil || sum == nil {
+		return
+	}
+	p.cfg.Pool.SetCreditsSnapshot(uid, traeCreditsSnapshot(sum, time.Now()))
+}
+
+// traeCreditsSnapshot 把 Trae 的积分包转换成池侧的余额快照。
+//
+// 抽成纯函数是为了可测：转换规则（只算通用积分、同日合并、跳过过期）
+// 每条都是易错的取舍，而 applyTraeCreditsToPool 依赖真实 Panel 与池。
+func traeCreditsSnapshot(sum *trae.CreditsSummary, now time.Time) pool.CreditsSnapshot {
+	snap := pool.CreditsSnapshot{
+		Remain: int64(sum.General),
+		Total:  int64(sum.Limit),
+	}
+	type dayAgg struct {
+		at     time.Time
+		remain int64
+	}
+	byDay := make(map[string]*dayAgg, len(sum.Packs))
+	for _, pk := range sum.Packs {
+		if pk.IsWork() {
+			continue // Work 积分不参与对话抵扣
+		}
+		remain := int64(pk.Remaining())
+		if remain <= 0 {
+			continue
+		}
+		at, ok := trae.ParsePackTime(pk.EndTime)
+		if !ok || !at.After(now) {
+			continue // 无到期时间或已过期：不进入到期提醒
+		}
+		day := at.Format("2006-01-02")
+		if a, exists := byDay[day]; exists {
+			a.remain += remain
+			if at.Before(a.at) {
+				a.at = at
+			}
+			continue
+		}
+		byDay[day] = &dayAgg{at: at, remain: remain}
+	}
+	days := make([]string, 0, len(byDay))
+	for d := range byDay {
+		days = append(days, d)
+	}
+	sort.Strings(days)
+	buckets := make([]pool.ExpiryBucket, 0, len(days))
+	for _, d := range days {
+		a := byDay[d]
+		buckets = append(buckets, pool.ExpiryBucket{
+			Date:     d,
+			ExpireAt: a.at,
+			Remain:   a.remain,
+		})
+	}
+	snap.ExpiryBuckets = buckets
+	if len(buckets) > 0 {
+		snap.EarliestAt = buckets[0].ExpireAt
+		snap.EarliestRemaining = buckets[0].Remain
+		// Expiring = 快过期窗口内的剩余，沿用池侧 7 天口径
+		// （与 CodeBuddy 的 ExpiringSoonWindow 语义对齐）。
+		const soonWindow = 7 * 24 * time.Hour
+		var expiring int64
+		for _, b := range buckets {
+			if b.ExpireAt.Sub(now) <= soonWindow {
+				expiring += b.Remain
+			}
+		}
+		snap.Expiring = expiring
+	}
+	return snap
 }
