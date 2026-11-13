@@ -115,16 +115,19 @@ function renderAccounts(list) {
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
-        // CodeBuddy 专属的三个按钮：签到 / 余额 / 任务。
-        // 不上 Trae 的原因：它的签到走面板「Trae 签到」区块（限额按设备算，
-        // 与账号维度不同），余额是 IDE/Work 双轨，任务体系完全不存在。
-        // 企业版同样不渲染（上游不支持个人成长体系）。
-        ((s.enterprise || s.backend === 'trae') ? '' :
-          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
-        (s.backend === 'trae' ? '' :
-          '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>') +
-        ((s.enterprise || s.backend === 'trae') ? '' :
-          '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
+        // 按上游渲染对应的账号级操作（同为两个字）。
+        //   签到 / 余额：两边都有，但链路完全不同（Trae 限额按设备算、
+        //     余额是 IDE/Work 双轨），data-b 带上上游让 click 分发走对接口。
+        //   任务 / 同步：CodeBuddy 是成长任务，Trae 没有任务体系但有昵称同步
+        //     （Trae 的 JWT 无用户名字段，昵称只能从 GetUserInfo 拉）。
+        // 企业版无个人成长体系，签到与任务都不渲染。
+        ((s.enterprise) ? '' :
+          '<button class="xs ghost" data-a="checkin" data-b="' + esc(s.backend || 'codebuddy') + '" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
+        '<button class="xs ghost" data-a="balance" data-b="' + esc(s.backend || 'codebuddy') + '" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
+        ((s.enterprise) ? '' :
+          (s.backend === 'trae'
+            ? '<button class="xs ghost" data-a="syncname" data-u="' + esc(s.uid) + '" title="从上游 GetUserInfo 拉取昵称">昵称</button>'
+            : '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>')) +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
                             : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
@@ -208,17 +211,41 @@ async function loadOverview(quiet) {
 $('accBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-a]');
   if (!b) return;
-  const u = b.dataset.u, a = b.dataset.a;
+  const u = b.dataset.u, a = b.dataset.a, be = b.dataset.b || 'codebuddy';
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
   if (a === 'disable' && !confirm('禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
   b.disabled = true;
   try {
     if (a === 'checkin') {
-      const r = await api('accounts/' + encodeURIComponent(u) + '/checkin', { method: 'POST' });
-      toast('签到完成' + (r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
+      if (be === 'trae') {
+        // Trae 签到走独立接口：限额按设备算（9095），与账号维度不同。
+        const r = await api('trae/accounts/' + encodeURIComponent(u) + '/checkin', { method: 'POST' });
+        if (r.ok && r.device_already) toast(u + ' 该设备今日已签到（限额按设备算）', 'warn');
+        else if (r.ok && r.unverified) toast(u + ' 领取成功但回查未确认，下轮重试', 'warn');
+        else if (r.ok) toast(u + (r.already ? ' 今日已签到' : ' 签到成功' + (r.reward > 0 ? ' +' + r.reward : '')), 'ok');
+        else toast('签到失败：' + (r.message || '未知错误'), 'err');
+      } else {
+        const r = await api('accounts/' + encodeURIComponent(u) + '/checkin', { method: 'POST' });
+        toast('签到完成' + (r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
+      }
     } else if (a === 'balance') {
-      const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
-      toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
+      if (be === 'trae') {
+        // Trae 余额是 IDE/Work 双轨，展示两个数而不是单一总量。
+        const r = await api('trae/accounts/' + encodeURIComponent(u) + '/credits', { method: 'POST' });
+        if (r.ok && r.credits) {
+          const c = r.credits;
+          const num = v => (typeof v === 'number' && isFinite(v)) ? Math.round(v).toLocaleString() : '—';
+          toast('通用 ' + num(c.general) + ' / Work ' + num(c.work) +
+            '（合计 ' + num(c.total) + '，额度 ' + num(c.limit) + '）', 'ok');
+        } else toast('余额查询失败：' + (r.message || '未知错误'), 'err');
+      } else {
+        const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
+        toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
+      }
+    } else if (a === 'syncname') {
+      // 单个账号的昵称同步（Trae 的 JWT 无用户名字段）。
+      const r = await api('trae/sync_profiles', { method: 'POST' });
+      toast('昵称同步完成：更新 ' + (r.updated || 0) + ' 个' + (r.failed ? '，失败 ' + r.failed + ' 个' : ''), r.failed ? 'warn' : 'ok');
     } else if (a === 'revive') {
       await api('accounts/' + encodeURIComponent(u) + '/revive', { method: 'POST' });
       toast('已解冻', 'ok');

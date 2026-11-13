@@ -316,7 +316,10 @@ func TestSchedulerTickDedup(t *testing.T) {
 	}
 }
 
-// TestSchedulerTickHourGate 非配置时点不执行。
+// TestSchedulerTickHourGate 时点闸门：已过点即补跑，未到点不跑。
+//
+// 语义变更说明：原实现要求精确命中配置小时，服务在那一刻没运行就整天错过。
+// 现在改为「当天已有配置时点过去」即补跑（同日仍只跑一次）。
 func TestSchedulerTickHourGate(t *testing.T) {
 	srv := newSchedServer(t)
 	cfg := schedCfg(srv.URL, Account{UID: "u-ok", AccessToken: "t1", DeviceID: "dev-ok"})
@@ -324,13 +327,37 @@ func TestSchedulerTickHourGate(t *testing.T) {
 	cfg.Schedule.Hours = []int{9, 21}
 	s := NewScheduler(func() *Config { return cfg }, NewClient(), NewCooldowns())
 
-	s.tick(context.Background(), time.Date(2026, 9, 27, 10, 0, 0, 0, time.Local))
+	// 8:00：两个时点都没到 → 不执行。
+	s.tick(context.Background(), time.Date(2026, 9, 27, 8, 0, 0, 0, time.Local))
 	if got, _ := s.LastOutcomes(); len(got) != 0 {
-		t.Error("非配置时点不应执行")
+		t.Error("8:00 尚未到任何配置时点，不应执行")
 	}
-	s.tick(context.Background(), time.Date(2026, 9, 27, 21, 0, 0, 0, time.Local))
+	// 10:00：9 点已过 → 补跑。
+	s.tick(context.Background(), time.Date(2026, 9, 27, 10, 0, 0, 0, time.Local))
 	if got, _ := s.LastOutcomes(); len(got) == 0 {
-		t.Error("配置时点应执行")
+		t.Error("10:00 应补跑 9 点那轮")
+	}
+}
+
+// TestSchedulerCatchesUpAfterMissedHour 服务在配置时点之后才启动，仍应补跑。
+func TestSchedulerCatchesUpAfterMissedHour(t *testing.T) {
+	srv := newSchedServer(t)
+	cfg := schedCfg(srv.URL, Account{UID: "u-ok", AccessToken: "t1", DeviceID: "dev-ok"})
+	cfg.Schedule.Enabled = true
+	cfg.Schedule.Hours = []int{2}
+	s := NewScheduler(func() *Config { return cfg }, NewClient(), NewCooldowns())
+
+	// 15:00 启动：2 点早过了，应补跑而不是等到明天。
+	s.tick(context.Background(), time.Date(2026, 9, 27, 15, 0, 0, 0, time.Local))
+	if got, _ := s.LastOutcomes(); len(got) == 0 {
+		t.Error("错过 2 点后应在当天首个 tick 补跑")
+	}
+	// 同日再 tick 不重复。
+	before, _ := s.LastOutcomes()
+	s.tick(context.Background(), time.Date(2026, 9, 27, 16, 0, 0, 0, time.Local))
+	after, _ := s.LastOutcomes()
+	if len(after) != len(before) {
+		t.Error("同日不应重复签到")
 	}
 }
 

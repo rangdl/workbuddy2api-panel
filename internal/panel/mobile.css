@@ -144,6 +144,16 @@
   #traeAccBody tr > .usage-cell { grid-column: 4 / 13; order: 2; }
   #traeAccBody tr > .acts { order: 3; }
 
+  /* 限流提示块：桌面端 .rate-limits 带 min-width:210px，卡片模式只有 ~160px 宽，
+     不清掉会把整张卡片撑破（截图实测）。改为随卡片宽度自适应并允许换行。 */
+  .acc .rate-limits { min-width: 0; max-width: 100%; }
+  .acc .rate-limit {
+    min-width: 0; max-width: 100%;
+    flex-wrap: wrap; align-items: flex-start;
+    overflow-wrap: anywhere; word-break: break-word;
+  }
+  .acc .rate-limit b, .acc .rate-limit span { min-width: 0; overflow-wrap: anywhere; }
+
   /* 模型锁池（v1.12.0 新增，8 列）：模型 / 域 / 状态 / 可选·总数 / 锁定账号 / 最早解锁 / 全池解锁 / 原因 */
   #mlBody tr > td:nth-child(1) { grid-column: 1 / 9; }
   #mlBody tr > td:nth-child(2) { grid-column: 9 / 13; justify-content: flex-end; }

@@ -128,6 +128,8 @@ type Panel struct {
 	// traeCheckin Trae 逐账号签到状态缓存（见 trae_config.go 的
 	// fillTraeCheckinStatus）：切视图会重新拉配置，缓存避免重复打上游。
 	traeCheckin traeCheckinCache
+	// traeCredit Trae 积分自动刷新的节流表（见 trae_ops.go 的 refreshTraeCredits）。
+	traeCredit traeCreditCache
 
 	// taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 	// （单任务 / 全量）同时只允许一条在跑。重复点击直接返回 409"仍在执行"，
@@ -319,6 +321,11 @@ func poolExpiryBuckets(in []upstream.ExpiryBucket) []pool.ExpiryBucket {
 func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	// 用 WithPaused 而不是 CountsDetailed：后者把暂停号并进 disabled（/status 的
 	// 「不可用」口径），而概况卡片要分开展示（issue #125）。
+	// 把 Trae 账号的已知积分同步进池（不发上游请求，只用 TraeStats 里已有的
+	// 缓存值）。没有这一步，Trae 账号在账号池页面恒显示 0——它的积分来自
+	// GetCredits 接口，而池的 credits 字段只有 CodeBuddy 的余额刷新在写。
+	p.syncTraeCreditsToPool()
+	p.refreshTraeCredits()
 	total, healthy, cooling, disabled, paused, inFlightFull := p.cfg.Pool.CountsDetailedWithPaused()
 	sticky := 0
 	if p.cfg.StickyCount != nil {

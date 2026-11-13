@@ -121,10 +121,27 @@ func (p *Panel) traeAccountCredits(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "uid": uid, "message": err.Error()})
 		return
 	}
-	// 回写运行期统计：面板的积分列优先用这份权威数据（含额度上限），
-	// 直到下一次对话的 notify_usage 覆盖它。
-	if p.cfg.TraeStats != nil && sum != nil {
-		p.cfg.TraeStats.NoteCredits(uid, sum.General, sum.Work, sum.Total, sum.Limit)
+	// 回写两处：
+	//   1) TraeStats —— 面板「Trae 签到」区块的积分列；
+	//   2) pool —— 账号池页面的积分列与选号权重都读它。
+	// 此前只写了前者，于是账号池里 Trae 账号的积分恒为 0。
+	if sum != nil {
+		if p.cfg.TraeStats != nil {
+			// 先取旧值算余额差（校准用），再写入新值。
+			if prev := p.cfg.TraeStats.Get(uid); prev.HasCredits && prev.CreditsAt != nil {
+				if delta := prev.Credits - sum.General; delta > 0 {
+					log.Printf("[trae] 余额差 acct=%s 上次=%.2f 当前=%.2f 消耗=%.2f",
+						uid, prev.Credits, sum.General, delta)
+				}
+			}
+			p.cfg.TraeStats.NoteCredits(uid, sum.General, sum.Work, sum.Total, sum.Limit)
+		}
+		// 与 CodeBuddy 同口径：credits 存"可用于对话的额度"。
+		// Trae 必须用 General（product_id != 209），不能用 Total——
+		// Total 含 Work 积分，而对话只消耗 IDE 额度，会让快耗尽的号看起来满额。
+		if p.cfg.Pool != nil {
+			p.cfg.Pool.SetCredits(uid, int64(sum.General), int64(sum.Limit))
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "credits": sum})
 }
@@ -213,4 +230,100 @@ func (p *Panel) traeSyncProfiles(w http.ResponseWriter, r *http.Request) {
 		p.reloadTrae()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "updated": updated, "failed": failed})
+}
+
+// syncTraeCreditsToPool 把 TraeStats 里缓存的积分同步进池。
+//
+// 为什么需要：池的 credits 字段是选号权重的第一因子，也是账号池页面积分列的
+// 数据源。CodeBuddy 由 scheduler 的余额刷新写入，Trae 的积分只能来自
+// GetCredits 接口（chat 流里没有扣费字段，只有 notify_usage 的剩余额度）。
+//
+// 刻意**不发上游请求**：本函数在每次 overview 轮询（5 秒）时被调用，
+// 打上游会白白消耗额度。真正刷新由「余额」按钮或对话中的 notify_usage 触发。
+func (p *Panel) syncTraeCreditsToPool() {
+	if p.cfg.TraeStats == nil || p.cfg.Pool == nil {
+		return
+	}
+	for _, st := range p.cfg.TraeStats.Snapshot() {
+		if !st.HasCredits {
+			continue // 从未查过：保持池里原值（可能是上次进程的持久化数据）
+		}
+		p.cfg.Pool.SetCredits(st.UID, int64(st.Credits), int64(st.CreditsLimit))
+	}
+}
+
+// traeCreditTTL 积分自动刷新的最小间隔。
+//
+// 目的：让账号池页面首次打开就能看到 Trae 积分，同时避免每 5 秒轮询都打上游。
+// 积分变化是分钟级的（对话扣费），5 分钟一次足够，且与 CodeBuddy 的余额
+// 后台刷新间隔同量级。
+const traeCreditTTL = 5 * time.Minute
+
+// traeCreditCache 逐账号积分刷新时刻（防止 overview 高频轮询打爆上游）。
+type traeCreditCache struct {
+	mu sync.Mutex
+	at map[string]time.Time
+}
+
+// refreshTraeCredits 在后台按需刷新 Trae 账号积分（非阻塞）。
+//
+// 由 overview 调用：过期的账号异步查一次，本次响应仍用缓存值（首次会显示 0，
+// 下一个 5 秒轮询就有了）。这样面板加载不会因为等上游而变慢。
+func (p *Panel) refreshTraeCredits() {
+	if p.cfg.TraeClient == nil || p.cfg.TraePath == "" || p.cfg.Pool == nil {
+		return
+	}
+	cfg, err := trae.Load(p.cfg.TraePath, p.cfg.AuthDir)
+	if err != nil || cfg == nil || !cfg.Enabled {
+		return
+	}
+	now := time.Now()
+	p.traeCredit.mu.Lock()
+	if p.traeCredit.at == nil {
+		p.traeCredit.at = make(map[string]time.Time)
+	}
+	var due []*trae.Account
+	for i := range cfg.Accounts {
+		a := &cfg.Accounts[i]
+		if a.Disabled || a.AccessToken == "" {
+			continue
+		}
+		if now.Sub(p.traeCredit.at[a.UID]) < traeCreditTTL {
+			continue
+		}
+		p.traeCredit.at[a.UID] = now // 先占位，避免并发重复查询
+		due = append(due, a)
+	}
+	p.traeCredit.mu.Unlock()
+	if len(due) == 0 {
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), traeOpTimeout)
+		defer cancel()
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 3)
+		for _, a := range due {
+			wg.Add(1)
+			go func(acc *trae.Account) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				sum, qerr := p.cfg.TraeClient.QueryCredits(ctx, cfg, acc)
+				if qerr != nil || sum == nil {
+					// 失败：清掉占位让下次重试（可能 token 过期需人工处理）。
+					p.traeCredit.mu.Lock()
+					delete(p.traeCredit.at, acc.UID)
+					p.traeCredit.mu.Unlock()
+					return
+				}
+				if p.cfg.TraeStats != nil {
+					p.cfg.TraeStats.NoteCredits(acc.UID, sum.General, sum.Work, sum.Total, sum.Limit)
+				}
+				p.cfg.Pool.SetCredits(acc.UID, int64(sum.General), int64(sum.Limit))
+			}(a)
+		}
+		wg.Wait()
+	}()
 }

@@ -77,6 +77,8 @@ type StatView struct {
 	CreditsLimit float64 `json:"credits_limit,omitempty"`
 	// CreditsAt 积分数据的观测时刻（前端标注「x 分钟前」）。
 	CreditsAt *time.Time `json:"credits_at,omitempty"`
+	// HasCredits 是否有过至少一次积分观测（false = Credits 字段无意义）。
+	HasCredits bool `json:"has_credits,omitempty"`
 }
 
 // TokenUsageView 与 pool.TokenUsage 字段同名，前端 formatTokenCount 等可直接复用。
@@ -291,6 +293,7 @@ func viewOf(uid string, e *statEntry) StatView {
 		v.TokenUsage.LastTokensPerSecond = &tps
 	}
 	if e.hasCredits {
+		v.HasCredits = true
 		v.Credits = e.creditsIDE + e.creditsWork
 		v.CreditsIDE = e.creditsIDE
 		v.CreditsWork = e.creditsWork

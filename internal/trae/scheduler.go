@@ -88,7 +88,14 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 	if cfg == nil || !cfg.Enabled || !cfg.Schedule.Enabled {
 		return
 	}
-	if !hourMatches(cfg.Schedule.Hours, now.Hour()) {
+	// 补跑语义：**已过点**即执行，而不是只在整点那一分钟命中。
+	//
+	// 原实现要求 now.Hour() 精确等于配置时点，于是服务在 2:00 那一刻没运行
+	// （重启/部署/休眠）就整天错过，且没有任何补救。现在按「当天是否已有
+	// 配置时点过去」判定：2 点配置在 2:00–23:59 任何时刻首次 tick 都会补跑。
+	//
+	// 去重仍由 lastRunDay 承担（当天只跑一次），所以补跑不会重复签。
+	if !anyHourPassed(cfg.Schedule.Hours, now.Hour()) {
 		return
 	}
 	day := now.Format("2006-01-02")
@@ -100,7 +107,7 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 	s.lastRunDay = day
 	s.mu.Unlock()
 
-	log.Printf("[trae] 自动签到开始（%s %02d 点）", day, now.Hour())
+	log.Printf("[trae] 自动签到开始（%s %02d 点，配置时点 %v）", day, now.Hour(), cfg.Schedule.Hours)
 	outcomes := s.RunOnce(ctx)
 	ok, already, failed := 0, 0, 0
 	for _, o := range outcomes {
@@ -281,6 +288,20 @@ func (s *Scheduler) LastOutcomes() ([]CheckinOutcome, time.Time) {
 func hourMatches(hours []int, h int) bool {
 	for _, v := range hours {
 		if v == h {
+			return true
+		}
+	}
+	return false
+}
+
+// anyHourPassed 当天是否已有配置时点过去（含当前小时）。
+//
+// 用于补跑：配置 2 点时，2:00–23:59 的任何 tick 都返回 true，
+// 这样服务在 2 点没运行时能在当天后续首次 tick 补上。
+// 跨零点不补（昨天的时点不该在今天执行）。
+func anyHourPassed(hours []int, nowHour int) bool {
+	for _, h := range hours {
+		if h >= 0 && h <= 23 && nowHour >= h {
 			return true
 		}
 	}

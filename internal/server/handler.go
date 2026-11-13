@@ -612,6 +612,9 @@ func (h *Handler) modelList() []map[string]any {
 			out = append(out, entry)
 		}
 	}
+	// Trae 模型并入同一份列表：倍率走同一个 credits 字段（"x0.15"），
+	// 客户端不需要区分上游就能看到定价。显式前缀形态见 traeModelEntries。
+	out = append(out, h.traeModelEntries()...)
 	return out
 }
 

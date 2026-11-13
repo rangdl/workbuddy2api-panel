@@ -454,6 +454,9 @@ func main() {
 		return tcfg
 	}))
 
+	// Trae 原始事件转储（TRAE_RAW_DUMP=1 时开启，排障用）。
+	server.InitTraeRawDump()
+
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,

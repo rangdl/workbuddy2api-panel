@@ -65,6 +65,9 @@ type chatStat struct {
 	cacheHit  int64
 	cacheMiss int64
 	hasCache  bool
+	// creditEstimated 积分是**估算**（Trae 的 chat 流不含扣费字段，按 token×倍率推算）。
+	// 日志里标成 credit≈ 以区别于上游实测值。
+	creditEstimated bool
 
 	// 调用来源（客户端 IP / User-Agent）。空 = 未采集（logging.request_client_info
 	// 关闭，或非 chat 路径），展示层一律以 "-" 兜底。
@@ -90,7 +93,8 @@ func (s *chatStat) done() {
 	}
 	s.logged = true
 	logChatRowEx(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks,
-		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent)
+		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent,
+		s.cacheHit, s.cacheMiss, s.hasCache, s.creditEstimated)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -542,14 +546,14 @@ const (
 //     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
 //   - toks<0 表示 usage 缺失，显示 "-"。
 func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) {
-	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "")
+	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "", 0, 0, false, false)
 }
 
 // logChatRowEx 是带请求 ID、结果、重试、积分与调用来源字段的扩展流水行。旧调用保持
 // 原格式；requestID 非空时才追加扩展字段；来源两参均为空时不追加来源段。
 func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
 	requestID, outcome string, attempts int, credit float64, hasCredit bool,
-	clientIP, userAgent string) {
+	clientIP, userAgent string, cacheHit, cacheMiss int64, hasCache, creditEstimated bool) {
 	if !chatLogEnabled {
 		return
 	}
@@ -561,6 +565,12 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 	tokpsField := "-"
 	if toks >= 0 {
 		tokField = fmt.Sprintf("%d", toks)
+		// 缓存命中率直接标在 tok 后面：同样的 completion 数，命中率高说明
+		// 输入几乎全走缓存、实际扣费低——这是排查「为什么这次扣得多」的第一线索。
+		if hasCache && cacheHit+cacheMiss > 0 {
+			pct := int(float64(cacheHit) / float64(cacheHit+cacheMiss) * 100)
+			tokField = fmt.Sprintf("%d(c%d%%)", toks, pct)
+		}
 		// 速率与用量账本走同一个函数（扣掉 TTFB）。此前这里自己除 total，漏扣首
 		// token 等待，于是控制台流水行的 tok/s 与面板数字对不上（issue #34）——
 		// 本函数本来就收到了 ttfb，只是没拿它算速率。
@@ -574,19 +584,32 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	extra := ""
-	if requestID != "" {
-		if outcome == "" {
-			outcome = reqlog.OutcomeHTTPError
-			if status >= 200 && status < 300 {
-				outcome = reqlog.OutcomeSuccess
-			}
+	// out 与 credit 独立于 rid 输出。
+	//
+	// 此前这两个字段被包在 `if requestID != ""` 里，而 requestID 全代码库
+	// 从未被赋值——于是 credit 列从来没出现过，CodeBuddy 的实测扣费也被
+	// 一起吞掉。现在只要有一项有值就输出。
+	if outcome == "" {
+		outcome = reqlog.OutcomeHTTPError
+		if status >= 200 && status < 300 {
+			outcome = reqlog.OutcomeSuccess
 		}
-		creditField := "-"
-		if hasCredit {
+	}
+	creditField := "-"
+	if hasCredit {
+		// credit≈ 表示是估算值（Trae 无扣费字段，按 token×倍率推算）；
+		// 无 ≈ 的是上游实测（CodeBuddy 的 usage.credit）。
+		if creditEstimated {
+			creditField = fmt.Sprintf("≈%.4f", credit)
+		} else {
 			creditField = fmt.Sprintf("%.4f", credit)
 		}
+	}
+	extra := ""
+	if requestID != "" {
 		extra = fmt.Sprintf(" rid=%s | out=%s | try=%d | credit=%s |", requestID, outcome, attempts, creditField)
+	} else {
+		extra = fmt.Sprintf(" out=%s | credit=%s |", outcome, creditField)
 	}
 	// 调用来源：IP 用可解析的裸值（便于 grep），UA 用 ShortUA 压缩后的客户端标签
 	// 并加引号（标签内可能含空格，如 `OpenAI/Python 1.30.0` 只会取到 OpenAI/Python）。
