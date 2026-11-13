@@ -71,7 +71,7 @@ func TestSequentialExhaustTemporaryAndModelIsolation(t *testing.T) {
 		wantPick(t, p, nil, "m", "cn", "a")
 	}
 	p.NoteError("a")
-	wantPick(t, p, map[string]bool{"a": true}, "m", "cn", "b")
+	wantPick(t, p, map[string]bool{"codebuddy:a": true}, "m", "cn", "b")
 	wantPick(t, p, nil, "m", "cn", "a")
 	p.SetMaxInFlight(1)
 	p.Acquire("a")

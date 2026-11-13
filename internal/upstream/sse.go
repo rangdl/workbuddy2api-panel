@@ -512,18 +512,44 @@ func WithErrorFrameObserver(fn func(payload string)) StreamOption {
 // 未覆盖，不编造）。
 // opts：旁路观测开关（见 WithErrorFrameObserver），不改变任何透传字节。
 func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, opts ...StreamOption) error {
-	var o streamOptions
-	for _, f := range opts {
-		if f != nil {
-			f(&o)
-		}
-	}
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
+	// emit 是写一帧的抽象：写失败即中止整个转换。
+	emit := func(frame string) error {
+		if _, err := io.WriteString(w, frame); err != nil {
+			return err
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		return nil
+	}
+	return streamEmit(emit, r, hintFn, opts...)
+}
+
+// StreamTo 与 Stream 等价，但把每帧交给 emit 而不是 http.ResponseWriter。
+//
+// 用途：gateway.Backend 的 Convert 契约是 emit 回调，不绑定 HTTP——这样
+// dispatch 层只有一份转发循环，不必为每个上游写一个 ResponseWriter 适配。
+//
+// emit 收到的是**完整帧**（含 "data: " 前缀与结尾空行），调用方原样写出即可。
+// 返回 errEmptyStream 表示上游 200 但没有任何有效数据帧。
+func StreamTo(emit func(frame []byte) error, r io.Reader, hintFn func(string) string, opts ...StreamOption) error {
+	return streamEmit(func(frame string) error { return emit([]byte(frame)) }, r, hintFn, opts...)
+}
+
+// streamEmit 是 StreamHint / StreamTo 的共同实现：所有帧经 emit 写出。
+func streamEmit(emit func(frame string) error, r io.Reader, hintFn func(string) string, opts ...StreamOption) error {
+	var o streamOptions
+	for _, f := range opts {
+		if f != nil {
+			f(&o)
+		}
+	}
 
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
@@ -544,15 +570,9 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	maxToolIdx := -1
 	toolFinishSent := false
 
-	// writeSSE 原样写出一帧并 flush。
+	// writeSSE 原样写出一帧。
 	writeSSE := func(payload string) error {
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
-			return werr
-		}
-		if fl != nil {
-			fl.Flush()
-		}
-		return nil
+		return emit("data: " + payload + "\n\n")
 	}
 
 	// writeRaw 原样写出一帧（绕过 normalizeFrame）。上游 error 帧（error-passthrough）
@@ -726,11 +746,8 @@ readLoop:
 			}
 		case trimmed != "":
 			// 注释/其他行：原样透传
-			if _, werr := io.WriteString(w, line); werr != nil {
+			if werr := emit(line); werr != nil {
 				return werr
-			}
-			if fl != nil {
-				fl.Flush()
 			}
 		}
 		// 空行（帧分隔）吞掉：本函数自产 "\n\n"
@@ -772,11 +789,8 @@ readLoop:
 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
-	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+	if err := emit("data: [DONE]\n\n"); err != nil {
 		return err
-	}
-	if fl != nil {
-		fl.Flush()
 	}
 	if validFrames == 0 {
 		return errEmptyStream

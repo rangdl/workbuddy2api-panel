@@ -143,7 +143,7 @@ func TestPickExcludingForRealm(t *testing.T) {
 func TestPickExcludingForRealmTried(t *testing.T) {
 	p := realmPool(t)
 	// tried 排除在 realm 过滤之后（维持请求级轮换语义）。
-	a := p.PickExcludingForRealm(map[string]bool{"cn1": true}, "", "cn")
+	a := p.PickExcludingForRealm(map[string]bool{"codebuddy:cn1": true}, "", "cn")
 	if a == nil {
 		t.Fatal("tried cn1 → nil")
 	}

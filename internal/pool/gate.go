@@ -20,7 +20,11 @@
 //     成本仅一轮换），但余额耗尽的 CoolHard 号不参与（调了必 402，白烧轮换）。
 package pool
 
-import "time"
+import (
+	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
+)
 
 // exclusion 报告一个账号被排除的原因。空值 = 可用（候选）。
 //
@@ -31,6 +35,7 @@ type exclusion string
 const (
 	excludeNone        exclusion = ""
 	excludeTried       exclusion = "tried"          // 本次请求已试过它（请求级轮换）
+	excludeBackend     exclusion = "backend"        // 不属于请求锁定的上游
 	excludeRealm       exclusion = "realm"          // 不属于请求所在的域
 	excludeUnhealthy   exclusion = "unhealthy"      // 禁用/暂停/冷却/熔断/降级/模型级冷却
 	excludeHardCooling exclusion = "hard-cooling"   // 余额耗尽冷却中（仅兜底口径区分）
@@ -46,11 +51,21 @@ func (x exclusion) ok() bool { return x == excludeNone }
 // 零值即「账号级、不限域、不考虑请求级轮换」——等于旧 AvailableUIDs / PickByUID
 // 的口径。model 为空时 healthy 退化为账号级 healthy()、积分保底恒不拦（无成本维度）。
 type gateSpec struct {
-	model        string          // 请求模型；空 = 账号级口径（不查 6004 模型级冷却、不查成本）
-	realm        string          // 请求域（cn/global）；空 = 不按域过滤
-	now          time.Time       // 判定时刻（调用方取一次，保证同一次遍历内时间一致）
-	tried        map[string]bool // 请求级轮换：本次请求已试过的 UID
-	allowCooling bool            // 兜底口径：软冷却/熔断号可参与（CoolHard 仍排除）
+	model string // 请求模型；空 = 账号级口径（不查 6004 模型级冷却、不查成本）
+	realm string // 请求域（cn/global）；空 = 不按域过滤
+	// backend 请求锁定的上游；空 = 不限（跨上游统一调度）。
+	//
+	// 三种来源会设置它：模型名显式前缀（trae:...）、粘性会话绑定
+	// （同一会话必须落在同一上游，否则 prompt cache 全废）、
+	// 以及回退流程中的「先只在本上游内换号」阶段。
+	backend string
+	now     time.Time // 判定时刻（调用方取一次，保证同一次遍历内时间一致）
+	// tried 请求级轮换：本次请求已试过的账号。
+	//
+	// 键是 gateway.QualifiedUID（"backend:uid"）而非裸 uid——两个上游的
+	// uid 形态可能相同，裸 uid 会让「Trae 的 u1 试过了」误伤「CodeBuddy 的 u1」。
+	tried        map[string]bool
+	allowCooling bool // 兜底口径：软冷却/熔断号可参与（CoolHard 仍排除）
 }
 
 // gateLocked 判定账号 e 在本次询问下是否可用，返回排除原因。
@@ -59,8 +74,11 @@ type gateSpec struct {
 // 条件顺序有意为之：先便宜的过滤（tried/域），再健康口径，最后成本与租约
 // （后两者各含一次表查询 / 原子读）。
 func (p *Pool) gateLocked(e *entry, s gateSpec) exclusion {
-	if s.tried != nil && s.tried[e.acc.UID()] {
+	if s.tried != nil && s.tried[gateway.QualifiedUID(e.acc)] {
 		return excludeTried
+	}
+	if s.backend != "" && e.acc.Backend() != s.backend {
+		return excludeBackend
 	}
 	if s.realm != "" && e.acc.Realm() != s.realm {
 		return excludeRealm

@@ -385,7 +385,15 @@ func parseCreditPack(pack map[string]any) CreditPack {
 	// usage.credits_amount 的语义是「该包已消耗」，剩余 = limit - used。
 	// 注意它**不是**剩余量（dsh 的 USAGE_API_RESEARCH 记录里"剩余 179.63"
 	// 是 limit-usage 的结果，字段本身是消耗量）。
-	if usage, ok := pack["usage"].(map[string]any); ok {
+	//
+	// 取值位置：真实响应把 usage 放在 entitlement_base_info 下（与 quota 同级），
+	// 但也有形态放在包顶层。先 base 后 pack——只查 pack 会让 CreditsUsed 恒为 0，
+	// 于是「剩余」被算成「总额度」，快耗尽的账号看起来满额。
+	usedFrom := base
+	if _, ok := usedFrom["usage"].(map[string]any); !ok {
+		usedFrom = pack
+	}
+	if usage, ok := usedFrom["usage"].(map[string]any); ok {
 		p.CreditsUsed = floatOf(usage["credits_amount"])
 	}
 	p.StartTime = str(base["start_time"])

@@ -39,16 +39,32 @@ func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm stri
 	return p.pick(tried, reqModel, realm)
 }
 
+// PickForBackend 在指定上游内选号（backend 空 = 不限，退化为 PickExcludingForRealm）。
+//
+// 用于三处：模型名显式前缀（trae:...）、粘性会话绑定的上游锁定、
+// 以及跨上游回退时的「先在本上游内换号」阶段。
+func (p *Pool) PickForBackend(tried map[string]bool, reqModel, realm, backend string) gateway.Account {
+	return p.pickSpec(gateSpec{model: reqModel, realm: realm, backend: backend, tried: tried})
+}
+
 // pick 在 healthy 候选集中按权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string) gateway.Account {
+	return p.pickSpec(gateSpec{model: reqModel, realm: realm, tried: tried})
+}
+
+// pickSpec 按完整 gateSpec 选号（含 backend 维度）。
+func (p *Pool) pickSpec(spec gateSpec) gateway.Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
 	// 候选过滤走统一判据（gate.go）：域 / 健康（6004 模型豁免）/ 积分保底 /
 	// 在途租约四条件只在 gateLocked 里组合一次，不再在本处手写一遍。
-	spec := gateSpec{model: reqModel, realm: realm, now: now, tried: tried}
+	// 从 spec 取出常用字段（函数体沿用旧变量名，改动面最小）。
+	reqModel, realm, tried, backend := spec.model, spec.realm, spec.tried, spec.backend
+	spec.now = now
+	_ = backend
 	var cands []*entry
 	for _, e := range p.byUID {
 		// 惰性清理过期的模型级冷却与成本台账（两者的 map 都不无限膨胀；
@@ -66,7 +82,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) gateway.Accou
 		if p.strategyForRealmLocked(realm) != WeightedRandom {
 			return nil // 有序策略等待恢复，不提前试探仍在冷却中的账号。
 		}
-		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
+		return p.pickEarliestExpiryLocked(spec)
 	}
 	// top5 短名单按权重降序截断（而非 credits 单纯降序）：否则闲置补偿根本进不了
 	// 短名单决策，低 credits 但久置的账号会永远排不进 top5。
@@ -320,11 +336,15 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 // 这里，若兜底不看保底，触底号会被「捞回来」继续接收费模型——表现为同一条
 // floor WARN 反复刷同一个号（实测：credits=1 < floor=150 仍持续中选）。
 // 兜底是**最后一道**选号路径，保底在它之前挡不住就等于没挡。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, model string) gateway.Account {
+func (p *Pool) pickEarliestExpiryLocked(spec gateSpec) gateway.Account {
+	now := spec.now
 	var best *entry
 	// 兜底口径的差异全部收在 gateSpec.allowCooling（软冷却/熔断号可参与试探，
 	// 禁用/暂停与有效 CoolHard 仍排除）——不需要也不允许在本处另写一份条件表。
-	spec := gateSpec{model: model, realm: realm, now: now, tried: tried, allowCooling: true}
+	// 保留调用方传入的 backend 锁定：兜底路径同样必须尊重「只在本上游内选」，
+	// 否则显式 trae: 前缀的请求会在 Trae 全冷却时被兜底到 CodeBuddy 账号上。
+	spec.allowCooling = true
+	spec.now = now
 	for _, e := range p.byUID {
 		if !p.gateLocked(e, spec).ok() {
 			continue

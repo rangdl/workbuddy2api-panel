@@ -70,10 +70,10 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 		// 搜索是 CodeBuddy 专有能力：非该上游的账号直接跳过（换下一个）。
 		acct := pool.UnwrapAuth(acc)
 		if acct == nil {
-			tried[acc.UID()] = true
+			tried[pool.TriedKey(acc)] = true
 			continue
 		}
-		tried[acct.UID] = true
+		tried[pool.TriedKey(acc)] = true
 		// 在途租约：与 chat 共用同一名额池。搜索也是真实上游调用，不占名额会让
 		// 搜索流量绕过 MaxInFlight 限流。
 		if !h.cfg.Pool.Acquire(acct.UID) {

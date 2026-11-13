@@ -1005,7 +1005,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 记录已试后跳过换下一个。
 		acct := pool.UnwrapAuth(acc)
 		if acct == nil {
-			tried[acc.UID()] = true
+			tried[pool.TriedKey(acc)] = true
 			continue
 		}
 		if crossRealm && h.cfg.Upstream != nil && acc.Realm() != realm {
@@ -1013,7 +1013,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 而不是请求前缀声明的域。
 			modelRate = h.cfg.Upstream.ModelRate(acct.Realm(), bareModel)
 		}
-		tried[acct.UID] = true
+		tried[pool.TriedKey(acc)] = true
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 		if !h.cfg.Pool.Acquire(acct.UID) {
@@ -1115,7 +1115,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.degrade.Trigger()
 				body = prompt.Rewrite(body, prompt.Degraded)
 				degradedApplied = true
-				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
+				delete(tried, pool.TriedKey(acc)) // 单账号池也能拿到重试机会（降级重试占一次名额）
 				releaseHeld()
 				log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
 				continue

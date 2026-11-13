@@ -105,3 +105,15 @@ func (b bareAccount) Nickname() string { return "" }
 func (b bareAccount) Realm() string    { return gateway.DefaultRealm }
 func (b bareAccount) Backend() string  { return b.backend }
 func (b bareAccount) Enterprise() bool { return false }
+
+// TriedKey 返回 tried 集合的键（"backend:uid"）。
+//
+// 调用方**必须**用它构造 tried 键，不能直接写裸 uid：两个上游的 uid 形态
+// 可能相同，裸 uid 会让「Trae 的 u1 试过了」误伤「CodeBuddy 的 u1」，
+// 表现为换号重试提前耗尽、池里明明有可用号却报 no_healthy_account。
+func TriedKey(acc gateway.Account) string {
+	if acc == nil {
+		return ""
+	}
+	return gateway.QualifiedUID(acc)
+}

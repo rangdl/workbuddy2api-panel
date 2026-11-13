@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 )
 
 const (
@@ -161,7 +163,7 @@ func (p *Pool) pickOrderedLocked(cands []*entry, tried map[string]bool, model, r
 		current := p.byUID[cursor.UID]
 		if current != nil && current.acc.Realm() == realm && current.healthyForModel(now, model) &&
 			!p.floorBlockedForRealmModel(current, model, realm, now) &&
-			(explored || tried[cursor.UID] || p.inFlightFull(current)) {
+			(explored || tried[gateway.QualifiedUID(current.acc)] || p.inFlightFull(current)) {
 			advance = false
 		}
 	}

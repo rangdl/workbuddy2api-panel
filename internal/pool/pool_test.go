@@ -91,12 +91,12 @@ func TestPickExcluding(t *testing.T) {
 	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.SetCredits("u1", 100, 0)
 	p.SetCredits("u2", 50, 0)
-	tried := map[string]bool{"u1": true}
+	tried := map[string]bool{"codebuddy:u1": true}
 	got := p.PickExcluding(tried)
 	if got == nil || got.UID() != "u2" {
 		t.Fatalf("pick=%+v want u2", got)
 	}
-	tried["u2"] = true
+	tried["codebuddy:u2"] = true
 	if got := p.PickExcluding(tried); got != nil {
 		t.Fatalf("want nil, got %+v", got)
 	}
