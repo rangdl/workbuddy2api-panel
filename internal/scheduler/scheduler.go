@@ -595,6 +595,8 @@ func (s *Scheduler) RunActivityNow() {
 func (s *Scheduler) runActivity(ctx context.Context) {
 	first := true
 	includeDisabled := s.includeDisabledInTasks()
+	type reported struct{ a *auth.Auth }
+	var okList []reported
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
@@ -626,7 +628,22 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 			log.Printf("activity %s: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
 			continue
 		}
-		s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
+		okList = append(okList, reported{a: a})
+	}
+	// streak 自检统一放到循环之后：上游计分是异步的，上报刚返回 200 就回读几乎
+	// 必然读到旧值，会把成功判成「silent drop」（线上实测：日志报 days=0，数秒后
+	// 实查已是 1）。先等 settle 让服务端落账，再逐号回读。
+	if len(okList) == 0 {
+		return
+	}
+	if !sleepCtx(ctx, activityStreakSettle) {
+		return
+	}
+	for _, it := range okList {
+		if !sleepCtx(ctx, activityAccountDelay) {
+			return
+		}
+		s.checkActivityStreak(it.a)
 	}
 }
 

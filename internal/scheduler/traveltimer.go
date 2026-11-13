@@ -13,13 +13,14 @@ package scheduler
 import (
 	"context"
 	"log"
+	"math/rand"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
-// travelTimerParams 到站定时器的三个时间参数。
+// travelTimerParams 到站定时器的时间参数。
 //
 // 为什么挂在 Scheduler 而不是包级 var：定时器跑在独立 goroutine 里，包级 var 由
 // 测试改写时会与运行中的 goroutine 形成数据竞争（-race 实测）。作为实例字段，
@@ -28,6 +29,14 @@ type travelTimerParams struct {
 	poll    time.Duration // 无在途行程时的兜底重查间隔
 	step    time.Duration // 分段等待段长（墙钟重判，规避休眠冻结单调时钟）
 	minWait time.Duration // 到站时刻距 now 的最小睡眠（吸收上游与本地秒级偏差）
+	// jitterMax 到站后额外等待的上限（随机 0..jitterMax）。
+	//
+	// 为什么需要：上游的 arrive_at 是精确到秒的固定值，到点即领会让「到达时刻」
+	// 与「领奖时刻」完全重合、每次都是 0 秒延迟——真人不会这样，规律性太强，
+	// 容易被判成脚本。加一段随机延迟把领奖时刻打散。
+	jitterMax time.Duration
+	// jitter 随机源（测试可注入确定性实现；nil 时用 math/rand）。
+	jitter func(time.Duration) time.Duration
 }
 
 // travelTimerDefaults 生产取值：
@@ -35,11 +44,14 @@ type travelTimerParams struct {
 //     「上游刚给出新行程」，也覆盖启动初期的临时失败；
 //   - step 与 wallclockCheckStep 同口径；
 //   - minWait 1s：到点瞬间查 status 可能仍返回 traveling（上游时间只到秒），
-//     留 1s 缓冲避免白跑一趟。已过点的行程不受此限，立即触发。
+//     留 1s 缓冲避免白跑一趟。已过点的行程不受此限，立即触发；
+//   - jitterMax 15min：到站后随机再等 0~15 分钟才领奖，避免「0 秒领取」的机器特征。
+//     猫到站后奖励不会过期（实测挂 19 天仍可领），等待无风险。
 var travelTimerDefaults = travelTimerParams{
-	poll:    10 * time.Minute,
-	step:    wallclockCheckStep,
-	minWait: time.Second,
+	poll:      10 * time.Minute,
+	step:      wallclockCheckStep,
+	minWait:   time.Second,
+	jitterMax: 15 * time.Minute,
 }
 
 // travelTimer 返回本调度器生效的时间参数（零值回落默认，New 构造的实例恒有值）。
@@ -54,18 +66,37 @@ func (s *Scheduler) travelTimer() travelTimerParams {
 	if p.minWait < 0 {
 		p.minWait = travelTimerDefaults.minWait
 	}
+	if p.jitter == nil {
+		p.jitter = randomJitter
+	}
+	if p.jitterMax < 0 {
+		p.jitterMax = 0
+	}
 	return p
+}
+
+// randomJitter 返回 [0, max) 内的随机时长；max<=0 返回 0。
+func randomJitter(max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(max)))
 }
 
 // travelArrival 一个账号的下一次到站时刻（本机墙钟口径）。
 //
 // arriveAt 保留上游原始 Unix 时刻，仅用于「这一趟是否已经触发过」的去重键：
 // at 每轮按 ServerNow 重算会漂移，不能当身份用。
+//
+// immediate 标记「已到站待领」（启动补跑场景）：这类不需要再加抖动等待——
+// 奖励已经等了不知道多久，再等只是无谓拖延；抖动只用于「在途 → 即将到站」
+// 的正常闭环，那里才有「0 秒领取」的机器特征。
 type travelArrival struct {
-	uid      string
-	nick     string
-	at       time.Time
-	arriveAt int64
+	uid       string
+	nick      string
+	at        time.Time
+	arriveAt  int64
+	immediate bool
 }
 
 // RunTravelTimer 到站定时器主循环，阻塞直到 ctx 取消。
@@ -92,6 +123,16 @@ func (s *Scheduler) RunTravelTimer(ctx context.Context) {
 		arrivals := filterUnfired(s.scanTravelArrivals(), fired)
 		s.travelMu.Unlock()
 		wait, target := travelTimerNext(arrivals, time.Now(), tp.minWait, tp.poll)
+		// 到站抖动：只在「等一趟真实在途行程」时加，兜底轮询（target==nil）不加。
+		// 目的见 travelTimerParams.jitterMax——把「到达即领」的 0 秒延迟打散。
+		if target != nil && !target.immediate && tp.jitterMax > 0 {
+			j := tp.jitter(tp.jitterMax)
+			if j > 0 {
+				wait += j
+				log.Printf("travel-timer %s: 到站后再等 %s（随机抖动，避免固定时刻领奖）",
+					logfmt.Label(target.uid, target.nick), roundDuration(j))
+			}
+		}
 		switch {
 		case target == nil:
 			log.Printf("travel-timer: 无可等待行程，%s 后重查", tp.poll)
@@ -169,8 +210,11 @@ func (s *Scheduler) scanTravelArrivals() []travelArrival {
 			log.Printf("travel-timer %s: status: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
 			continue
 		}
-		if at, key, ok := travelDueTime(ts, time.Now()); ok {
-			out = append(out, travelArrival{uid: a.UID, nick: a.NicknameValue(), at: at, arriveAt: key})
+		if at, key, immediate, ok := travelDueTime(ts, time.Now()); ok {
+			out = append(out, travelArrival{
+				uid: a.UID, nick: a.NicknameValue(),
+				at: at, arriveAt: key, immediate: immediate,
+			})
 		}
 	}
 	return out
@@ -179,27 +223,27 @@ func (s *Scheduler) scanTravelArrivals() []travelArrival {
 // travelDueTime 计算该账号下一次需要唤醒的时刻：
 //
 //   - traveling + arrive_at：按上游口径换算到站时刻（ArriveAt-ServerNow，免疫本机
-//     时钟偏差）；
+//     时钟偏差）；immediate=false，调用方会附加随机抖动；
 //   - arrived：**立即**（at=now）——这是启动补跑的核心场景：服务关机期间猫已到站，
 //     重启后必须马上领奖，否则要等到下一个 travel_hours 整点，而线上实证里
-//     [9,21] 窗口常年错过，奖励挂了 19 天。
+//     [9,21] 窗口常年错过，奖励挂了 19 天。immediate=true，跳过抖动（已经等够久）。
 //   - 其余（idle / 未知 / 缺时间）：不参与定时。
 //
 // 去重键 key：traveling 用上游 arrive_at（同一趟行程身份稳定）；arrived 用
 // RecordID（同一笔待领奖励身份稳定）。用「每轮重算的 at」当键会漂移，不行。
-func travelDueTime(ts *upstream.TravelState, now time.Time) (at time.Time, key int64, ok bool) {
+func travelDueTime(ts *upstream.TravelState, now time.Time) (at time.Time, key int64, immediate bool, ok bool) {
 	if ts == nil {
-		return time.Time{}, 0, false
+		return time.Time{}, 0, false, false
 	}
 	switch ts.State {
 	case travelStateArrived:
 		if ts.RecordID == 0 {
-			return time.Time{}, 0, false // 缺 record_id 无法领奖，交给整点巡检记日志
+			return time.Time{}, 0, false, false // 缺 record_id 无法领奖，交给整点巡检记日志
 		}
-		return now, ts.RecordID, true
+		return now, ts.RecordID, true, true
 	case travelStateTraveling:
 		if ts.ArriveAt <= 0 {
-			return time.Time{}, 0, false
+			return time.Time{}, 0, false, false
 		}
 		remain := ts.ArriveAt - now.Unix() // 上游未回 server_now 时退回本机时钟
 		if ts.ServerNow > 0 {
@@ -208,9 +252,9 @@ func travelDueTime(ts *upstream.TravelState, now time.Time) (at time.Time, key i
 		if remain < 0 {
 			remain = 0 // 已过点：立即唤醒（travelOne 按真实状态决定领奖/跳过）
 		}
-		return now.Add(time.Duration(remain) * time.Second), ts.ArriveAt, true
+		return now.Add(time.Duration(remain) * time.Second), ts.ArriveAt, false, true
 	default:
-		return time.Time{}, 0, false
+		return time.Time{}, 0, false, false
 	}
 }
 

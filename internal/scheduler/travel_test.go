@@ -141,12 +141,14 @@ func fastTravel(t *testing.T) {
 
 // fastTravelTimer 把该调度器的到站定时器参数调到毫秒级（只影响本实例，
 // 不碰包级状态——定时器 goroutine 与测试并发时不产生数据竞争）。
+// jitterMax=0 关闭到站随机抖动：生产默认 15min，测试等不起也不需要。
 func fastTravelTimer(t *testing.T, s *Scheduler) {
 	t.Helper()
 	s.travelTimerCfg = travelTimerParams{
-		poll:    50 * time.Millisecond,
-		step:    5 * time.Millisecond,
-		minWait: 0,
+		poll:      50 * time.Millisecond,
+		step:      5 * time.Millisecond,
+		minWait:   0,
+		jitterMax: 0,
 	}
 }
 
@@ -801,7 +803,7 @@ func TestTravelDueTime(t *testing.T) {
 		ServerNow: local + 86400,
 		ArriveAt:  local + 86400 + 7200,
 	}
-	at, key, ok := travelDueTime(ts, now)
+	at, key, immediate, ok := travelDueTime(ts, now)
 	if !ok {
 		t.Fatal("traveling 且有 arrive_at 应返回到站时刻")
 	}
@@ -811,30 +813,36 @@ func TestTravelDueTime(t *testing.T) {
 	if key != ts.ArriveAt {
 		t.Errorf("去重键=%d want arrive_at=%d（同一趟行程身份稳定）", key, ts.ArriveAt)
 	}
+	if immediate {
+		t.Error("traveling 不应标记 immediate（要加随机抖动，避免到点即领）")
+	}
 
 	// 上游未回 server_now：退回本机时钟。
 	noServer := &upstream.TravelState{State: "traveling", ArriveAt: local + 600}
-	if at, _, ok := travelDueTime(noServer, now); !ok || at.Sub(now) != 600*time.Second {
+	if at, _, _, ok := travelDueTime(noServer, now); !ok || at.Sub(now) != 600*time.Second {
 		t.Errorf("缺 server_now 应退回本机时钟，got %v ok=%v", at, ok)
 	}
 
 	// 已过点：立即唤醒（at 不晚于 now）。
 	past := &upstream.TravelState{State: "traveling", ServerNow: local + 100, ArriveAt: local + 50}
-	if at, _, ok := travelDueTime(past, now); !ok || at.After(now) {
+	if at, _, _, ok := travelDueTime(past, now); !ok || at.After(now) {
 		t.Errorf("已过点应返回不晚于 now 的时刻，got %v ok=%v", at, ok)
 	}
 
 	// arrived：立即触发（启动补跑——关机期间到站的行程，重启后马上领奖）。
 	arrived := &upstream.TravelState{State: "arrived", RecordID: 28367071}
-	at, key, ok = travelDueTime(arrived, now)
+	at, key, immediate, ok = travelDueTime(arrived, now)
 	if !ok || at.After(now) {
 		t.Errorf("arrived 应立即触发，got at=%v ok=%v", at, ok)
 	}
 	if key != 28367071 {
 		t.Errorf("arrived 去重键=%d want record_id=28367071", key)
 	}
+	if !immediate {
+		t.Error("arrived 应标记 immediate（启动补跑不额外等待，奖励已经等够久）")
+	}
 	// arrived 但缺 record_id：无法领奖，不参与定时（交给整点巡检记日志）。
-	if _, _, ok := travelDueTime(&upstream.TravelState{State: "arrived"}, now); ok {
+	if _, _, _, ok := travelDueTime(&upstream.TravelState{State: "arrived"}, now); ok {
 		t.Error("arrived 缺 record_id 不应产生定时")
 	}
 
@@ -845,7 +853,7 @@ func TestTravelDueTime(t *testing.T) {
 		{State: "traveling"}, // 无 arrive_at
 		{State: "teleporting", ArriveAt: local + 7200},
 	} {
-		if _, _, ok := travelDueTime(bad, now); ok {
+		if _, _, _, ok := travelDueTime(bad, now); ok {
 			t.Errorf("state=%+v 不应产生定时", bad)
 		}
 	}
@@ -975,6 +983,77 @@ func TestRunTravelTimerClaimsArrivedOnStartup(t *testing.T) {
 	if n := stub.departCalls.Load(); n != 0 {
 		t.Errorf("depart calls=%d want 0（仍 arrived 不应派出）", n)
 	}
+}
+
+// TestTravelTimerJitterDelaysArrivalClaim 到站后加随机抖动，避免「0 秒领取」的机器特征。
+//
+// 生产默认 jitterMax=15min；这里注入确定性 jitter 并断言：
+//   - 在途行程（traveling）会等待 jitter + 到站剩余时间；
+//   - 已到站（arrived，启动补跑）**不**加抖动——奖励已经等够久，不该再拖。
+func TestTravelTimerJitterDelaysArrivalClaim(t *testing.T) {
+	fastTravel(t)
+
+	// 注入确定性抖动：固定 300ms。
+	injectJitter := func(t *testing.T, s *Scheduler, d time.Duration) {
+		t.Helper()
+		s.travelTimerCfg.jitterMax = time.Hour // 非零，表示启用抖动
+		s.travelTimerCfg.jitter = func(time.Duration) time.Duration { return d }
+	}
+
+	t.Run("traveling 加抖动", func(t *testing.T) {
+		stub := &travelStub{
+			buddy: `{"id":7}`,
+			// 上游口径：0s 后到站（立即到点），但抖动应额外拖 300ms。
+			state:      `{"state":"traveling","record_id":42,"server_now":1000,"arrive_at":1000}`,
+			stateAfter: `{"state":"arrived","record_id":42}`,
+		}
+		srv := stub.server()
+		defer srv.Close()
+		s, _ := newTravelScheduler(t, srv, "u1")
+		fastTravelTimer(t, s)
+		injectJitter(t, s, 300*time.Millisecond)
+		startTravelTimer(t, s)
+
+		start := time.Now()
+		deadline := time.After(3 * time.Second)
+		for stub.claimCalls.Load() == 0 {
+			select {
+			case <-deadline:
+				t.Fatalf("抖动后仍未领奖：claim=%d", stub.claimCalls.Load())
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
+			t.Errorf("领奖耗时 %v < 抖动 300ms（抖动未生效）", elapsed)
+		}
+	})
+
+	t.Run("arrived 不加抖动", func(t *testing.T) {
+		stub := &travelStub{
+			buddy: `{"id":7}`,
+			// 启动补跑场景：猫已到站，奖励躺着等领。
+			state: `{"state":"arrived","record_id":42}`,
+		}
+		srv := stub.server()
+		defer srv.Close()
+		s, _ := newTravelScheduler(t, srv, "u1")
+		fastTravelTimer(t, s)
+		injectJitter(t, s, 500*time.Millisecond) // 故意给大抖动
+		startTravelTimer(t, s)
+
+		start := time.Now()
+		deadline := time.After(3 * time.Second)
+		for stub.claimCalls.Load() == 0 {
+			select {
+			case <-deadline:
+				t.Fatalf("启动补跑未领奖：claim=%d", stub.claimCalls.Load())
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		if elapsed := time.Since(start); elapsed >= 500*time.Millisecond {
+			t.Errorf("已到站领奖耗时 %v，不应被抖动拖住（奖励已等够久）", elapsed)
+		}
+	})
 }
 
 // TestRunTravelTimerRearm 手动触发（PokeTravelTimer）立即唤醒重算，不必等满到站时刻。

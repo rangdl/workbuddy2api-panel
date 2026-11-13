@@ -33,6 +33,14 @@ var travelAccountDelay = 800 * time.Millisecond
 // activityAccountDelay 活跃上报账号间限速：与旅行同口径，避免上游风控。测试可置 0。
 var activityAccountDelay = 800 * time.Millisecond
 
+// activityStreakSettle 活跃上报后回读 streak 前的等待。
+//
+// 上游行为事件计分是异步的：report 刚返回 200 就立刻回读，几乎必然读到旧值
+// （线上实测 2026-11-13：日志报「report OK but streak.days=0 (silent drop?)」，
+// 数秒后实查已是 days=1）。等待让服务端落账，避免把成功判成静默丢弃。
+// 测试可置 0。
+var activityStreakSettle = 8 * time.Second
+
 // adoptReportGap 领养前置上报后的等待：给上游事件处理留时间再发 buddy/first。
 // 对齐 scripts/task_first_buddy.py 实测的 1.05s 间隔口径。测试可置 0。
 var adoptReportGap = 1050 * time.Millisecond

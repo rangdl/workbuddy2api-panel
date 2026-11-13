@@ -81,6 +81,8 @@ func TestPersonalAccountWithSwitchClaimRunsAllTasks(t *testing.T) {
 	restoreClock := nowForNightWindow
 	nowForNightWindow = func() time.Time { return time.Date(2026, 10, 12, 23, 30, 0, 0, time.Local) }
 	t.Cleanup(func() { nowForNightWindow = restoreClock })
+	fastActivity(t) // 关闭账号间限速与 streak 回读等待（否则每例白等 8s）
+	fastTravel(t)
 
 	cases := []struct {
 		name     string
@@ -110,6 +112,8 @@ func TestEnterpriseAccountSkipsGrowthTasks(t *testing.T) {
 	restoreClock := nowForNightWindow
 	nowForNightWindow = func() time.Time { return time.Date(2026, 10, 12, 23, 30, 0, 0, time.Local) }
 	t.Cleanup(func() { nowForNightWindow = restoreClock })
+	fastActivity(t) // 关闭账号间限速与 streak 回读等待
+	fastTravel(t)
 
 	cases := []struct {
 		name     string

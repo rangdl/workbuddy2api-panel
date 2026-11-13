@@ -14,12 +14,17 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
-// fastActivity 关闭活跃上报账号间限速，避免测试白等 800ms。
+// fastActivity 关闭活跃上报账号间限速与 streak 回读等待，避免测试白等。
 func fastActivity(t *testing.T) {
 	t.Helper()
 	old := activityAccountDelay
+	oldSettle := activityStreakSettle
 	activityAccountDelay = 0
-	t.Cleanup(func() { activityAccountDelay = old })
+	activityStreakSettle = 0
+	t.Cleanup(func() {
+		activityAccountDelay = old
+		activityStreakSettle = oldSettle
+	})
 }
 
 // reportStub 记录 /v2/report 调用次数与 userId。
