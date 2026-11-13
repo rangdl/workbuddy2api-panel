@@ -10,21 +10,25 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
-// sessionTestScheduler 与 enterpriseTestScheduler 同构：switched=true 时账号的
-// AccessToken 为带 token_source=enterprise_switch 的 JWT（企业**切换会话**，
-// enterpriseId 为空——网关无法凭 enterpriseId 识别的形态）；false 为个人号对照组。
-func sessionTestScheduler(t *testing.T, switched bool) (*Scheduler, *recorderUpstream) {
+// personalWithSwitchClaimScheduler 构造「个人号但 JWT 带 token_source=enterprise_switch」的
+// 调度器。enterpriseId 为空，属正常个人账号——该章只记录本次授权走了哪条流程。
+//
+// 这正是线上真实形态：个人号从企业切换入口登录后，refresh 出的 token 会长期带该章。
+// 历史 bug：旧 IsEnterpriseSession 据此把这类账号判成企业号，四条任务链路全线跳过。
+func personalWithSwitchClaimScheduler(t *testing.T) (*Scheduler, *recorderUpstream) {
 	t.Helper()
 	r := &recorderUpstream{}
 	srv := r.server()
 	t.Cleanup(srv.Close)
 
-	token := "at"
-	if switched {
-		payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"u1","token_source":"enterprise_switch"}`))
-		token = "hdr." + payload + ".sig"
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"u1","token_source":"enterprise_switch"}`))
+	a := &auth.Auth{
+		UID:          "u1",
+		AccessToken:  "hdr." + payload + ".sig",
+		RefreshToken: "rt",
+		ExpiresAt:    9999999999,
+		EnterpriseID: "", // 关键：个人号
 	}
-	a := &auth.Auth{UID: "u1", AccessToken: token, RefreshToken: "rt", ExpiresAt: 9999999999}
 	p := pool.New("")
 	p.Add(a)
 
@@ -34,68 +38,106 @@ func sessionTestScheduler(t *testing.T, switched bool) (*Scheduler, *recorderUps
 		BillingBaseCN: srv.URL,
 		WebBaseCN:     srv.URL,
 	}
-	s := New(Config{Pool: p, Upstream: up})
-	return s, r
+	return New(Config{Pool: p, Upstream: up}), r
 }
 
-// TestEnterpriseSessionGateSkipsBehaviorTasks 企业切换会话的行为类任务门控：
-// /v2/report 等行为事件对该形态返回 200 却被上游静默丢弃（实测 2026-10-12，
-// 15 个成长任务全部 0/x 且 90s 内进度从不跳动），执行即零收益白跑——
-// 活跃上报 / 连登管家 / 夜猫子必须一个上游调用都不发；
-// 签到不在此列（对该形态未观测到静默失败，且失败是显式报错）。
+// enterpriseAccountScheduler 构造真企业版（enterpriseId 非空）的调度器。
+func enterpriseAccountScheduler(t *testing.T) (*Scheduler, *recorderUpstream) {
+	t.Helper()
+	r := &recorderUpstream{}
+	srv := r.server()
+	t.Cleanup(srv.Close)
+
+	a := &auth.Auth{
+		UID:          "u1",
+		AccessToken:  "at",
+		RefreshToken: "rt",
+		ExpiresAt:    9999999999,
+		EnterpriseID: "e1", // 真企业版
+	}
+	p := pool.New("")
+	p.Add(a)
+
+	up := &upstream.Client{
+		HTTP:          srv.Client(),
+		ChatBaseCN:    srv.URL,
+		BillingBaseCN: srv.URL,
+		WebBaseCN:     srv.URL,
+	}
+	return New(Config{Pool: p, Upstream: up}), r
+}
+
+// TestPersonalAccountWithSwitchClaimRunsAllTasks 个人号带 enterprise_switch 章时，
+// 所有个人成长任务必须照常发起（回归）。
 //
-// **猫猫旅行不在此列**（2026-11-13 调整）：实测该形态下 travel/status 与
-// buddy/quota 均正常返回，且旅行领奖 / 盲盒开盒都不走 /v2/report 计分通道。
-// 原实现把旅行一并门控，导致「能量盲盒」按钮在企业切换会话账号上返回
-// 0 个账号。现在放行，由 travelOne 的错误处理兜底。
-// 每个子用例配个人号对照，证明"没发请求"是门控生效而非构造有误。
-func TestEnterpriseSessionGateSkipsBehaviorTasks(t *testing.T) {
-	// 与 TestEnterpriseGateSkipsGrowthTasks 同款：把夜猫子窗口钉在窗口内。
+// 背景（2026-11-13）：旧 IsEnterpriseSession 把该章当作企业上下文，导致
+// 活跃上报 / 连登管家 / 夜猫子 / 旅行四条链路对正常个人号全线跳过。线上表现为
+// 服务运行一段时间后（refresh 继承该章）任务突然全停、盲盒按钮返回 0 个账号。
+//
+// 实测依据：该账号 email / enterpriseId / realm_access 全是个人号特征；
+// 下游 fork 亦独立注释「不要再用 token_source=enterprise_switch 判定企业上下文，
+// 企业形态一律以 enterpriseId 为准」。
+func TestPersonalAccountWithSwitchClaimRunsAllTasks(t *testing.T) {
 	restoreClock := nowForNightWindow
 	nowForNightWindow = func() time.Time { return time.Date(2026, 10, 12, 23, 30, 0, 0, time.Local) }
 	t.Cleanup(func() { nowForNightWindow = restoreClock })
 
 	cases := []struct {
-		name string
-		run  func(*Scheduler)
-		// endpoint 是该任务在**个人号**上必然发起的上游路径（对照组判据）。
+		name     string
+		run      func(*Scheduler)
 		endpoint string
-		// gated=true 期望切换会话不发该请求；false 期望照常发（不门控）。
-		gated bool
 	}{
-		{"签到", func(s *Scheduler) { s.RunCheckinNow() }, "/daily-checkin", false},
-		{"活跃上报", func(s *Scheduler) { s.RunActivityNow() }, "/v2/report", true},
-		// 旅行放行：读端点实测可用，写操作不走 report 计分通道。
-		{"猫猫旅行", func(s *Scheduler) { s.RunTravelNow() }, "/activity/growth/buddy/info", false},
-		{"夜猫子", func(s *Scheduler) { s.RunBlackcatNow() }, "/v2/activity/growth/tasks", true},
-		{"连登管家", func(s *Scheduler) { s.RunStreakBonusNow() }, "/activity/growth/streak", true},
+		{"签到", func(s *Scheduler) { s.RunCheckinNow() }, "/daily-checkin"},
+		{"活跃上报", func(s *Scheduler) { s.RunActivityNow() }, "/v2/report"},
+		{"猫猫旅行", func(s *Scheduler) { s.RunTravelNow() }, "/activity/growth/buddy/info"},
+		{"夜猫子", func(s *Scheduler) { s.RunBlackcatNow() }, "/v2/activity/growth/tasks"},
+		{"连登管家", func(s *Scheduler) { s.RunStreakBonusNow() }, "/activity/growth/streak"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			sSess, rSess := sessionTestScheduler(t, true)
-			c.run(sSess)
-			if c.gated && rSess.has(c.endpoint) {
-				t.Errorf("企业切换会话不应发起 %s，实际请求=%v", c.endpoint, rSess.snapshot())
-			}
-			if !c.gated && !rSess.has(c.endpoint) {
-				t.Errorf("企业切换会话应照常发起 %s（不门控），实际请求=%v", c.endpoint, rSess.snapshot())
-			}
-
-			sPer, rPer := sessionTestScheduler(t, false)
-			c.run(sPer)
-			if !rPer.has(c.endpoint) {
-				t.Errorf("个人号对照应发起 %s，实际请求=%v", c.endpoint, rPer.snapshot())
+			s, r := personalWithSwitchClaimScheduler(t)
+			c.run(s)
+			if !r.has(c.endpoint) {
+				t.Errorf("个人号（带 enterprise_switch 章）应照常发起 %s，实际请求=%v", c.endpoint, r.snapshot())
 			}
 		})
 	}
 }
 
-// TestEnterpriseSessionKeepsKeepalive 切换会话照常保活（token 会过期，会话
-// 形态不影响选号/刷新能力）。
-func TestEnterpriseSessionKeepsKeepalive(t *testing.T) {
-	s, r := sessionTestScheduler(t, true)
+// TestEnterpriseAccountSkipsGrowthTasks 真企业版（enterpriseId 非空）仍然全部跳过：
+// 上游 growth 端点一律 403，签到 / 领奖返回 400 code 10001，执行即零收益。
+func TestEnterpriseAccountSkipsGrowthTasks(t *testing.T) {
+	restoreClock := nowForNightWindow
+	nowForNightWindow = func() time.Time { return time.Date(2026, 10, 12, 23, 30, 0, 0, time.Local) }
+	t.Cleanup(func() { nowForNightWindow = restoreClock })
+
+	cases := []struct {
+		name     string
+		run      func(*Scheduler)
+		endpoint string
+	}{
+		{"活跃上报", func(s *Scheduler) { s.RunActivityNow() }, "/v2/report"},
+		{"猫猫旅行", func(s *Scheduler) { s.RunTravelNow() }, "/activity/growth/buddy/info"},
+		{"夜猫子", func(s *Scheduler) { s.RunBlackcatNow() }, "/v2/activity/growth/tasks"},
+		{"连登管家", func(s *Scheduler) { s.RunStreakBonusNow() }, "/activity/growth/streak"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, r := enterpriseAccountScheduler(t)
+			c.run(s)
+			if r.has(c.endpoint) {
+				t.Errorf("企业版不应发起 %s，实际请求=%v", c.endpoint, r.snapshot())
+			}
+		})
+	}
+}
+
+// TestEnterpriseAccountKeepsKeepalive 企业版照常保活（token 会过期，企业形态
+// 不影响选号/刷新能力）。
+func TestEnterpriseAccountKeepsKeepalive(t *testing.T) {
+	s, r := enterpriseAccountScheduler(t)
 	s.RunKeepaliveNow()
-	if !r.has("/token/refresh") {
-		t.Errorf("企业切换会话必须照常保活，实际请求=%v", r.snapshot())
+	if !r.has("/v2/plugin/auth/token/refresh") {
+		t.Errorf("企业版必须照常保活，实际请求=%v", r.snapshot())
 	}
 }

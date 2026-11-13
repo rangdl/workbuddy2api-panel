@@ -226,28 +226,39 @@ func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 // 无需加锁——Realm() 加锁是因为 realm/Domain 会被 RefreshToken 在锁内改写。
 func (a *Auth) IsEnterprise() bool { return strings.TrimSpace(a.EnterpriseID) != "" }
 
-// IsEnterpriseSession 报告当前凭证是否处于「企业上下文」：
-// 账号本身是企业版（IsEnterprise），或 AccessToken 签发自**企业切换会话**
-// （JWT payload 带 token_source=enterprise_switch——浏览器在企业空间状态下
-// 完成 OAuth 授权时签发）。
+// SupportsPersonalGrowth 报告账号是否具备个人成长体系（签到 / 成长任务 / 连登管家 /
+// 猫猫旅行 / 夜猫子 / 活跃上报）。企业版没有该体系——上游 growth 端点一律 403
+// 「growth system is only available for personal users」，签到 / 领奖返回
+// 400 code 10001「企业账号不支持该操作」，执行即零收益。
 //
-// 为什么单独一站：企业切换会话与真企业版的上游表现**不同**（实测 2026-10-12，
-// 同一时刻与个人号 A/B 对照）——成长任务列表 / 额度查询 / 领养 Buddy 等**读端点
-// 与直连 API 照常**，但 /v2/report 行为事件**返回 200 却被静默丢弃**（15 个成长
-// 任务全部 0/x，重跑并 90s 内逐 15s 回读进度从不跳动），连登 / 签到同样无效。
-// 即「读得见、记不上账」：不跳过则队列每轮白跑全部任务（含真实对话配额）且
-// 无任何报错。因此行为类任务（活跃上报 / 连登 / 旅行 / 夜猫子 / 成长任务执行）
-// 的门控应使用本方法；签到与任务列表扫描不在此列（签到失败是显式报错，
-// 列表扫描实测可用）。额度查询 / 选号 / 保活照常（按 IsEnterprise 口径）。
+// scheduler 各任务与 panel 成长入口统一用本方法门控：判据只此一处，避免散落各处
+// 各自漂移（历史上就因此把个人号误判成企业号，见 TokenSource 的注释）。
+func (a *Auth) SupportsPersonalGrowth() bool { return !a.IsEnterprise() }
+
+// TokenSource 从 AccessToken 的 JWT payload 里读 token_source 声明。
 //
-// 每次现解码 JWT 而非 Parse 时缓存：RefreshToken 会整体换发 token，
-// 企业切换状态可能随重新授权翻转，缓存会读到过期形态。解码成本仅一次
-// base64 + 小 JSON（每调度轮每账号数次），可忽略。
-func (a *Auth) IsEnterpriseSession() bool {
-	if a.IsEnterprise() {
-		return true
+// ⚠️ **不要用它判定企业身份**（2026-11-13 修正）：
+// 本方法的前身 IsEnterpriseSession 把 token_source=enterprise_switch 当作
+// 「企业上下文」，据此跳过了活跃上报 / 连登管家 / 夜猫子 / 旅行四条链路。
+// 实测（本机个人号，enterpriseId 为空、JWT 仅带该章）：
+//   - 账号的 email / enterpriseId / realm_access 全部是个人号特征；
+//   - token_source 只记录「这次授权走了哪条流程」，个人号走企业切换入口登录时
+//     同样会带该章；
+//   - 该章随 refresh 继承（refresh 端点不重新判定身份），一次登录即长期携带，
+//     表现为「服务跑了一段时间后任务突然全停」。
+// 下游 fork（misakano7545/workbuddy2api-panel）独立得出同一结论并明确注释：
+// 「不要再用 token_source=enterprise_switch 判定企业上下文……企业形态一律以
+// enterpriseId 为准」。
+//
+// 现在该声明的唯一用途是**出站头对齐**：官方客户端用它填 X-Auth-Method 与
+// X-Userinfo.token_source，属于客户端指纹维度，不参与任何业务门控。
+//
+// 每次现解码而不缓存：RefreshToken 会整体换发 token，该声明可能随重新授权翻转。
+func (a *Auth) TokenSource() string {
+	if a == nil {
+		return ""
 	}
-	return jwtTokenSource(a.AccessTokenValue()) == "enterprise_switch"
+	return jwtTokenSource(a.AccessTokenValue())
 }
 
 // jwtTokenSource 解出 JWT payload 中的 token_source 声明；非 JWT / 解码失败

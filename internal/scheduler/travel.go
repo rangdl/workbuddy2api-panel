@@ -70,22 +70,13 @@ func (s *Scheduler) RunTravelNow() {
 // travelAccounts 返回本轮可参与旅行的账号。
 // 抽出来供批次巡检与到站定时器共用，避免两处门控漂移。
 //
-// 门控调整（2026-11）：企业**切换会话**不再整体跳过。
+// 门控判据统一走 auth.SupportsPersonalGrowth（= !IsEnterprise）：
+// 企业版没有个人成长体系，上游 growth 端点一律 403，执行即零收益。
 //
-// 原实现见到 IsEnterpriseSession() 就 continue，依据是「企业会话的 /v2/report
-// 行为事件返回 200 却被静默丢弃」。但 2026-11-13 实测（企业切换会话账号，
-// enterpriseId 为空、JWT token_source=enterprise_switch）：
-//   - GET  /activity/growth/buddy/travel/status  → 200，正常返回 arrived/record_id
-//   - GET  /activity/growth/buddy/quota          → 200，正常返回 balance/affordable
-// 即读端点完全可用。而旅行领奖（travel/claim）与盲盒开盒（buddy/open）都不走
-// /v2/report 的计分通道，没有理由被这个门控拦住。
-//
-// 现在的口径：
-//   - 真企业版（enterpriseId 非空，IsEnterprise）仍然跳过——实测其 growth 端点 403；
-//   - 企业切换会话（仅 JWT 标记）放行，由各调用点的错误处理兜底：上游若拒绝，
-//     travelOne/travelBlindBox 只记日志并跳过该账号，不影响其他账号。
-//   - 依赖 /v2/report 计分的操作（成长任务、活跃上报、连登）仍按原门控排除，
-//     那些走的是各自模块的 IsEnterpriseSession 判断，不在本函数范围内。
+// 历史教训（2026-11-13）：这里曾用 IsEnterpriseSession()，它会额外把
+// JWT 带 token_source=enterprise_switch 的**个人号**也判成企业号并跳过。
+// 实测该章只记录「本次授权走了哪条流程」，个人号走企业切换入口登录时同样携带，
+// 且随 refresh 继承——表现为服务跑一段时间后旅行/盲盒突然全线停摆。
 func (s *Scheduler) travelAccounts() []*auth.Auth {
 	var out []*auth.Auth
 	for _, st := range s.cfg.Pool.List() {
@@ -99,8 +90,8 @@ func (s *Scheduler) travelAccounts() []*auth.Auth {
 		if a.IsGlobal() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
-		if a.IsEnterprise() {
-			continue // 真企业版：growth 端点实测 403（企业切换会话不在此列，见上）
+		if !a.SupportsPersonalGrowth() {
+			continue // 企业版：growth 端点实测 403
 		}
 		out = append(out, a)
 	}
