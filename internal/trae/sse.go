@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,7 +31,9 @@ import (
 
 // soloEvent 一个解析后的上游事件。
 type soloEvent struct {
-	Event        string
+	Event string
+	// Data 原始 data 行内容（诊断用，见 SetRawDump）。
+	Data         string
 	Response     string
 	Reasoning    string
 	ToolCalls    []any
@@ -47,6 +50,8 @@ type soloEvent struct {
 	// QueuePosition request_wait_in_queue 的排队位置。
 	QueuePosition int64
 	HasQueue      bool
+	// Raw notify_usage 的完整原始 payload（排查扣费口径用；不参与业务逻辑）。
+	Raw map[string]any
 }
 
 // StreamResult 流式转换的结果统计。
@@ -65,6 +70,8 @@ type StreamResult struct {
 	RemainIDE  float64
 	RemainWork float64
 	HasRemain  bool
+	// RemainRaw notify_usage 的原始 payload（可观测性：确认上游是否给出本次扣费）。
+	RemainRaw map[string]any
 }
 
 // ConvertStream 把上游 SOLO SSE 流转成 OpenAI SSE 帧，逐帧交给 emit。
@@ -90,6 +97,7 @@ func ConvertStream(r io.Reader, chatID, model string, emit func([]byte) error) (
 		if ev == nil {
 			continue
 		}
+		dumpEvent(ev)
 		switch ev.Event {
 		case "output", "thought":
 			delta := map[string]any{}
@@ -130,6 +138,7 @@ func ConvertStream(r io.Reader, chatID, model string, emit func([]byte) error) (
 				res.RemainIDE = ev.RemainIDE
 				res.RemainWork = ev.RemainWork
 				res.HasRemain = true
+				res.RemainRaw = ev.Raw
 			}
 		case "done", "turn_completion":
 			finish := ev.FinishReason
@@ -305,6 +314,29 @@ func normalizeUsage(u map[string]any) map[string]any {
 		out["completion_tokens"] = ct
 	}
 	out["total_tokens"] = tt
+
+	// 缓存拆分（OpenAI 兼容形态）：上游给 cache_read_input_tokens /
+	// cache_creation_input_tokens，这里映射成 prompt_tokens_details.cached_tokens
+	// 与 cache_creation_tokens。
+	//
+	// 为什么重要：命中缓存的输入 token 计费远低于未命中，不区分就无法解释
+	// 「同样的 token 数为什么这次扣得多」。多轮长对话尤其明显。
+	cacheRead := intOf(u["cache_read_input_tokens"])
+	cacheCreate := intOf(u["cache_creation_input_tokens"])
+	reasoning := intOf(u["reasoning_tokens"])
+	if cacheRead > 0 || cacheCreate > 0 {
+		details := map[string]any{}
+		if cacheRead > 0 {
+			details["cached_tokens"] = cacheRead
+		}
+		if cacheCreate > 0 {
+			details["cache_creation_tokens"] = cacheCreate
+		}
+		out["prompt_tokens_details"] = details
+	}
+	if reasoning > 0 {
+		out["completion_tokens_details"] = map[string]any{"reasoning_tokens": reasoning}
+	}
 	return out
 }
 
@@ -409,7 +441,7 @@ func (s *sseScanner) next() (*soloEvent, error) {
 // parseSoloEvent 把 (event, data) 解析为结构化事件。
 // 未知事件类型返回事件对象本身（调用方按 event 名过滤）。
 func parseSoloEvent(event, data string) *soloEvent {
-	ev := &soloEvent{Event: strings.TrimSpace(event)}
+	ev := &soloEvent{Event: strings.TrimSpace(event), Data: data}
 	if strings.TrimSpace(data) == "" {
 		return ev
 	}
@@ -459,6 +491,7 @@ func parseSoloEvent(event, data string) *soloEvent {
 		if s, ok := raw["billing_mode"].(string); ok {
 			ev.BillingMode = s
 		}
+		ev.Raw = raw
 	case "request_wait_in_queue":
 		// 排队位置：可用于判断是否该换号（chat_v3 通用池常 1000+，solo 较轻）。
 		ev.QueuePosition = intOf(raw["position"])
@@ -546,5 +579,34 @@ func PeekStream(r io.Reader) (PeekResult, error) {
 			// 内容事件 / done：上游已正常应答，停止预读。
 			return PeekResult{Header: captured.Bytes(), QueuePosition: queuePos, HasQueue: sawQueue}, nil
 		}
+	}
+}
+
+// rawDump 原始事件转储开关（诊断用：确认上游到底给了哪些字段）。
+//
+// 为什么做成包级开关而不是配置项：它只在排障时临时开启（面板「聊天原始事件」
+// 或环境变量），常态关闭。开着会把每次对话的完整事件流打进日志，
+// 量大且含对话内容，不适合长期启用。
+var rawDump atomic.Bool
+
+// SetRawDump 开启/关闭原始事件转储。
+func SetRawDump(on bool) { rawDump.Store(on) }
+
+// RawDumpEnabled 当前是否开启。
+func RawDumpEnabled() bool { return rawDump.Load() }
+
+// DumpEvent 在转储开启时回调每个解析前的事件（event 名 + 原始 data）。
+//
+// 由 server 层注入日志函数；nil 时静默。回调在流式热路径上，
+// 实现方必须自己判断是否真的写日志（本函数已先检查 rawDump）。
+var DumpEvent func(event, data string)
+
+// dumpEvent 内部调用点：只有开关打开且回调非空才动作。
+func dumpEvent(ev *soloEvent) {
+	if ev == nil || !rawDump.Load() {
+		return
+	}
+	if fn := DumpEvent; fn != nil {
+		fn(ev.Event, ev.Data)
 	}
 }

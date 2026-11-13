@@ -66,9 +66,17 @@ func (b *Backend) Supports(acc gateway.Account, bareModel string) bool {
 	if cfg == nil {
 		return false
 	}
+	// Remote 目录的判据更严：要过 isCallableModel（usage/config_source/展示名）。
+	// 该模型在目录里存在但不可调用（工具配置 / 账号自带模型）时应拒绝——
+	// 否则会选中它再被上游 4001 拒绝，白烧一次额度。
+	if remote := b.Client.FetchRemoteModels(context.Background(), cfg, a, false); remote != nil {
+		if row, ok := remote[bareModel]; ok {
+			return traepkg.IsCallableModel(row)
+		}
+	}
+	// Remote 未覆盖时回落 wire 名册（get_detail_param）。
 	cat := b.Client.FetchCatalog(context.Background(), cfg, a, false)
 	if cat == nil || !cat.Live {
-		// 目录拉不到时只信内置表（已在上方判定过），不放行未收录模型。
 		return false
 	}
 	return cat.FunctionForConfigName(bareModel) != ""
@@ -134,16 +142,21 @@ func (b *Backend) Chat(ctx context.Context, acc gateway.Account, in *gateway.Inb
 				FinishReason: "",
 			}
 			if res.Usage != nil {
-				stats.Usage = &gateway.Usage{
+				u := &gateway.Usage{
 					PromptTokens:     intOf(res.Usage["prompt_tokens"]),
 					CompletionTokens: intOf(res.Usage["completion_tokens"]),
 					TotalTokens:      intOf(res.Usage["total_tokens"]),
+					CacheRead:        intOf(res.Usage["cache_read_input_tokens"]),
+					CacheCreation:    intOf(res.Usage["cache_creation_input_tokens"]),
+					Reasoning:        intOf(res.Usage["reasoning_tokens"]),
 				}
+				stats.Usage = u
 			}
 			if res.HasRemain {
 				stats.Remain = &gateway.Remain{
 					Available: res.RemainIDE, // 对话只消耗 IDE 积分，不含 Work
 					Work:      res.RemainWork,
+					Raw:       res.RemainRaw,
 				}
 			}
 			return stats, err

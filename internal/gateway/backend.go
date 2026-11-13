@@ -135,6 +135,27 @@ type Usage struct {
 	PromptTokens     int64
 	CompletionTokens int64
 	TotalTokens      int64
+	// CacheRead 命中缓存的输入 token（计费远低于未命中）。
+	CacheRead int64
+	// CacheCreation 写入缓存的输入 token。
+	CacheCreation int64
+	// Reasoning 思考 token（输出的一部分）。
+	Reasoning int64
+}
+
+// CachedPercent 缓存命中率（0~100；无输入 token 时返回 0）。
+//
+// 口径：cached / (cached + 未命中部分)。上游的 prompt_tokens 已含缓存部分，
+// 所以未命中 = prompt - cached。
+func (u *Usage) CachedPercent() int {
+	if u == nil || u.PromptTokens <= 0 || u.CacheRead <= 0 {
+		return 0
+	}
+	pct := int(float64(u.CacheRead) / float64(u.PromptTokens) * 100)
+	if pct > 100 {
+		pct = 100
+	}
+	return pct
 }
 
 // Remain 上游上报的剩余额度。
@@ -143,6 +164,15 @@ type Remain struct {
 	Available float64
 	// Work 仅供展示（Trae 的 Work 积分）；0 = 无此概念。
 	Work float64
+	// Consumed 本次计费消耗（0 = 上游未给出）。
+	//
+	// Trae 的 notify_usage 目前只确认了剩余额度字段；是否有消耗字段取决于
+	// 上游。backend 若识别出消耗就填这里，dispatch 据此记 credit。
+	Consumed float64
+	// HasConsumed Consumed 是否有效。
+	HasConsumed bool
+	// Raw 原始 payload（可观测性：排查扣费口径时打日志）。
+	Raw map[string]any
 }
 
 // Credits 归一后的余额视图。
