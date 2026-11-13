@@ -78,12 +78,31 @@ type Scheduler struct {
 	adoptTried map[string]string
 
 	// schedMu 保护排程参数（时点/开关）；Reconfigure 可在运行期热改（面板保存配置时调用）。
-	// rearmSchedule/rearmBalance/rearmSweep 是「排程已变，立即重算」通知：Run 与
-	// 各周期循环各自消费，分别用独立 channel（同 channel 被多个 select 消费会丢信号）。
+	// rearmSchedule/rearmBalance/rearmSweep/rearmTravel 是「排程已变，立即重算」通知：
+	// Run 与各周期循环各自消费，分别用独立 channel（同 channel 被多个 select 消费会丢信号）。
 	schedMu       sync.Mutex
 	rearmSchedule chan struct{}
 	rearmBalance  chan struct{}
 	rearmSweep    chan struct{}
+	// rearmTravel 猫猫旅行到站定时器（RunTravelTimer）的重算通知：手动触发巡检、
+	// 配置保存后都 poke 一次，让它按最新状态重算下一次唤醒（而不是睡满旧时刻）。
+	rearmTravel chan struct{}
+
+	// travelBlindbox 能量盲盒配置（schedule.travel_blindbox_*），atomic 读写：
+	// 面板保存配置后 SetTravelBlindbox 热改，下一趟 travelOne 即生效。
+	travelBlindboxEnabled   atomic.Bool
+	travelBlindboxMaxPerRun atomic.Int64
+
+	// travelMu 串行化旅行巡检：固定整点排程（runBatch）、面板手动触发与到站定时器
+	// 是三个独立入口，若并发跑同一账号会重复 claim/depart（上游对重复领奖报错，
+	// 重复派出消耗当日唯一名额）。整趟巡检持锁而不是逐账号持锁——巡检本身已是
+	// 分钟级串行流程，额外并行收益为零。
+	travelMu sync.Mutex
+
+	// travelTimerCfg 到站定时器的时间参数（零值回落 travelTimerDefaults）。
+	// 作为字段而非包级 var：定时器跑在独立 goroutine 里，包级 var 被测试改写时
+	// 会与运行中的 goroutine 形成数据竞争（-race 实测）。
+	travelTimerCfg travelTimerParams
 
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
@@ -122,6 +141,7 @@ func New(cfg Config) *Scheduler {
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
 		rearmSweep:    make(chan struct{}, 1),
+		rearmTravel:   make(chan struct{}, 1),
 	}
 }
 
@@ -204,6 +224,36 @@ func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepal
 	s.schedMu.Unlock()
 	poke(s.rearmSchedule)
 	poke(s.rearmBalance)
+	// 旅行排程参数变了（hours/开关），到站定时器也要按新配置重算，否则会按旧
+	// hours 推出的时刻继续睡。rearm 本身不会丢信号（buffered 1 + poke 幂等）。
+	poke(s.rearmTravel)
+}
+
+// SetTravelBlindbox 热更新能量盲盒配置（schedule.travel_blindbox_enabled /
+// travel_blindbox_max_per_run）。用独立 setter 而非并入 Reconfigure：后者已有
+// 12 个位置参数，继续追加会让唯一 call site 难以校对。
+// maxPerRun<=0 视为未配置，回落 blindboxDefaultMaxPerRun。
+func (s *Scheduler) SetTravelBlindbox(enabled bool, maxPerRun int) {
+	if maxPerRun <= 0 {
+		maxPerRun = blindboxDefaultMaxPerRun
+	}
+	s.travelBlindboxEnabled.Store(enabled)
+	s.travelBlindboxMaxPerRun.Store(int64(maxPerRun))
+}
+
+// travelBlindboxCfg 读取盲盒配置快照（单趟巡检开头取一次，避免逐号 atomic 读）。
+func (s *Scheduler) travelBlindboxCfg() (enabled bool, maxPerRun int) {
+	n := int(s.travelBlindboxMaxPerRun.Load())
+	if n <= 0 {
+		n = blindboxDefaultMaxPerRun
+	}
+	return s.travelBlindboxEnabled.Load(), n
+}
+
+// PokeTravelTimer 立即唤醒到站定时器重算（手动触发巡检/面板保存配置后调用）。
+// 定时器随后会重查全部账号的 travel/status 并重新确定下一个到站时刻。
+func (s *Scheduler) PokeTravelTimer() {
+	poke(s.rearmTravel)
 }
 
 // poke 非阻塞发一次唤醒信号（已有待处理信号则忽略，语义等价）。
@@ -348,6 +398,13 @@ const (
 // ctx 取消 / rearmSchedule（在线改配置重排）在每段的 select 里随时返回，段长
 // 不影响两者响应性。返回三态见 slotWake。
 func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Duration) slotWake {
+	return s.waitSlotChan(ctx, next, step, s.rearmSchedule)
+}
+
+// waitSlotChan 与 waitSlot 同语义，但可指定重排信号 channel（到站定时器用
+// rearmTravel）。抽出来而不是复制一份：分段等待的墙钟口径只能有一个实现，
+// 两份迟早漂移（一处修了睡眠冻结、另一处没修）。
+func (s *Scheduler) waitSlotChan(ctx context.Context, next time.Time, step time.Duration, rearm <-chan struct{}) slotWake {
 	for {
 		wallRemain := time.Until(next)
 		if wallRemain <= 0 {
@@ -362,7 +419,7 @@ func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Dura
 		case <-ctx.Done():
 			timer.Stop()
 			return slotCancel
-		case <-s.rearmSchedule:
+		case <-rearm:
 			timer.Stop()
 			return slotRearm
 		case <-timer.C:

@@ -590,6 +590,19 @@ $('btnTravelAll').onclick = async () => {
   try { await api('travel_all', { method: 'POST' }); toast('旅行巡检已开始（含领养链路），结果见日志', 'ok'); }
   catch (e) { toast(e.message, 'err'); }
 };
+/* 能量盲盒：第一下只 dry-run（查配额打日志，不消耗能量），确认后再问一次才真正开盒。
+   dry-run 在服务端是异步跑的（账号多时限速约 800ms/号），等一小会儿再弹确认框，
+   让用户有机会先看到「运行日志 → 任务」里的 balance / affordable。 */
+$('btnBlindboxAll').onclick = async () => {
+  try {
+    await api('blindbox_all', { method: 'POST' });
+    toast('盲盒配额查询已开始（dry-run，未消耗能量），结果见日志', 'ok');
+    await new Promise(r => setTimeout(r, 3000));
+    if (!confirm('dry-run 已触发：请先到「运行日志 → 任务」确认各账号的 blindbox ... quota 行。\n\n确认现在真正开盒？每次开盒消耗 energy 且不可逆。')) return;
+    await api('blindbox_all?apply=1', { method: 'POST' });
+    toast('能量盲盒开盒已开始，结果见日志', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+};
 $('btnActivityAll').onclick = async () => {
   try { await api('activity_all', { method: 'POST' }); toast('活跃上报已开始，结果见日志', 'ok'); }
   catch (e) { toast(e.message, 'err'); }
@@ -1143,6 +1156,8 @@ const CFG_MAP = {
   package_detail_limit: ['panel', 'package_detail_limit'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'], growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
+  travel_blindbox_enabled: ['schedule', 'travel_blindbox_enabled'],
+  travel_blindbox_max_per_run: ['schedule', 'travel_blindbox_max_per_run'],
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],

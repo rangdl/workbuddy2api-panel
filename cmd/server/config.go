@@ -117,6 +117,16 @@ type Config struct {
 		// 只做 accept/claim 两条幂等请求，不跑任何行为链路；分钟级开销可忽略。
 		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
 		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
+
+		// Buddy 能量盲盒（energy 唯一消耗出口）：猫 idle 时消耗能量开盒，产出猫/积分。
+		// 与 travel_enabled 独立（关旅行不影响盲盒开关的保存值）。
+		//
+		// 缺省 **false**：开盒不可逆（每次扣 cost_per_open 能量，单号 energy 有限、
+		// 补充依赖连登兑换），先手工触发一次确认产出正常，再决定是否自动执行。
+		TravelBlindboxEnabled bool `json:"travel_blindbox_enabled"` // 缺省 false；true = 旅行 idle 阶段自动开盒
+		// TravelBlindboxMaxPerRun 单趟开盒次数上限（与上游 affordable / max_open_count
+		// 取最小值）。缺省 5；<=0 回落 5；合法范围 1-20。
+		TravelBlindboxMaxPerRun int `json:"travel_blindbox_max_per_run"`
 	} `json:"schedule"`
 
 	Global struct {
@@ -302,6 +312,9 @@ func Default() *Config {
 	c.Schedule.BalanceRefreshMinutes = 5
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
+	// 盲盒缺省关闭（开盒消耗能量且不可逆，先手工验证产出）；单次上限缺省 5。
+	c.Schedule.TravelBlindboxEnabled = false
+	c.Schedule.TravelBlindboxMaxPerRun = 5
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -643,6 +656,10 @@ func (c *Config) normalize() error {
 		}
 		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
 	}
+	// 盲盒单次上限：<=0（含老配置缺键）回落 5；合法范围见 validateScheduleHours。
+	if c.Schedule.TravelBlindboxMaxPerRun <= 0 {
+		c.Schedule.TravelBlindboxMaxPerRun = 5
+	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err
 	}
@@ -696,6 +713,9 @@ func (c *Config) validateScheduleHours() error {
 	}
 	if err := checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours); err != nil {
 		return err
+	}
+	if n := c.Schedule.TravelBlindboxMaxPerRun; n < 1 || n > 20 {
+		return fmt.Errorf("schedule.travel_blindbox_max_per_run: %d 超出范围（1-20）；如要关闭盲盒请设 schedule.travel_blindbox_enabled=false", n)
 	}
 	return checkHourRange("schedule.growth_hours", "growth_enabled", c.Schedule.GrowthHours)
 }

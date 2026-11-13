@@ -222,6 +222,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
+	p.mux.HandleFunc("POST /panel/api/blindbox_all", p.withAuth(p.blindboxAll))
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
@@ -791,6 +792,31 @@ func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
 	go p.cfg.Scheduler.RunTravelNow()
 	log.Printf("panel: 手动全量旅行巡检已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+}
+
+// blindboxAll 手动触发能量盲盒（异步执行）。
+//
+// 默认 dry-run（query `apply=1` 才真正开盒）：开盒消耗能量且不可逆，按钮的
+// 第一下必须是「只看 quota」，由用户确认能量与可开次数后再显式确认开盒。
+func (p *Panel) blindboxAll(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	apply := r.URL.Query().Get("apply") == "1"
+	maxPerRun := 0
+	if v := r.URL.Query().Get("max"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			maxPerRun = n
+		}
+	}
+	go p.cfg.Scheduler.RunBlindboxNow(apply, maxPerRun)
+	if apply {
+		log.Printf("panel: 手动开能量盲盒已触发（真实开盒）")
+	} else {
+		log.Printf("panel: 手动能量盲盒已触发（dry-run，只查配额）")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "apply": apply})
 }
 
 // activityAll 手动触发全量活跃上报（异步执行；点亮连登 + 解锁领养前置）。

@@ -208,6 +208,8 @@ func main() {
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
 	})
+	// 能量盲盒（缺省关闭）：独立 setter 挂载，避免继续膨胀 Reconfigure 的位置参数。
+	sch.SetTravelBlindbox(cfg.Schedule.TravelBlindboxEnabled, cfg.Schedule.TravelBlindboxMaxPerRun)
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
 		log.Printf("签到已禁用（schedule.checkin_enabled=false）")
@@ -218,7 +220,13 @@ func main() {
 	case !cfg.Schedule.TravelEnabled:
 		log.Printf("猫猫旅行已禁用（schedule.travel_enabled=false）")
 	default:
-		log.Printf("猫猫旅行已启用：%v 点（独立排程：领养 / 派出 / 领奖）", cfg.Schedule.TravelHours)
+		log.Printf("猫猫旅行已启用：%v 点（固定兜底）+ 到站定时器（按 arrive_at 精确唤醒）", cfg.Schedule.TravelHours)
+	}
+	switch {
+	case !cfg.Schedule.TravelBlindboxEnabled:
+		log.Printf("Buddy 能量盲盒自动开盒已禁用（schedule.travel_blindbox_enabled=false；面板「开能量盲盒」按钮可手工触发）")
+	default:
+		log.Printf("Buddy 能量盲盒已启用：每账号单趟至多 %d 次（消耗 energy，猫 idle 时执行）", cfg.Schedule.TravelBlindboxMaxPerRun)
 	}
 	switch {
 	case !cfg.Schedule.ActivityEnabled:
@@ -433,6 +441,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	// 猫猫旅行到站定时器：按各账号 travel/status 的 arrive_at 精确唤醒（固定 hours
+	// 只作兜底）。首轮自带启动补跑，覆盖关机期间已到站未领的行程。
+	go sch.RunTravelTimer(ctx)
 	// Trae 签到调度（独立于 CodeBuddy 的 scheduler：两者账号体系与排程配置互不相干）。
 	go traeSched.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
@@ -630,6 +641,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+	sch.SetTravelBlindbox(newCfg.Schedule.TravelBlindboxEnabled, newCfg.Schedule.TravelBlindboxMaxPerRun)
 
 	return restartRequiredFields(newCfg), nil
 }

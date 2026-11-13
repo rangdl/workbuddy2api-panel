@@ -859,3 +859,62 @@ func TestServerReadTimeout(t *testing.T) {
 		t.Error("unparsable read_timeout should fail fast")
 	}
 }
+
+// TestTravelBlindboxDefaultsOff 能量盲盒缺省关闭（开盒消耗 energy 且不可逆，先手工验证）。
+// 上限缺省 5；老 config（无这两个键）加载后同样如此。
+func TestTravelBlindboxDefaultsOff(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Schedule.TravelBlindboxEnabled {
+		t.Error("travel_blindbox_enabled 缺省必须为 false（消耗不可逆）")
+	}
+	if c.Schedule.TravelBlindboxMaxPerRun != 5 {
+		t.Errorf("travel_blindbox_max_per_run=%d want 5", c.Schedule.TravelBlindboxMaxPerRun)
+	}
+
+	// 老 config 无该键：仍是关闭 + 默认上限。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"travel_hours":[9,21]}}`), 0o600)
+	lc, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lc.Schedule.TravelBlindboxEnabled || lc.Schedule.TravelBlindboxMaxPerRun != 5 {
+		t.Errorf("老配置回落错误：enabled=%v max=%d", lc.Schedule.TravelBlindboxEnabled, lc.Schedule.TravelBlindboxMaxPerRun)
+	}
+
+	// 显式开启 + 自定义上限。
+	on, err := ParseConfig([]byte(`{"schedule":{"travel_blindbox_enabled":true,"travel_blindbox_max_per_run":3}}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !on.Schedule.TravelBlindboxEnabled || on.Schedule.TravelBlindboxMaxPerRun != 3 {
+		t.Errorf("显式配置未生效：%+v", on.Schedule)
+	}
+
+	// 0 / 负数上限回落默认。
+	zero, err := ParseConfig([]byte(`{"schedule":{"travel_blindbox_max_per_run":0}}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if zero.Schedule.TravelBlindboxMaxPerRun != 5 {
+		t.Errorf("上限 0 应回落 5，got %d", zero.Schedule.TravelBlindboxMaxPerRun)
+	}
+}
+
+// TestTravelBlindboxMaxPerRunOutOfRange 上限超过 20 快速失败，并指向关闭开关。
+//
+// 负数不走报错：与 balance_refresh_minutes / task_sweep_minutes 同口径，
+// <=0 一律视为「未配置」回落默认 5（见 TestTravelBlindboxDefaultsOff 的 0 用例）。
+func TestTravelBlindboxMaxPerRunOutOfRange(t *testing.T) {
+	_, err := ParseConfig([]byte(`{"schedule":{"travel_blindbox_max_per_run":21}}`))
+	if err == nil {
+		t.Fatal("want error for travel_blindbox_max_per_run=21")
+	}
+	if !strings.Contains(err.Error(), "travel_blindbox_enabled") {
+		t.Errorf("error should point at schedule.travel_blindbox_enabled: %v", err)
+	}
+}

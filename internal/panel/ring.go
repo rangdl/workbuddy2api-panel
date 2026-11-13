@@ -28,8 +28,11 @@ type LogEntry struct {
 }
 
 // taskPrefixes 任务动作日志的行首标识（scheduler 与 panel 的既有口径）。
+//
+// 注意 "travel-timer:" 必须单列：前缀匹配是逐条 HasPrefix，"travel " 带空格，
+// 匹配不到 "travel-timer: ..."（无 uid 的全局行），否则这条会落到 sys 频道。
 var taskPrefixes = []string{
-	"school ", "streak-bonus ", "travel ", "blackcat ", "lottery ",
+	"school ", "streak-bonus ", "travel ", "travel-timer ", "travel-timer:", "blindbox ", "blackcat ", "lottery ",
 	"checkin ", "activity ", "keepalive ", "balance ", "user-resource ",
 	"panel: 任务", "panel: 一键", "panel: checkin", "panel: 手动",
 	"panel: 队列", "panel: 券码",

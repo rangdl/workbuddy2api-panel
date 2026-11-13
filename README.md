@@ -390,11 +390,13 @@ curl -s http://localhost:7863/v1/search/messages \
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询解冻。空数组 / `null` = 未配置回落默认（不是禁用） |
-| `schedule.travel_hours` | `[9, 21]` | 每日本地时区整点推进猫猫旅行状态机（领养 / 派出 / 领奖） |
+| `schedule.travel_hours` | `[9, 21]` | 每日本地时区整点推进猫猫旅行状态机（领养 / 派出 / 领奖）；**兜底**排程——主路径是到站定时器 |
 | `schedule.activity_hours` | `[10]` | 每日本地时区整点对话活跃上报（点亮连登 + 解锁 `first_buddy`） |
 | `schedule.keepalive_hours` | `[22]` | 每日本地时区整点刷新 token 保活 |
 | `schedule.blackcat_hours` | `[23]` | 每日本地时区整点夜猫子补足（23:00–08:00 计数窗口） |
 | `schedule.checkin_enabled` | `true` | 签到总开关；`false` 真正关闭 |
+| `schedule.travel_blindbox_enabled` | `false` | Buddy 能量盲盒自动开盒（猫 `idle` 时消耗 energy）；消耗不可逆故缺省关闭 |
+| `schedule.travel_blindbox_max_per_run` | `5` | 单趟开盒次数上限（1-20），实际取 `min(affordable, max_open_count, 本值)` |
 | `schedule.travel_enabled` | `true` | 猫猫旅行总开关（独立于签到） |
 | `schedule.activity_enabled` | `true` | 活跃上报总开关 |
 | `schedule.keepalive_enabled` | `true` | token 保活总开关 |
@@ -559,7 +561,7 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 |---|---|---|---|
 | 签到 | `schedule.checkin_enabled` | `checkin_hours` `[9, 21]` 整点 | 签到 + 余额查询；余额恢复则解冻冷却账号。**末尾追加连登管家**（见下） |
 | 活跃上报 | `schedule.activity_enabled` | `activity_hours` `[10]` 整点 | 对话活跃上报（`chat_request_send` 事件，必须含 `userId`）；点亮连登 + 解锁 `first_buddy`；每号每天 1 次 |
-| 猫猫旅行 | `schedule.travel_enabled` | `travel_hours` `[9, 21]` 整点 | 独立排程：无猫领养 / `idle` 派出 / `arrived` 领奖 |
+| 猫猫旅行 | `schedule.travel_enabled` | `travel_hours` `[9, 21]` 整点 + 到站定时器 | 独立排程：无猫领养 / `idle` 派出 / `arrived` 领奖；到站定时器按 `arrive_at` 精确唤醒 |
 | 保活 | `schedule.keepalive_enabled` | `keepalive_hours` `[22]` 整点 | 全账号刷新 token；session 失效**连续 3 次**才自动禁用 |
 | 夜猫子 | `schedule.blackcat_enabled` | `blackcat_hours` `[23]` 整点 | **先查任务进度再决定**：`black_cat` 未达标才在 23:00–08:00 计数窗口内补足 glm-5.2 短对话（每天 1 次累计 3 天，漏跑次日窗口自动补） |
 
@@ -631,18 +633,36 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 
 #### 猫猫旅行（独立排程）
 
-对池内每个可用账号在 `travel_hours`（默认 `[9, 21]` 整点）单趟推进一次，每趟只做一个动作，不轮询不等待。默认两趟闭环：9 点领昨日到站奖励并派出，21 点领当日到站奖励（`daily_limit_reached` 自动挡住二次派出）。
+两条触发路径并存：
+
+- **到站定时器（主路径）**：独立 goroutine 周期性查 `travel/status`，按上游返回的 `arrive_at` 精确定时唤醒，到点只对那个账号跑一趟 `travelOne`。剩余时长用 `arrive_at - server_now` 换算，不受本机时钟偏差影响；等待按 1 分钟分段（`wallclockCheckStep`），机器休眠后醒来仍能立即补跑。无在途行程时按 10 分钟周期重查（纯 sleep，不产生上游请求）。
+- **`travel_hours` 定点点检（兜底）**：默认 `[9, 21]`，覆盖定时器漏唤醒 / 长期关机后的补跑。
+
+单趟最多三个动作（claim → 盲盒 → depart），不再「每趟只做一个」：
 
 | 探测结果 | 动作 |
 |---|---|
 | 无猫（`buddy` 为 `null`） | 先同意协议（幂等），再尝试领养；过门槛则 +300 积分并获得猫 |
-| `state=idle` 且今日未派出 | 派出 `location_id=4`（古镇客栈；4 个地点收益 / 时长区间相同，无最优解） |
-| `state=arrived` | 领取到站奖励（带 `record_id`） |
+| `state=arrived` | 领取到站奖励（带 `record_id`）→ **重查 status**；若已回到 `idle` 且今日未派出，同趟继续派出 |
+| `state=idle` 且今日未派出 | 先开能量盲盒（若开启）→ 派出 `location_id=4`（古镇客栈；4 个地点收益 / 时长区间相同，无最优解） |
 | `state=traveling` / 今日已达上限 / 未知状态 | 跳过 |
+
+> 领奖后**重查**而不是假定：上游可能把状态置回 `idle`，也可能因当日上限锁死。
+> 盲盒必须排在派出**之前**——派出后猫进入 `traveling`，上游会拒绝开盒。
 
 - 领养门槛未达标时上游返回 HTTP 400，每账号每自然日只尝试一次（跨日重试，记录仅存内存）；门槛可用活跃上报解除
 - 限速：账号间间隔 800ms
 - 每自然日 1 次派出：按 CST（Asia/Shanghai）自然日重置，与容器 `TZ` 无关
+
+#### Buddy 能量盲盒（`schedule.travel_blindbox_*`）
+
+energy 此前只进不出（连登兑换发 energy，但没有任何消耗出口）。盲盒是唯一的消耗口：`POST /activity/growth/buddy/open` 每次扣 `cost_per_open` 能量，产出猫 / 积分。
+
+- **前置门控**：旅行状态必须 `idle`（旅行中 / 到站未领时上游拒绝）；`affordable <= 0` 直接跳过
+- **次数**：`min(affordable, max_open_count, travel_blindbox_max_per_run)`
+- **缺省关闭**：消耗不可逆、单号 energy 有限且补充依赖连登兑换。面板账号池上方的「**能量盲盒**」按钮默认 **dry-run**（只查 quota 打日志，不消耗能量），确认产出后再打开自动执行
+- 写请求不重试：服务端可能已扣能量，重试会重复消耗
+- 日志前缀 `blindbox `，与 `travel ` / `travel-timer ` 同属「运行日志 → 任务」频道
 - 失败隔离：单账号失败只跳过该账号当趟；401 不强刷（token 刷新交保活时点）
 
 ## API 端点

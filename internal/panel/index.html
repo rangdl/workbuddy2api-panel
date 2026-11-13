@@ -716,6 +716,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnRemarks">备注</button>
           <button class="xs" id="btnCheckinAll">全部签到</button>
           <button class="xs" id="btnTravelAll">旅行巡检</button>
+          <button class="xs" id="btnBlindboxAll">能量盲盒</button>
           <button class="xs" id="btnActivityAll">活跃上报</button>
           <button class="xs" id="btnKeepaliveAll">全部保活</button>
         </header>
@@ -996,10 +997,19 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div class="hr"></div>
             <div class="grid2">
-              <div class="switch"><span class="lb">后台刷新余额</span>
-                <input type="checkbox" name="balance_refresh_enabled"></div>
-              <label class="fld"><span class="lb">刷新间隔（分钟）</span>
-                <input name="balance_refresh_minutes" type="number" min="1" placeholder="5"></label>
+              <div>
+                <div class="switch"><span class="lb">Buddy 能量盲盒</span>
+                  <input type="checkbox" name="travel_blindbox_enabled"></div>
+                <label class="fld"><span class="lb">单趟开盒上限（次）</span>
+                  <input name="travel_blindbox_max_per_run" type="number" min="1" max="20" placeholder="5">
+                  <span class="hint">猫 idle 时消耗 energy 开盒（产出猫 / 积分），实际次数与上游可开次数取最小值。消耗不可逆，默认关闭——先用账号池上方的「能量盲盒」按钮 dry-run 看配额，确认产出后再打开</span></label>
+              </div>
+              <div>
+                <div class="switch"><span class="lb">后台刷新余额</span>
+                  <input type="checkbox" name="balance_refresh_enabled"></div>
+                <label class="fld"><span class="lb">刷新间隔（分钟）</span>
+                  <input name="balance_refresh_minutes" type="number" min="1" placeholder="5"></label>
+              </div>
             </div>
             <div class="hr"></div>
             <div class="grid2">

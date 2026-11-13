@@ -54,3 +54,6 @@ docs/
 server.exe
 .DS_Store
 .playwright-mcp/
+
+# 本地 Claude Code 配置与技能包（含 fnos CLI 等，非项目代码）
+.claude/

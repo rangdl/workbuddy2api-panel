@@ -3,6 +3,7 @@
 package scheduler
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -20,6 +21,10 @@ const (
 	travelStateIdle      = "idle"
 	travelStateTraveling = "traveling"
 	travelStateArrived   = "arrived"
+
+	// blindboxDefaultMaxPerRun 盲盒单趟开盒次数上限的兜底值（配置未设/非法时）。
+	// 与上游 max_open_count 的常见值一致；实际次数仍取三者最小值。
+	blindboxDefaultMaxPerRun = 5
 )
 
 // travelAccountDelay 账号间限速：全量账号约 40s，避免上游风控。测试可置 0。
@@ -46,8 +51,26 @@ func travelDay(t time.Time) string {
 // 领奖 + 领养前置上报），不发模型对话，与「让位防风控」不冲突；
 // 401/查询失败只跳过该账号本轮（不强刷 token，交 22:00 keepalive）；
 // 账号间限速 travelAccountDelay。
+//
+// 末尾 poke 到站定时器：本趟可能派出了新行程，定时器需要按新的 arrive_at 重算。
 func (s *Scheduler) RunTravelNow() {
+	s.travelMu.Lock()
+	defer s.travelMu.Unlock()
 	first := true
+	for _, a := range s.travelAccounts() {
+		if !first {
+			time.Sleep(travelAccountDelay)
+		}
+		first = false
+		s.travelOne(a)
+	}
+	s.PokeTravelTimer()
+}
+
+// travelAccounts 返回本轮可参与旅行的账号（gating 与 RunTravelNow 原实现逐条一致）。
+// 抽出来供批次巡检与到站定时器共用，避免两处门控漂移。
+func (s *Scheduler) travelAccounts() []*auth.Auth {
+	var out []*auth.Auth
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -62,19 +85,22 @@ func (s *Scheduler) RunTravelNow() {
 		if a.IsEnterpriseSession() {
 			continue // 企业版 / 企业切换会话门控：无成长体系（growth 端点企业号 403；切换会话不计分），不发起任何上游调用
 		}
-		if !first {
-			time.Sleep(travelAccountDelay)
-		}
-		first = false
-		s.travelOne(a)
+		out = append(out, a)
 	}
+	return out
 }
 
-// travelOne 单账号单趟状态机：查有无猫 + 查状态 + 最多一个动作，不轮询不等待。
+// travelOne 单账号一趟状态机：查有无猫 + 查状态 + 至多 claim / 盲盒 / depart 各一次。
+//
+// 2026-11 改造（线上实证）：原实现每趟只做一个动作，而「派出 → 2h → 到站 → 领奖」
+// 需要跨两个 travel_hours 窗口。飞牛 NAS 每天开关机，[9,21] 两个窗口几乎从不
+// 同时命中，导致到站奖励挂了 19 天无人领。现在领奖成功后**重查 status**（不重查
+// buddy/info：猫档案本趟不会变）——若已回到 idle 且未达当日上限，同趟继续派出。
 func (s *Scheduler) travelOne(a *auth.Auth) {
+	label := logfmt.Label(a.UID, a.NicknameValue())
 	buddy, err := s.cfg.Upstream.BuddyInfo(a)
 	if err != nil {
-		log.Printf("travel %s: buddy-info: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
+		log.Printf("travel %s: buddy-info: %v", label, err)
 		return
 	}
 	if buddy == nil {
@@ -83,19 +109,83 @@ func (s *Scheduler) travelOne(a *auth.Auth) {
 	}
 	ts, err := s.cfg.Upstream.TravelStatus(a)
 	if err != nil {
-		log.Printf("travel %s: status: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
+		log.Printf("travel %s: status: %v", label, err)
 		return
 	}
-	switch ts.State {
-	case travelStateArrived:
-		s.travelClaim(a, ts)
-	case travelStateIdle:
-		s.travelDepart(a, ts)
-	case travelStateTraveling:
-		log.Printf("travel %s: skip (traveling record=%d)", logfmt.Label(a.UID, a.NicknameValue()), ts.RecordID)
-	default:
-		log.Printf("travel %s: skip (unknown state %q)", logfmt.Label(a.UID, a.NicknameValue()), ts.State)
+	if ts.State == travelStateArrived {
+		if !s.travelClaim(a, ts) {
+			return // 缺 record_id / 上游报错：状态未变，不猜下一步
+		}
+		// claim 后服务端可能置 idle（可再派出一趟），也可能因当日上限直接锁死；
+		// 重新查询而不是假定，避免盲发 depart 撞业务错误。
+		next, err := s.cfg.Upstream.TravelStatus(a)
+		if err != nil {
+			log.Printf("travel %s: status after claim: %v", label, err)
+			return
+		}
+		ts = next
 	}
+	switch ts.State {
+	case travelStateIdle:
+		s.travelIdlePhase(a, ts)
+	case travelStateTraveling:
+		log.Printf("travel %s: skip (traveling record=%d)", label, ts.RecordID)
+	case travelStateArrived:
+		log.Printf("travel %s: skip (still arrived after claim, record=%d)", label, ts.RecordID)
+	default:
+		log.Printf("travel %s: skip (unknown state %q)", label, ts.State)
+	}
+}
+
+// RunBlindboxNow 手动触发一轮能量盲盒（面板按钮）。
+//
+// apply=false 为 dry-run：只查旅行状态 + quota 并打日志，不消耗任何能量——
+// 开盒不可逆，面板默认必须是 dry-run。apply=true 时才真正开盒（受 maxPerRun 约束）。
+//
+// 与自动链路的门控完全一致（走同一个 travelBlindBox）：旅行非 idle 跳过、
+// 能量不足跳过。区别只在于不派出、不受 travel_blindbox_enabled 开关限制
+// （手工触发是用户的明确意图）。
+func (s *Scheduler) RunBlindboxNow(apply bool, maxPerRun int) {
+	if maxPerRun <= 0 {
+		maxPerRun = blindboxDefaultMaxPerRun
+	}
+	s.travelMu.Lock()
+	defer s.travelMu.Unlock()
+	first := true
+	for _, a := range s.travelAccounts() {
+		if !first {
+			time.Sleep(travelAccountDelay)
+		}
+		first = false
+		label := logfmt.Label(a.UID, a.NicknameValue())
+		ts, err := s.cfg.Upstream.TravelStatus(a)
+		if err != nil {
+			log.Printf("blindbox %s: status: %v", label, err)
+			continue
+		}
+		if !apply {
+			q, err := s.cfg.Upstream.BuddyQuota(a)
+			if err != nil {
+				log.Printf("blindbox %s: quota: %v", label, err)
+				continue
+			}
+			log.Printf("blindbox %s: [dry-run] travel=%s balance=%d affordable=%d cost=%d max=%d",
+				label, ts.State, q.Balance, q.Affordable, q.CostPerOpen, q.MaxOpenCount)
+			continue
+		}
+		s.travelBlindBox(a, ts, maxPerRun)
+	}
+}
+
+// travelIdlePhase 空闲阶段：先开能量盲盒（服务端要求 idle），再派出。
+//
+// 顺序不能反：派出后猫进入 traveling，盲盒会被上游拒绝；而领奖后回到 idle 的
+// 这一刻正是盲盒唯一可用的时机（每日至多一次）。
+func (s *Scheduler) travelIdlePhase(a *auth.Auth, ts *upstream.TravelState) {
+	if enabled, maxPerRun := s.travelBlindboxCfg(); enabled {
+		s.travelBlindBox(a, ts, maxPerRun)
+	}
+	s.travelDepart(a, ts)
 }
 
 // travelDepart 空闲且未达当日上限时派出（每日 1 次，自然日 00:00 CST 重置）。
@@ -111,18 +201,115 @@ func (s *Scheduler) travelDepart(a *auth.Auth, ts *upstream.TravelState) {
 	log.Printf("travel %s: depart ok location=%d", logfmt.Label(a.UID, a.NicknameValue()), travelLocationID)
 }
 
-// travelClaim 到站领奖（必须带 record_id）。
-func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) {
+// travelClaim 到站领奖（必须带 record_id）；返回是否领奖成功（成功才值得重查状态）。
+func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) bool {
 	if ts.RecordID == 0 {
 		log.Printf("travel %s: claim skipped (arrived but no record_id)", logfmt.Label(a.UID, a.NicknameValue()))
-		return
+		return false
 	}
 	reward, err := s.cfg.Upstream.TravelClaim(a, ts.RecordID)
 	if err != nil {
 		log.Printf("travel %s: claim record=%d: %v", logfmt.Label(a.UID, a.NicknameValue()), ts.RecordID, err)
-		return
+		return false
 	}
 	log.Printf("travel %s: claim ok record=%d reward=%d", logfmt.Label(a.UID, a.NicknameValue()), ts.RecordID, reward)
+	return true
+}
+
+// travelBlindBox 开能量盲盒（消耗闲置 energy）。
+//
+// 门控（照参考实现 + 实测）：
+//   - 旅行状态必须 idle：旅行中/到站未领时上游拒绝开盒；
+//   - affordable <= 0 表示能量不足，直接跳过（省一次写请求）；
+//   - 单次次数 = min(affordable, max_open_count, 配置上限)。
+//
+// 写请求不重试：服务端可能已扣能量，重试会重复消耗（probe_blindbox.py 同口径）。
+func (s *Scheduler) travelBlindBox(a *auth.Auth, ts *upstream.TravelState, maxPerRun int) {
+	label := logfmt.Label(a.UID, a.NicknameValue())
+	if ts.State != travelStateIdle {
+		log.Printf("blindbox %s: skip (travel state=%s, must be idle)", label, ts.State)
+		return
+	}
+	q, err := s.cfg.Upstream.BuddyQuota(a)
+	if err != nil {
+		log.Printf("blindbox %s: quota: %v", label, err)
+		return
+	}
+	log.Printf("blindbox %s: quota balance=%d affordable=%d cost=%d max=%d",
+		label, q.Balance, q.Affordable, q.CostPerOpen, q.MaxOpenCount)
+	if q.Affordable <= 0 {
+		log.Printf("blindbox %s: skip (energy insufficient, affordable=0)", label)
+		return
+	}
+	count := q.Affordable
+	// max_open_count 缺失（0）时按 1 处理：宁少开不多开，剩余额度下一趟再开。
+	serverMax := q.MaxOpenCount
+	if serverMax <= 0 {
+		serverMax = 1
+	}
+	if count > serverMax {
+		count = serverMax
+	}
+	if maxPerRun > 0 && count > maxPerRun {
+		count = maxPerRun
+	}
+	raw, err := s.cfg.Upstream.BuddyOpen(a, count)
+	if err != nil {
+		log.Printf("blindbox %s: open failed: %v", label, err)
+		return
+	}
+	if name := blindboxPrizeName(raw); name != "" {
+		log.Printf("blindbox %s: opened %d time(s) → %s", label, count, name)
+	} else {
+		log.Printf("blindbox %s: opened %d time(s)", label, count)
+	}
+	if blindboxNeedsAddress(raw) {
+		log.Printf("blindbox %s: 实物奖，需到成长中心填写收件地址", label)
+	}
+}
+
+// blindboxPrizeName 从开盒载荷里尽力提取猫名（形状随活动期变化，取不到就返回空）。
+// 兼容 {"buddy":{"name":...}} / {"buddy":"名字"} / {"buddies":[{...}]} / {"name":...}。
+func blindboxPrizeName(raw json.RawMessage) string {
+	var m map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &m) != nil {
+		return ""
+	}
+	if v, ok := m["buddy"]; ok {
+		switch b := v.(type) {
+		case string:
+			return b
+		case map[string]any:
+			if n, ok := b["name"].(string); ok {
+				return n
+			}
+		}
+	}
+	if list, ok := m["buddies"].([]any); ok && len(list) > 0 {
+		if b, ok := list[0].(map[string]any); ok {
+			if n, ok := b["name"].(string); ok {
+				return n
+			}
+		}
+	}
+	if n, ok := m["name"].(string); ok {
+		return n
+	}
+	return ""
+}
+
+// blindboxNeedsAddress 载荷是否提示中实物奖（需自行填收件地址）。
+func blindboxNeedsAddress(raw json.RawMessage) bool {
+	var m map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &m) != nil {
+		return false
+	}
+	for _, k := range []string{"need_address", "require_address"} {
+		if v, ok := m[k].(bool); ok && v {
+			return true
+		}
+	}
+	return false
 }
 
 // travelAdopt 无猫时领养，链路：report → agreement → buddy/first。
