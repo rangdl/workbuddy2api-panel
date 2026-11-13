@@ -356,16 +356,16 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', upstream: '上游接入', clients: '协议接入', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', upstream: 'Trae 签到', clients: '协议接入', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
-  if (v === 'clients') { loadResponsesConfig(); loadAnthropicConfig(); }
+  if (v === 'clients') { loadResponsesConfig(); loadAnthropicConfig(); loadThirdPartyConfig(); }
   if (v === 'config') loadConfig();
-  if (v === 'upstream') { loadThirdPartyConfig(); loadTraeConfig(); }
+  if (v === 'upstream') loadTraeConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();

@@ -12,7 +12,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/thirdparty"
 )
 
-// TestThirdPartyConfigAPI 覆盖面板「上游接入」页接口：
+// TestThirdPartyConfigAPI 覆盖面板「协议接入」页的第三方上游接口：
 // 缺文件回默认值、合法保存落盘、非法拒绝、鉴权、热重载钩子。
 func TestThirdPartyConfigAPI(t *testing.T) {
 	dir := t.TempDir()

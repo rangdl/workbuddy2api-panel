@@ -641,8 +641,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型与档位</a></li>
       <li><a href="#upstream" data-view="upstream">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 5.5h5M11.5 5.5h2M2.5 10.5h2M8.5 10.5h5"/><circle cx="9.5" cy="5.5" r="1.6"/><circle cx="5.5" cy="10.5" r="1.6"/></svg>
-        上游接入</a></li>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="m5.6 7 1.5 1.5L10.4 5.9"/></svg>
+        Trae 签到</a></li>
       <li><a href="#clients" data-view="clients">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M6 2.5 3.5 5 6 7.5M10 8.5 12.5 11 10 13.5"/><path d="M9 2.5 7 13.5"/></svg>
         协议接入</a></li>
@@ -1184,32 +1184,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </form>
     </section>
 
-    <!-- 上游接入 -->
+    <!-- Trae 签到：Trae 上游的账号 / 签到 / 凭证管理 -->
     <section class="view" id="view-upstream" hidden>
       <div class="box">
-        <header><h3>第三方上游（OpenAI 兼容）</h3><span class="grow"></span><span class="note" id="tpPath"></span></header>
-        <div class="pad">
-          <div class="switch"><span class="lb">启用 /tp/v1/*</span>
-            <input type="checkbox" id="tpEnabled"></div>
-          <div class="hint">启用后，客户端把 base_url 指向 <code>http://&lt;主机&gt;:&lt;端口&gt;/tp/v1</code> 即可走第三方上游；
-            原 <code>/v1/*</code> 仍走 CodeBuddy，两者并存互不影响。</div>
-          <div class="hr"></div>
-          <div class="fld"><span class="lb">上游列表（按顺序匹配模型名；models 留空 = 兜底承接未命中的模型）</span>
-            <div id="tpRows" style="display:flex;flex-direction:column;gap:10px;margin:6px 0"></div>
-            <button type="button" class="xs" id="btnTpAddRow">+ 添加上游</button>
-            <span class="hint">上游需为 OpenAI 兼容（<code>POST {base_url}/chat/completions</code>，Bearer 鉴权）。</span></div>
-          <div class="hint" style="margin-top:10px">保存后立即生效（启用开关与上游列表热重载，无需重启）。</div>
-        </div>
-        <div class="savebar">
-          <span class="grow"></span>
-          <span class="restart-note" id="tpNote"></span>
-          <button type="button" id="btnTpReload">放弃修改</button>
-          <button type="button" class="primary" id="btnTpSave">保存上游配置</button>
-        </div>
-      </div>
-
-      <div class="box">
-        <header><h3>Trae 上游</h3><span class="grow"></span><span class="note" id="traePath"></span></header>
+        <header><h3>Trae 签到</h3><span class="grow"></span><span class="note" id="traePath"></span></header>
         <div class="pad">
           <div class="switch"><span class="lb">启用 /trae/v1/*</span>
             <input type="checkbox" id="traeEnabled"></div>
@@ -1265,7 +1243,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
     </section>
 
-    <!-- 协议接入：Codex（Responses）/ Claude Code（Anthropic）客户端协议 -->
+    <!-- 协议接入：Codex（Responses）/ Claude Code（Anthropic）/ 第三方 OpenAI 兼容上游 -->
     <section class="view" id="view-clients" hidden>
       <div class="box" id="respBox">
         <header><h3>Responses / Codex 接入</h3><span class="grow"></span><span class="note" id="respPath"></span></header>
@@ -1314,6 +1292,28 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button type="button" class="primary" id="btnAnthSave">保存 Anthropic 配置</button>
         </div>
       </div>
+      <div class="box">
+        <header><h3>第三方上游（OpenAI 兼容）</h3><span class="grow"></span><span class="note" id="tpPath"></span></header>
+        <div class="pad">
+          <div class="switch"><span class="lb">启用 /tp/v1/*</span>
+            <input type="checkbox" id="tpEnabled"></div>
+          <div class="hint">启用后，客户端把 base_url 指向 <code>http://&lt;主机&gt;:&lt;端口&gt;/tp/v1</code> 即可走第三方上游；
+            原 <code>/v1/*</code> 仍走 CodeBuddy，两者并存互不影响。</div>
+          <div class="hr"></div>
+          <div class="fld"><span class="lb">上游列表（按顺序匹配模型名；models 留空 = 兜底承接未命中的模型）</span>
+            <div id="tpRows" style="display:flex;flex-direction:column;gap:10px;margin:6px 0"></div>
+            <button type="button" class="xs" id="btnTpAddRow">+ 添加上游</button>
+            <span class="hint">上游需为 OpenAI 兼容（<code>POST {base_url}/chat/completions</code>，Bearer 鉴权）。</span></div>
+          <div class="hint" style="margin-top:10px">保存后立即生效（启用开关与上游列表热重载，无需重启）。</div>
+        </div>
+        <div class="savebar">
+          <span class="grow"></span>
+          <span class="restart-note" id="tpNote"></span>
+          <button type="button" id="btnTpReload">放弃修改</button>
+          <button type="button" class="primary" id="btnTpSave">保存上游配置</button>
+        </div>
+      </div>
+
     </section>
 
     <!-- 日志 -->

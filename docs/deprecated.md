@@ -45,13 +45,14 @@
 | 移除配置装配 | `cmd/server/thirdparty_config.go` |
 | 移除面板接口 | `internal/panel/panel.go` 的 `thirdparty_config` / `thirdparty_test` |
 | 移除面板前端 | `internal/panel/js/config.js`（`tpInput` / `tpProviderRow` / `collectThirdPartyConfig` 等） |
-| 移除面板 DOM | `internal/panel/index.html`「上游接入」页的第三方上游卡片 |
+| 移除面板 DOM | `internal/panel/index.html`「协议接入」页的第三方上游卡片 |
 | 移除配置生成 | `cmd/server/configs.go` 的 `third_party.json` 默认值 |
 | 移除迁移项 | `cmd/server/layout.go` 的 `legacyFiles` 条目 |
 | 删除示例 | `third_party.example.json` |
 | 清理文档 | README「第三方上游」整节 |
 
-⚠️ 注意：「上游接入」页同时承载 Trae 配置，改 HTML 时不要把整页删掉。
+⚠️ 注意：第三方上游卡片 2026-11-13 已从「上游接入」移到「协议接入」页，
+与 Responses / Anthropic 卡片同页。三者都移除后，「协议接入」整页才会空。
 
 ### 第二步：Anthropic Messages（`/v1/messages`）
 
