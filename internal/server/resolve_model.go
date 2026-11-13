@@ -1,6 +1,18 @@
 package server
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
+)
+
+// resolveModelFull 在 resolveModelDetail 之上支持上游前缀（gateway.ModelRef）。
+//
+// 规则见 gateway.ParseModelRef：「显式 = 锁定，缺省 = 自由」。
+// backends 由调用方从注册表取（只含已启用的），解析层不硬编码上游名。
+func resolveModelFull(model string, backends []string) gateway.ModelRef {
+	return gateway.ParseModelRef(model, backends)
+}
 
 // resolveModelDetail 解析模型名协议（PLAN D6），并区分「realm 是否由调用方显式写出」：
 //

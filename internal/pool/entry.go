@@ -96,6 +96,9 @@ type Status struct {
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
 	Realm string `json:"realm,omitempty"`
+	// Backend 账号所属上游（"codebuddy" / "trae"）。
+	// 多上游合池后面板据此分组，调用方据此挑对上游实现。
+	Backend string `json:"backend,omitempty"`
 	// Enterprise 企业版账号（auth.EnterpriseID 非空，计算值不落盘）。
 	// 企业版无个人成长体系（签到/成长任务/连登/旅行/夜猫子 上游均拒），
 	// 面板据此隐藏对应按钮；选号、保活、额度展示不受影响。

@@ -121,7 +121,7 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 // 返回每个账号的结果；账号间按配置间隔限速（默认 800ms）。
 //
 // 语义：**不检查 cfg.Enabled 与排程开关**——手动触发是用户的显式意图，
-// 允许"先登录账号、手动签到验证，再决定是否启用 /trae/v1/*"。
+// 允许"先登录账号、手动签到验证，再决定是否启用该上游"。
 // 自动排程的开关判定在 tick 里（那里才需要 Enabled + Schedule.Enabled 双闸）。
 func (s *Scheduler) RunOnce(ctx context.Context) []CheckinOutcome {
 	cfg := s.ConfigFn()

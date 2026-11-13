@@ -85,6 +85,11 @@ type Inbound struct {
 	SessionKey string
 	// ConversationID 会话标识（上游追踪头用）。
 	ConversationID string
+	// ChatID 本次响应的 id（"chatcmpl-..."），由调用方生成。
+	//
+	// 为什么放在 Inbound 而不是让 backend 自己生成：同一次客户端请求可能换号
+	// 重试，各次尝试必须产出**同一个** id，否则客户端会把重试结果当成新消息。
+	ChatID string
 }
 
 // Outbound 规范化的上游回程。

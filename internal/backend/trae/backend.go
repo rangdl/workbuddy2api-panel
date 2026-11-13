@@ -126,7 +126,7 @@ func (b *Backend) Chat(ctx context.Context, acc gateway.Account, in *gateway.Inb
 		Stream: rc,
 		Convert: func(emit func(frame []byte) error) (gateway.StreamStats, error) {
 			// Trae 的自定义 SSE 必须整体重写（CodeBuddy 只需帧规范化）。
-			res, err := traepkg.ConvertStream(rc, "", in.Ref.Bare, emit)
+			res, err := traepkg.ConvertStream(rc, in.ChatID, in.Ref.Bare, emit)
 			stats := gateway.StreamStats{
 				SentAny:      res.SentAny,
 				ErrorCode:    res.ErrorCode,

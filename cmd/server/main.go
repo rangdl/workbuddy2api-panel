@@ -18,7 +18,10 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
+	backendtrae "github.com/linguo2625469/workbuddy2api-panel/internal/backend/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -321,12 +324,19 @@ func main() {
 	// Trae 上游（可选；trae.json 缺失或 enabled=false 时不启用）。
 	// 冷却表在 main 构造：面板与 handler 需共用同一实例（前者展示、后者读写）。
 	traeCfg := loadTraeConfig(*cfgPath, cfg.AuthDir)
+	// Trae 账号合进同一个池：选号时按 backend 维度区分上游。
+	// 必须在 handler 构造之前完成，否则启动初期的请求选不到 Trae 号。
+	if n := syncTraeAccountsToPool(p, traeCfg); n > 0 {
+		log.Printf("[trae] 已同步 %d 个账号进调度池", n)
+	}
 	traeClient := trae.NewClient()
 	traeCool := trae.NewCooldowns()
 	// 运行期计数同样要在 main 构造：面板展示与 handler 记账必须是同一实例。
 	traeStats := trae.NewStats()
 	// 签到调度器：ConfigFn 每次 tick 重新读文件（热重载自然生效）；
 	// 用 trae.Load 而非 loadTraeConfig 是为了避免每分钟重复打启动摘要日志。
+	// Trae 账号合进同一个池（选号按 backend 维度区分）。启动时同步一次，
+	// 面板热重载后由 ReloadTrae 回调再同步。
 	traeSched := trae.NewScheduler(func() *trae.Config {
 		tcfg, err := trae.Load(trae.ConfigPath(*cfgPath), cfg.AuthDir)
 		if err != nil || tcfg == nil {
@@ -405,7 +415,12 @@ func main() {
 			if handlerRef == nil {
 				return nil
 			}
-			handlerRef.SetTraeConfig(loadTraeConfig(*cfgPath, cfg.AuthDir))
+			tcfg := loadTraeConfig(*cfgPath, cfg.AuthDir)
+			handlerRef.SetTraeConfig(tcfg)
+			// 账号变化（登录/删除/禁用）要反映到池里，否则新号选不到、
+			// 删掉的号还会被选中。
+			syncTraeAccountsToPool(p, tcfg)
+			removeStaleTraeAccounts(p, tcfg)
 			return nil
 		},
 		LoadConfig: func() (any, error) {
@@ -426,9 +441,23 @@ func main() {
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
+	// 多上游注册表：CodeBuddy 始终注册（它是默认链路）；Trae 按 trae.json 的
+	// enabled 开关参与——Enabled() 运行期读配置，面板热重载后即时生效。
+	backends := gateway.NewRegistry()
+	backends.Register(backendcb.New(up, func() bool { return true },
+		func() ([]*auth.Auth, error) { return auth.LoadDir(cfg.AuthDir) }))
+	backends.Register(backendtrae.New(traeClient, func() *trae.Config {
+		tcfg, err := trae.Load(trae.ConfigPath(*cfgPath), cfg.AuthDir)
+		if err != nil {
+			return nil
+		}
+		return tcfg
+	}))
+
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
+		Backends:     backends,
 		APIKey:       cfg.APIKey,
 		Session:      sessRouter,
 		StickyCount:  sessCount,

@@ -75,7 +75,7 @@ func ModelPair(model string) (configName, modelName string, ok bool) {
 }
 
 // KnownModels 返回内置模型目录（config_name 列表，去重排序）。
-// 供 /trae/v1/models 在无账号、无法拉取上游目录时使用。
+// 供模型列表在无账号、无法拉取上游目录时使用。
 func KnownModels() []string {
 	seen := make(map[string]bool, len(modelPairs))
 	out := make([]string, 0, len(modelPairs))

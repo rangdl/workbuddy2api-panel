@@ -1,7 +1,8 @@
 // Package trae 实现 Trae（trae.cn / trae.com.cn）上游接入。
 //
 // 与 internal/upstream（CodeBuddy）和 internal/thirdparty（OpenAI 兼容）并列的
-// 第三个上游 provider，走独立前缀 /trae/v1/*，与现有链路互不影响。
+// 第三个上游 provider。对话经 /v1/* 统一调度（模型名带 "trae:" 前缀指定），
+// 签到/积分等运维能力由面板直接调用本包。
 //
 // 协议要点（蓝本：TraeWorkAssistant 的 api_server/，2026-09 实测结论）：
 //   - 对话端点 POST {chat_base}/api/agent/v3/llm_utils_chat，**明文 JSON 可行**
@@ -57,7 +58,7 @@ const (
 
 // Config trae.json 结构。
 type Config struct {
-	// Enabled 总开关；false 时 /trae/v1/* 一律 404。
+	// Enabled 总开关；false 时该上游不参与调度。
 	Enabled bool `json:"enabled"`
 	// ChatBase 对话上游 base（缺省 DefaultChatBase）。
 	ChatBase string `json:"chat_base"`

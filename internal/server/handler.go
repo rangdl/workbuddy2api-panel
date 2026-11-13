@@ -91,11 +91,13 @@ type Config struct {
 	// ThirdPartyClient 第三方转发客户端（ThirdParty 启用时必填；nil 则视为未启用）。
 	ThirdPartyClient *thirdparty.Client
 
-	// Trae Trae 上游配置（可选；nil 或 Enabled=false 时 /trae/v1/* 返回 404）。
-	// 与 CodeBuddy、第三方链路互不影响（独立前缀 /trae/v1/*）。
+	// Trae Trae 上游配置（可选；nil 或 Enabled=false 时不参与调度）。
+	// 对话走 /v1/*（模型名带 "trae:" 前缀指定），签到等运维能力在面板里。
 	Trae *trae.Config
 	// TraeClient Trae 上游客户端（Trae 启用时必填；nil 则视为未启用）。
 	TraeClient *trae.Client
+	// Backends 多上游注册表（可选；nil = 只有 CodeBuddy，行为与引入多上游前一致）。
+	Backends *gateway.Registry
 	// TraeCooldowns Trae 账号冷却表（可选；nil 时 handler 自建）。
 	// 由外部注入的原因：面板需要读同一实例才能展示冷却状态。
 	TraeCooldowns *trae.Cooldowns
@@ -163,7 +165,7 @@ type Handler struct {
 	// thirdpartyCfg 第三方上游配置（运行期可原子替换：面板保存 third_party.json 后
 	// 热重载，无需重启）。nil 或 Enabled=false 时 /tp/v1/* 返回 404。
 	thirdpartyCfg atomic.Pointer[thirdparty.Config]
-	// traeCfg Trae 上游配置（运行期可原子替换）。nil 或 Enabled=false 时 /trae/v1/* 返回 404。
+	// traeCfg Trae 上游配置（运行期可原子替换，供 backend 读）。
 	traeCfg atomic.Pointer[trae.Config]
 	// traeCool Trae 账号级冷却表（进程内，重启清零）。nil 时不做冷却判定。
 	traeCool *trae.Cooldowns
@@ -234,12 +236,8 @@ func NewHandler(cfg Config) *Handler {
 		h.mux.HandleFunc("POST /tp/v1/messages", h.withAuthAnthropic(h.thirdpartyAnthropicMessages))
 		h.mux.HandleFunc("GET /tp/v1/models", h.withAuth(h.thirdpartyModels))
 	}
-	// Trae 上游（/trae/v1/*）：与 /v1/*、/tp/v1/* 三者互不影响，同样由运行期开关控制。
-	if cfg.TraeClient != nil {
-		h.mux.HandleFunc("POST /trae/v1/chat/completions", h.withAuth(h.traeChat))
-		h.mux.HandleFunc("POST /trae/v1/responses", h.withAuth(h.traeResponses))
-		h.mux.HandleFunc("GET /trae/v1/models", h.withAuth(h.traeModels))
-	}
+	// Trae 不再有独立前缀：对话统一走 /v1/*（模型名带 "trae:" 前缀即可指定上游），
+	// 回退、粘性、并发控制全部复用主链路的实现。签到/积分等运维能力仍在面板里。
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
 	}
@@ -276,7 +274,7 @@ func (h *Handler) SetTraeConfig(cfg *trae.Config) {
 // /v1/responses（Codex）与 /v1/messages（Claude Code，含 /v1/v1/messages 双拼容错别名）
 // 都复用 h.chatCompletions 链路（responses.go / anthropic.go），requestTrace 会随
 // context 自动填充，因此只要在 ServeHTTP 入口建 trace，账号/模型/token 统计全量可得。
-// /tp/v1/* 与 /trae/v1/* 是独立转发路径（不经 chatCompletions，无 chatStat 可挂），
+// /tp/v1/* 是独立转发路径（不经 chatCompletions，无 chatStat 可挂），
 // 暂不接入记账。
 var requestLogPaths = map[string]bool{
 	"/v1/chat/completions": true,
@@ -733,7 +731,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
-	realm, bareModel, realmExplicit := resolveModelDetail(peek.Model)
+	// 模型名前缀协议：支持 "trae:cn:glm-5.3" 这类上游/域限定。
+	// 规则「显式 = 锁定，缺省 = 自由」——不带前缀就是最自由的跨上游调度。
+	modelRef := resolveModelFull(peek.Model, h.backendNames())
+	realm, bareModel, realmExplicit := modelRef.Realm, modelRef.Bare, modelRef.RealmExplicit
+	// 上游限定：显式前缀 > 粘性绑定（后者在下方解析出 stickyBackend 后回填）。
+	backendLock := modelRef.Backend
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -783,7 +786,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.Pool.StrategyForRealm(realm) != pool.WeightedRandom {
 			resolve = h.cfg.Session.LookupForModel
 		}
-		if v, ok := resolve(sessKey, peek.Model); ok {
+		if v, ok := resolve(sessKey, modelRef.String()); ok {
 			// 绑定值是 gateway.QualifiedUID（"backend:uid"）。带 backend 是必需品
 			// 而非防撞车：同一会话必须落在同一上游，否则 prompt cache 全废
 			// （跨上游缓存绝不共享），省下的那点负载均衡远不值这个代价。
@@ -989,11 +992,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			// 粘性绑定存在时锁定其上游：同一会话跨上游切换会让 prompt cache
 			// 全部失效（缓存绝不跨上游共享），省下的负载均衡远不值这个代价。
-			acc = h.cfg.Pool.PickForBackend(tried, bareModel, pickRealm, stickyBackend)
-			if acc == nil && crossRealm && stickyBackend == "" {
+			// 上游锁定优先级：显式前缀（用户明确指定）> 粘性绑定（缓存一致性）。
+			pickBackend := backendLock
+			if pickBackend == "" {
+				pickBackend = stickyBackend
+			}
+			acc = h.cfg.Pool.PickForBackend(tried, bareModel, pickRealm, pickBackend)
+			if acc == nil && crossRealm && pickBackend == "" {
 				// 该域选不到（并发抢名额/轮换耗尽/另一域刚冷却完）→ 另一域再试一次，
 				// 保持尽力而为语义；tried 已记录失败号，轮转仍由 MaxRotate 封顶。
-				acc = h.cfg.Pool.PickForBackend(tried, bareModel, otherRealm(pickRealm), stickyBackend)
+				acc = h.cfg.Pool.PickForBackend(tried, bareModel, otherRealm(pickRealm), pickBackend)
 			}
 		}
 		if acc == nil {
@@ -1009,10 +1017,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.uid = acc.UID()
 		// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
 		st.nick = acc.Nickname()
-		// 本链路（/v1/*）是 CodeBuddy 专用：非该上游的账号不参与，
-		// 记录已试后跳过换下一个。
 		acct := pool.UnwrapAuth(acc)
 		if acct == nil {
+			// 非 CodeBuddy 账号走 backend 分发：请求体转换、出站头、回程 SSE
+			// 全部由该上游的实现负责（Trae 的自定义事件流在这里被改写为
+			// OpenAI SSE）。CodeBuddy 专用逻辑（prompt 改写/粘性/模型负缓存）
+			// 不适用于它，所以整段跳过。
+			if h.dispatchViaBackend(w, r, acc, body, peek.Stream, modelRef, st, sessKey) {
+				return
+			}
 			tried[pool.TriedKey(acc)] = true
 			continue
 		}

@@ -3,6 +3,8 @@ package main
 import (
 	"log"
 
+	backendtrae "github.com/linguo2625469/workbuddy2api-panel/internal/backend/trae"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 )
 
@@ -12,7 +14,7 @@ import (
 // **必须在同一个目录**，靠 trae- / workbuddy- 前缀区分。不能按 trae.json
 // 的位置推导（配置在 config/，账号在根 auths/，两者不同级）。
 //
-// 返回 nil 表示「未启用 /trae/v1/*」：文件不存在（绝大多数部署只用 CodeBuddy）
+// 返回 nil 表示「未启用 Trae 上游」：文件不存在（绝大多数部署只用 CodeBuddy）
 // 或配置损坏。配置损坏额外记一条 WARN——不阻断启动，但必须让运维看见，
 // 否则表现为「配了却没生效」的静默失败。
 //
@@ -27,7 +29,7 @@ func loadTraeConfig(configPath, authDir string) *trae.Config {
 	}
 	cfg, err := trae.Load(path, authDir)
 	if err != nil {
-		log.Printf("WARN: [trae] 配置加载失败，/trae/v1/* 不启用: %v", err)
+		log.Printf("WARN: [trae] 配置加载失败，Trae 上游不参与调度: %v", err)
 		return nil
 	}
 	if cfg == nil {
@@ -48,5 +50,46 @@ func loadTraeConfig(configPath, authDir string) *trae.Config {
 func saveTraeAccountFunc(dir string) func(*trae.Account) error {
 	return func(a *trae.Account) error {
 		return trae.SaveAccount(dir, a)
+	}
+}
+
+// syncTraeAccountsToPool 把 Trae 账号合进同一个调度池。
+//
+// 池里同时装着 CodeBuddy 与 Trae 账号，选号按 backend 维度区分（gateSpec.backend）。
+// 这里是「合池」唯一的装配点：Trae 侧账号变化（登录/删除/禁用）后调用即可。
+//
+// 只增不删的取舍：池的 SyncToDir 是「本次扫描到的全集」，混两个上游时不能直接
+// 用它（会把另一个上游的账号当成"已删除"）。所以这里用 Add 逐个加入——
+// 状态保留由 pool.upsertLocked 保证，禁用态由 trae.json 的 Disabled 字段驱动。
+func syncTraeAccountsToPool(p *pool.Pool, cfg *trae.Config) int {
+	if p == nil || cfg == nil || !cfg.Enabled {
+		return 0
+	}
+	accs := backendtrae.Wrap(cfg)
+	for _, a := range accs {
+		p.Add(a)
+	}
+	return len(accs)
+}
+
+// removeStaleTraeAccounts 把已从 trae.json 删除的账号摘出池。
+func removeStaleTraeAccounts(p *pool.Pool, cfg *trae.Config) {
+	if p == nil {
+		return
+	}
+	live := map[string]bool{}
+	if cfg != nil && cfg.Enabled {
+		for _, a := range backendtrae.Wrap(cfg) {
+			live[a.UID()] = true
+		}
+	}
+	for _, st := range p.List() {
+		// 只处理 Trae 的账号：CodeBuddy 的由 SyncToDir 管。
+		if st.Backend != backendtrae.Name {
+			continue
+		}
+		if !live[st.UID] {
+			p.Remove(st.UID)
+		}
 	}
 }
