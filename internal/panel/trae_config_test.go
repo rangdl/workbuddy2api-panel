@@ -32,9 +32,21 @@ func newTraeTestKeyPEM(t *testing.T) string {
 	return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
 }
 
-// writeTraeTestConfig 直接落盘配置（准备测试前置状态，绕过面板接口）。
+// writeTraeTestConfig 准备测试前置状态，绕过面板接口。
+//
+// 账号不再内嵌在 trae.json 里：这里拆成「写全局配置」+「逐个写账号文件」，
+// 与生产路径（trae.Load 从 auth_dir 装配）保持一致。
 func writeTraeTestConfig(t *testing.T, path string, cfg *trae.Config) {
 	t.Helper()
+	dir := trae.DefaultAuthDir(path)
+	if cfg.AuthDir == "" {
+		cfg.AuthDir = dir
+	}
+	for i := range cfg.Accounts {
+		if err := trae.SaveAccount(cfg.AuthDir, &cfg.Accounts[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := writeTraeConfig(path, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -377,5 +389,159 @@ func TestTraeLoginStartGeneratedWarns(t *testing.T) {
 	}
 	if !trae.IsValidDeviceID(got.DeviceID) {
 		t.Errorf("占位号形态非法: %q", got.DeviceID)
+	}
+}
+
+// TestTraeConfigIncludesCheckinStatus 账号视图应带今日签到状态（前端据此显示
+// 「已签」而不是始终显示「签到」）。
+func TestTraeConfigIncludesCheckinStatus(t *testing.T) {
+	dir := t.TempDir()
+	p, path := newTraePanel(t, dir)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"checked_in":true}`))
+	}))
+	defer srv.Close()
+
+	cfg := &trae.Config{
+		Enabled: true, ChatBase: trae.DefaultChatBase, APITraeBase: srv.URL,
+		Accounts: []trae.Account{{
+			UID: "u-1", AccessToken: "t1", DeviceID: "1234567890123456",
+		}},
+	}
+	writeTraeTestConfig(t, path, cfg)
+
+	rec := traeDo(p, http.MethodGet, "/panel/api/trae_config", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
+	}
+	var got struct {
+		Config struct {
+			Accounts []struct {
+				UID                  string `json:"uid"`
+				CheckinDone          *bool  `json:"checkin_done"`
+				CheckinDeviceAlready bool   `json:"checkin_device_already"`
+				CheckinError         string `json:"checkin_error"`
+			} `json:"accounts"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Config.Accounts) != 1 {
+		t.Fatalf("账号数 = %d", len(got.Config.Accounts))
+	}
+	a := got.Config.Accounts[0]
+	if a.CheckinDone == nil || !*a.CheckinDone {
+		t.Errorf("checkin_done 应为 true: %+v", a)
+	}
+	if a.CheckinError != "" {
+		t.Errorf("不应有查询错误: %s", a.CheckinError)
+	}
+}
+
+// TestTraeConfigCheckinStatusErrorIsReported 查询失败时必须留下原因，
+// 不能静默当作"未签到"（否则用户会反复点签到）。
+func TestTraeConfigCheckinStatusErrorIsReported(t *testing.T) {
+	dir := t.TempDir()
+	p, path := newTraePanel(t, dir)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"message":"token expired"}`))
+	}))
+	defer srv.Close()
+
+	cfg := &trae.Config{
+		Enabled: true, ChatBase: trae.DefaultChatBase, APITraeBase: srv.URL,
+		Accounts: []trae.Account{{
+			UID: "u-1", AccessToken: "t1", DeviceID: "1234567890123456",
+		}},
+	}
+	writeTraeTestConfig(t, path, cfg)
+
+	rec := traeDo(p, http.MethodGet, "/panel/api/trae_config", "")
+	var got struct {
+		Config struct {
+			Accounts []struct {
+				CheckinDone  *bool  `json:"checkin_done"`
+				CheckinError string `json:"checkin_error"`
+			} `json:"accounts"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	a := got.Config.Accounts[0]
+	if a.CheckinDone != nil {
+		t.Error("查询失败时 checkin_done 应为 nil（未知），不能当作未签到")
+	}
+	if a.CheckinError == "" {
+		t.Error("应记录查询失败原因")
+	}
+}
+
+// TestTraeConfigSkipCheckinQuery no_checkin=1 时不打上游（供测试/离线场景）。
+func TestTraeConfigSkipCheckinQuery(t *testing.T) {
+	dir := t.TempDir()
+	p, path := newTraePanel(t, dir)
+
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"code":0,"checked_in":true}`))
+	}))
+	defer srv.Close()
+
+	cfg := &trae.Config{
+		Enabled: true, ChatBase: trae.DefaultChatBase, APITraeBase: srv.URL,
+		Accounts: []trae.Account{{UID: "u-1", AccessToken: "t1", DeviceID: "1234567890123456"}},
+	}
+	writeTraeTestConfig(t, path, cfg)
+
+	if rec := traeDo(p, http.MethodGet, "/panel/api/trae_config?no_checkin=1", ""); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if hits != 0 {
+		t.Errorf("no_checkin=1 时不应请求上游，实际 %d 次", hits)
+	}
+}
+
+// TestTraeCheckinStatusCache 30 秒内重复拉配置不应重复打上游；
+// 签到成功后缓存失效，下次必须重新查。
+func TestTraeCheckinStatusCache(t *testing.T) {
+	dir := t.TempDir()
+	p, path := newTraePanel(t, dir)
+
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"checked_in":false}`))
+	}))
+	defer srv.Close()
+
+	cfg := &trae.Config{
+		Enabled: true, ChatBase: trae.DefaultChatBase, APITraeBase: srv.URL,
+		Accounts: []trae.Account{{UID: "u-1", AccessToken: "t1", DeviceID: "1234567890123456"}},
+	}
+	writeTraeTestConfig(t, path, cfg)
+
+	for i := 0; i < 3; i++ {
+		if rec := traeDo(p, http.MethodGet, "/panel/api/trae_config", ""); rec.Code != http.StatusOK {
+			t.Fatalf("第 %d 次状态 = %d", i+1, rec.Code)
+		}
+	}
+	if hits != 1 {
+		t.Errorf("30 秒内重复拉配置应复用缓存，实际请求上游 %d 次", hits)
+	}
+
+	p.invalidateCheckinCache()
+	if rec := traeDo(p, http.MethodGet, "/panel/api/trae_config", ""); rec.Code != http.StatusOK {
+		t.Fatalf("失效后状态 = %d", rec.Code)
+	}
+	if hits != 2 {
+		t.Errorf("缓存失效后应重新查询，实际请求 %d 次", hits)
 	}
 }

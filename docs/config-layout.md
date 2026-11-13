@@ -18,10 +18,35 @@ data/                          程序自己写的运行时状态
 ├── credit-history.json        积分变动流水
 ├── output_probes.json         模型上限探测结果
 └── request-logs/              JSONL 请求归档
+
+auths/                         账号凭证（每账号一文件，权限 0600）
+├── workbuddy-<uid>.json       CodeBuddy 账号
+└── trae-<uid>.json            Trae 账号
 ```
 
 分家的理由：`config/` 只需要读、备份频率低、内容是人写的；`data/` 高频写入、
-可以直接丢弃重建。分成两个目录后，备份策略和挂载权限可以分别设置。
+可以直接丢弃重建；`auths/` 含明文 token 与设备私钥，权限单独收紧且**绝不入库**。
+分成三个目录后，备份策略和挂载权限可以分别设置。
+
+## Trae 账号存储（一账号一文件）
+
+Trae 账号**不再内嵌在 `trae.json` 里**，改为 `auths/trae-<uid>.json`，
+与 CodeBuddy 的 `auths/workbuddy-<uid>.json` 形态一致。`trae.json` 只保留全局配置
+（开关、base、排程、UA、verify_claim 等）。
+
+理由：
+
+- **并发安全**：Trae 的 refreshToken 是轮换链，两个账号同时续期时若都重写同一个
+  `trae.json`，后写者会覆盖先写者刚更新的另一个账号。分文件后各写各的。
+- **权限最小化**：账号文件含明文 refreshToken 与设备私钥，单独 `0600`。
+- **心智一致**：备份 / 手工编辑 / 导入导出的方式与 CodeBuddy 相同。
+
+`trae.json` 的 `auth_dir` 指定账号目录，缺省为 `trae.json` 同级的 `auths/`
+（与 CodeBuddy 共用目录，靠 `trae-` / `workbuddy-` 前缀区分）。
+
+> **旧版自动迁移**：启动时若发现 `trae.json` 里还有 `accounts` 数组，会把它拆成
+> 一账号一文件后清空该数组。迁移是幂等的；任何一条写失败都会保留源数组并告警，
+> 下次启动重试——不会让账号凭空消失。
 
 ## 首次启动
 

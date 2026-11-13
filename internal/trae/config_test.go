@@ -96,21 +96,34 @@ func TestConfigLoad(t *testing.T) {
 		t.Error("损坏文件应报错")
 	}
 
-	// 非法（uid 重复）
-	invalid := filepath.Join(dir, "invalid.json")
-	raw := `{"enabled":true,"chat_base":"https://h.example","accounts":[
-		{"uid":"u1","access_token":"t"},{"uid":"u1","access_token":"t"}]}`
-	if err := os.WriteFile(invalid, []byte(raw), 0o600); err != nil {
+	// uid 重复（同一目录下两个文件同 uid）→ LoadAccounts 后由 Validate 报错
+	dup := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dup, "trae-a.json"), []byte(`{"uid":"u1","access_token":"t"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(invalid); err == nil {
+	if err := os.WriteFile(filepath.Join(dup, "trae-b.json"), []byte(`{"uid":"u1","access_token":"t"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	accounts, err := LoadAccounts(dup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 同 uid 的两个文件都会被读入（后者覆盖并打 WARN），由 Validate 拒绝。
+	dupCfg := &Config{Accounts: accounts}
+	if len(accounts) != 2 {
+		t.Errorf("应读入 2 个文件，实际 %d", len(accounts))
+	}
+	if err := dupCfg.Validate(); err == nil {
 		t.Error("uid 重复应报错")
 	}
 
-	// 合法 + 缺省补齐
+	// 合法 + 缺省补齐：trae.json 只有全局配置，账号来自同目录 auths/
 	good := filepath.Join(dir, "trae.json")
-	ok := `{"enabled":true,"accounts":[{"uid":"u1","access_token":"t"}]}`
+	ok := `{"enabled":true}`
 	if err := os.WriteFile(good, []byte(ok), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveAccount(DefaultAuthDir(good), &Account{UID: "u1", AccessToken: "t"}); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err = Load(good)
@@ -122,6 +135,9 @@ func TestConfigLoad(t *testing.T) {
 	}
 	if !cfg.Enabled || len(cfg.Accounts) != 1 {
 		t.Errorf("加载结果不符: %+v", cfg)
+	}
+	if cfg.AuthDir != DefaultAuthDir(good) {
+		t.Errorf("AuthDir = %q，应为 trae.json 同级的 auths/", cfg.AuthDir)
 	}
 }
 

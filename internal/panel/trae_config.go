@@ -45,6 +45,17 @@ type traeAccountView struct {
 	TokenTail string `json:"token_tail"`
 	// ExpiresAt token 过期时间（Unix 秒；0 = 未知）。
 	ExpiresAt int64 `json:"expires_at"`
+	// CheckinDone 今日是否已签（实时查询上游）。
+	//
+	// nil = 未知（未查询 / 查询失败），前端据此显示"签到"而不是"已签"；
+	// 查询失败时 CheckinError 给出原因，避免把"查不到"当成"没签"。
+	CheckinDone *bool `json:"checkin_done,omitempty"`
+	// CheckinDeviceAlready 该**设备**今日已签（did_checked_in）。
+	// 与 CheckinDone 的区别：后者是账号维度，前者是设备维度。多账号共用同一
+	// 设备号时，只有第一个账号的 CheckinDone 会为真，其余账号在设备维度上是"已签"。
+	CheckinDeviceAlready bool `json:"checkin_device_already,omitempty"`
+	// CheckinError 签到状态查询失败的原因（空 = 查询成功）。
+	CheckinError string `json:"checkin_error,omitempty"`
 }
 
 // traeScheduleView 排程视图（与 trae.CheckinSchedule 同名字段）。
@@ -119,6 +130,10 @@ func (p *Panel) getTraeConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.cfg.TraeCooldowns != nil {
 		view.Cooldowns = p.cfg.TraeCooldowns.Snapshot()
+	}
+	// 实时补签到状态（并发、带超时；失败只记录原因，不影响配置读取）。
+	if cfg != nil && p.cfg.TraeClient != nil && r.URL.Query().Get("no_checkin") == "" {
+		p.fillTraeCheckinStatus(r.Context(), cfg, view.Accounts)
 	}
 	for _, a := range view.Accounts {
 		if a.Disabled || !a.HasToken {
@@ -204,12 +219,17 @@ func (p *Panel) saveTraeConfig(w http.ResponseWriter, r *http.Request) {
 		next.IDEVersion = req.IDEVersion
 	}
 	// 按提交的 uid 顺序重建账号列表，凭证从旧配置带入。
+	// 账号本身**不写回 trae.json**（json:"-"）：这里只把「保留哪些、是否禁用」
+	// 落到各自的账号文件上，删掉的账号还要移除其文件。
 	for _, uid := range req.Accounts {
 		a := old.AccountByUID(uid)
 		if a == nil {
 			continue // 未知 uid：忽略（不凭空造账号）
 		}
 		a.Disabled = disabled[uid]
+		if !a.Disabled {
+			a.DisabledReason = ""
+		}
 		next.Accounts = append(next.Accounts, *a)
 	}
 	if err := next.Validate(); err != nil {
@@ -220,6 +240,24 @@ func (p *Panel) saveTraeConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 账号文件：保留的写回（启用状态可能变了），未保留的删除。
+	kept := make(map[string]bool, len(next.Accounts))
+	for i := range next.Accounts {
+		kept[next.Accounts[i].UID] = true
+		if err := trae.SaveAccount(next.AuthDir, &next.Accounts[i]); err != nil {
+			writeErr(w, http.StatusInternalServerError, "保存账号 "+next.Accounts[i].UID+" 失败: "+err.Error())
+			return
+		}
+	}
+	for _, a := range old.Accounts {
+		if kept[a.UID] {
+			continue
+		}
+		if err := trae.RemoveAccount(old.AuthDir, a.UID); err != nil {
+			log.Printf("panel: 删除 Trae 账号文件 %s 失败: %v", a.UID, err)
+		}
+	}
+	p.invalidateCheckinCache()
 	p.reloadTrae()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restart_required": []string{}})
 }
@@ -308,30 +346,38 @@ func (p *Panel) importTraeDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cred := creds[0]
+	idx := -1
 	for i := range cfg.Accounts {
-		if cfg.Accounts[i].UID != req.UID {
-			continue
+		if cfg.Accounts[i].UID == req.UID {
+			idx = i
+			break
 		}
-		cfg.Accounts[i].DeviceID = cred.DeviceID
-		cfg.Accounts[i].PrivateKeyPEM = cred.PrivateKeyPEM
-		if cred.PublicKeyPEM != "" {
-			cfg.Accounts[i].PublicKeyPEM = cred.PublicKeyPEM
-		}
-		if cred.MachineID != "" {
-			cfg.Accounts[i].MachineID = cred.MachineID
-		}
-		if cred.AppVersion != "" {
-			cfg.Accounts[i].AppVersion = cred.AppVersion
-		}
+	}
+	if idx < 0 {
+		writeErr(w, http.StatusBadRequest, "账号 "+req.UID+" 不存在：请先用 OAuth 登录添加账号")
+		return
+	}
+	cfg.Accounts[idx].DeviceID = cred.DeviceID
+	cfg.Accounts[idx].PrivateKeyPEM = cred.PrivateKeyPEM
+	if cred.PublicKeyPEM != "" {
+		cfg.Accounts[idx].PublicKeyPEM = cred.PublicKeyPEM
+	}
+	if cred.MachineID != "" {
+		cfg.Accounts[idx].MachineID = cred.MachineID
+	}
+	if cred.AppVersion != "" {
+		cfg.Accounts[idx].AppVersion = cred.AppVersion
 	}
 	if err := cfg.Validate(); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := writeTraeConfig(path, cfg); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+	// 只写被改动的那个账号文件（trae.json 不含账号）。
+	if err := trae.SaveAccount(cfg.AuthDir, &cfg.Accounts[idx]); err != nil {
+		writeErr(w, http.StatusInternalServerError, "保存账号失败: "+err.Error())
 		return
 	}
+	p.invalidateCheckinCache()
 	p.reloadTrae()
 	if p.cfg.TraeCooldowns != nil {
 		p.cfg.TraeCooldowns.Clear(req.UID) // 补齐设备凭证后解除"设备问题"冷却
@@ -609,27 +655,14 @@ func (p *Panel) traeLoginFinish(w http.ResponseWriter, r *http.Request) {
 		uid = "trae-" + tail(pair.AccessToken, 8)
 	}
 	// 合并到配置：同 uid 覆盖 token，新 uid 追加。
-	merged := false
+	idx := -1
 	for i := range cfg.Accounts {
-		if cfg.Accounts[i].UID != uid {
-			continue
+		if cfg.Accounts[i].UID == uid {
+			idx = i
+			break
 		}
-		cfg.Accounts[i].AccessToken = pair.AccessToken
-		if pair.RefreshToken != "" {
-			cfg.Accounts[i].RefreshToken = pair.RefreshToken
-		}
-		cfg.Accounts[i].ExpiresAt = pair.ExpiresAt
-		cfg.Accounts[i].Disabled = false
-		cfg.Accounts[i].DisabledReason = ""
-		// 设备身份跟着本次登录走：允许把"生成号"换成真实号（签到只认真实号）。
-		cfg.Accounts[i].DeviceID = devID
-		cfg.Accounts[i].MachineID = machID
-		if cred.PrivateKeyPEM != "" {
-			cfg.Accounts[i].PrivateKeyPEM = cred.PrivateKeyPEM
-		}
-		merged = true
 	}
-	if !merged {
+	if idx < 0 {
 		cfg.Accounts = append(cfg.Accounts, trae.Account{
 			UID:           uid,
 			Name:          "trae-" + uid,
@@ -639,17 +672,38 @@ func (p *Panel) traeLoginFinish(w http.ResponseWriter, r *http.Request) {
 			DeviceID:      devID,
 			MachineID:     machID,
 			PrivateKeyPEM: cred.PrivateKeyPEM,
+			PublicKeyPEM:  cred.PublicKeyPEM,
 			AppVersion:    trae.DefaultPageAppVersion,
 		})
+		idx = len(cfg.Accounts) - 1
+	} else {
+		cfg.Accounts[idx].AccessToken = pair.AccessToken
+		if pair.RefreshToken != "" {
+			cfg.Accounts[idx].RefreshToken = pair.RefreshToken
+		}
+		cfg.Accounts[idx].ExpiresAt = pair.ExpiresAt
+		cfg.Accounts[idx].Disabled = false
+		cfg.Accounts[idx].DisabledReason = ""
+		// 设备身份跟着本次登录走：允许把"生成号"换成真实号（签到只认真实号）。
+		cfg.Accounts[idx].DeviceID = devID
+		cfg.Accounts[idx].MachineID = machID
+		if cred.PrivateKeyPEM != "" {
+			cfg.Accounts[idx].PrivateKeyPEM = cred.PrivateKeyPEM
+		}
+		if cred.PublicKeyPEM != "" {
+			cfg.Accounts[idx].PublicKeyPEM = cred.PublicKeyPEM
+		}
 	}
 	if err := cfg.Validate(); err != nil {
 		writeErr(w, http.StatusInternalServerError, "配置校验失败: "+err.Error())
 		return
 	}
-	if err := writeTraeConfig(path, cfg); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+	// 只写这一个账号文件；trae.json 的全局配置不需要改（账号不在里面）。
+	if err := trae.SaveAccount(cfg.AuthDir, &cfg.Accounts[idx]); err != nil {
+		writeErr(w, http.StatusInternalServerError, "保存账号失败: "+err.Error())
 		return
 	}
+	p.invalidateCheckinCache()
 	p.reloadTrae()
 	if p.cfg.TraeCooldowns != nil {
 		p.cfg.TraeCooldowns.Clear(uid)
@@ -674,24 +728,16 @@ func (p *Panel) removeTraeAccount(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "trae.json 不存在或无法读取")
 		return
 	}
-	kept := cfg.Accounts[:0]
-	removed := false
-	for _, a := range cfg.Accounts {
-		if a.UID == uid {
-			removed = true
-			continue
-		}
-		kept = append(kept, a)
-	}
-	if !removed {
+	if cfg.AccountByUID(uid) == nil {
 		writeErr(w, http.StatusNotFound, "账号不存在: "+uid)
 		return
 	}
-	cfg.Accounts = kept
-	if err := writeTraeConfig(path, cfg); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+	// 删除账号文件本身（trae.json 不含账号，无需改写）。
+	if err := trae.RemoveAccount(cfg.AuthDir, uid); err != nil {
+		writeErr(w, http.StatusInternalServerError, "删除账号文件失败: "+err.Error())
 		return
 	}
+	p.invalidateCheckinCache()
 	p.reloadTrae()
 	if p.cfg.TraeCooldowns != nil {
 		p.cfg.TraeCooldowns.Clear(uid)
@@ -727,7 +773,10 @@ func takeTraeLogin(traceID string) *trae.LoginSession {
 	return found
 }
 
-// writeTraeConfig 原子落盘（tmp + rename），权限 0600（含凭证）。
+// writeTraeConfig 原子落盘全局配置（tmp + rename），权限 0600。
+//
+// 账号**不在**这里：Config.Accounts 的 json tag 是 "-"，一账号一文件由
+// trae.SaveAccount 负责（见 internal/trae/accounts.go）。
 func writeTraeConfig(path string, cfg *trae.Config) error {
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -783,4 +832,131 @@ func orDefaultStr(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// traeCheckinStatusTimeout 面板查询逐账号签到状态的总超时。
+//
+// 这是**面板轮询路径**上的上游请求，不能让它拖慢页面：超时后账号的
+// CheckinDone 保持 nil（前端显示"签到"），并在 CheckinError 说明原因。
+const traeCheckinStatusTimeout = 8 * time.Second
+
+// traeCheckinStatusTTL 签到状态缓存时长。
+//
+// 切视图 / 点按钮都会重新拉 trae_config，每次都打上游会白白消耗风控额度。
+// 30 秒内的结果直接复用；签到成功与手动刷新会显式失效缓存。
+const traeCheckinStatusTTL = 30 * time.Second
+
+// traeCheckinCache 逐账号签到状态缓存（uid → 结果）。
+type traeCheckinCache struct {
+	mu   sync.Mutex
+	at   time.Time
+	data map[string]traeCheckinSnapshot
+}
+
+type traeCheckinSnapshot struct {
+	done          *bool
+	deviceAlready bool
+	err           string
+}
+
+// invalidateCheckinCache 让下次读取重新查询上游（签到成功 / 手动刷新时调用）。
+func (p *Panel) invalidateCheckinCache() {
+	p.traeCheckin.mu.Lock()
+	p.traeCheckin.data = nil
+	p.traeCheckin.at = time.Time{}
+	p.traeCheckin.mu.Unlock()
+}
+
+// fillTraeCheckinStatus 并发查询每个账号的"今日是否已签"，写回 view。
+//
+// 账号多时并发上限 4，避免一次面板刷新打出十几个上游请求。
+func (p *Panel) fillTraeCheckinStatus(ctx context.Context, cfg *trae.Config, views []traeAccountView) {
+	targets := make([]int, 0, len(views))
+	for i := range views {
+		if !views[i].Disabled && views[i].HasToken && views[i].DeviceID != "" {
+			targets = append(targets, i)
+		}
+	}
+	if len(targets) == 0 {
+		return
+	}
+
+	// 先看缓存：命中且未过 TTL 就直接套用。
+	p.traeCheckin.mu.Lock()
+	cacheFresh := p.traeCheckin.data != nil && time.Since(p.traeCheckin.at) < traeCheckinStatusTTL
+	cached := p.traeCheckin.data
+	p.traeCheckin.mu.Unlock()
+	if cacheFresh {
+		hit := true
+		for _, i := range targets {
+			s, ok := cached[views[i].UID]
+			if !ok {
+				hit = false
+				break
+			}
+			views[i].CheckinDone = s.done
+			views[i].CheckinDeviceAlready = s.deviceAlready
+			views[i].CheckinError = s.err
+		}
+		if hit {
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, traeCheckinStatusTimeout)
+	defer cancel()
+
+	results := make(map[string]traeCheckinSnapshot, len(targets))
+	var mu sync.Mutex
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for _, idx := range targets {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+			acc := cfg.AccountByUID(views[i].UID)
+			if acc == nil {
+				return
+			}
+			st, err := p.cfg.TraeClient.CheckinStatus(ctx, cfg, acc)
+			snap := traeCheckinSnapshot{}
+			if err != nil {
+				snap.err = err.Error()
+			} else {
+				snap.done = st.CheckedIn
+				snap.deviceAlready = st.DeviceAlready
+			}
+			mu.Lock()
+			results[views[i].UID] = snap
+			mu.Unlock()
+		}(idx)
+	}
+	wg.Wait()
+
+	// 回写视图 + 更新缓存（只缓存本轮实际查到的账号）。
+	p.traeCheckin.mu.Lock()
+	if p.traeCheckin.data == nil {
+		p.traeCheckin.data = make(map[string]traeCheckinSnapshot, len(results))
+	}
+	for uid, s := range results {
+		p.traeCheckin.data[uid] = s
+	}
+	p.traeCheckin.at = time.Now()
+	p.traeCheckin.mu.Unlock()
+
+	for _, i := range targets {
+		s, ok := results[views[i].UID]
+		if !ok {
+			continue
+		}
+		views[i].CheckinDone = s.done
+		views[i].CheckinDeviceAlready = s.deviceAlready
+		views[i].CheckinError = s.err
+	}
 }

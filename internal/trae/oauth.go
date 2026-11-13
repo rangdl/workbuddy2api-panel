@@ -372,14 +372,21 @@ func (c *Client) EnsureTokenFresh(ctx context.Context, cfg *Config, acc *Account
 	return true, nil
 }
 
-// persistRotated 把续期结果写回 cfg.Accounts 并调用 SaveHook 落盘。
+// SaveAccountHook 续期成功后把**该账号**落盘的钩子（由启动方注入）。
 //
-// acc 可能是调用方持有的副本（例如 AccountByUID 返回的拷贝），所以按 UID
-// 回写到 cfg.Accounts 再保存，避免"内存里更新了、文件里还是旧值"。
+// 一账号一文件之后，钩子只需写一个文件——这正是分文件的核心收益：
+// 多个账号并发续期时互不覆盖（旧实现重写整个 trae.json，后写者会丢掉
+// 先写者刚更新的另一个账号）。
+//
+// 为什么不直接调 SaveAccount：AuthDir 的解析与"写失败要不要记为账号异常"
+// 的策略由调用方决定，provider 只负责把变更交出去。
+type saveAccountFunc func(*Account) error
+
 func (c *Client) persistRotated(cfg *Config, acc *Account) {
 	if cfg == nil || acc == nil {
 		return
 	}
+	// 内存里的 cfg.Accounts 同步更新，避免同一轮请求内再用到旧 token。
 	for i := range cfg.Accounts {
 		if cfg.Accounts[i].UID == acc.UID {
 			cfg.Accounts[i].AccessToken = acc.AccessToken
@@ -388,10 +395,10 @@ func (c *Client) persistRotated(cfg *Config, acc *Account) {
 			break
 		}
 	}
-	if cfg.SaveHook == nil {
+	if cfg.SaveAccount == nil {
 		return
 	}
-	if err := cfg.SaveHook(cfg); err != nil && c.Trace != nil {
+	if err := cfg.SaveAccount(acc); err != nil && c.Trace != nil {
 		c.Trace("persist/rotated-token", false, err)
 	}
 }

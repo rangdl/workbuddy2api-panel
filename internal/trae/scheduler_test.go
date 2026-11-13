@@ -239,8 +239,8 @@ func TestSchedulerRefreshesExpiredToken(t *testing.T) {
 	})
 	cfg.OAuthHost = srv.URL // ExchangeToken 也打这台假上游
 	var savedRT string
-	cfg.SaveHook = func(c *Config) error {
-		savedRT = c.Accounts[0].RefreshToken
+	cfg.SaveAccount = func(a *Account) error {
+		savedRT = a.RefreshToken
 		return nil
 	}
 	s := NewScheduler(func() *Config { return cfg }, NewClient(), NewCooldowns())

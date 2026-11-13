@@ -445,3 +445,35 @@ func TestCreditPackClassify(t *testing.T) {
 		t.Errorf("超额时剩余应为 0，得到 %v", p.Remaining())
 	}
 }
+
+// TestCreditsSummaryJSONKeys 序列化用小写字段名（前端读 c.general）。
+//
+// 默认序列化会用 Go 字段名（General/Work/...），前端拿到 undefined，
+// Math.round(undefined) → NaN，正是面板显示 NaN 的根因。
+func TestCreditsSummaryJSONKeys(t *testing.T) {
+	sum := CreditsSummary{General: 1.5, Work: 2, Total: 3.5, Limit: 10,
+		Packs: []CreditPack{{ProductID: 208, CreditsLimit: 10}}}
+	b, err := json.Marshal(sum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"general", "work", "total", "limit", "packs"} {
+		if _, ok := m[k]; !ok {
+			t.Errorf("缺少小写字段 %q（实际: %s）", k, b)
+		}
+	}
+	if _, ok := m["General"]; ok {
+		t.Errorf("不应输出大写字段名: %s", b)
+	}
+	packs := m["packs"].([]any)
+	pack := packs[0].(map[string]any)
+	for _, k := range []string{"product_id", "credits_limit"} {
+		if _, ok := pack[k]; !ok {
+			t.Errorf("积分包缺少小写字段 %q: %v", k, pack)
+		}
+	}
+}

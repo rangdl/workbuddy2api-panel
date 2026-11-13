@@ -26,6 +26,7 @@ func (p *Panel) traeCheckinAll(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), traeCheckinAllTimeout)
 	defer cancel()
 	outcomes := p.cfg.TraeScheduler.RunOnce(ctx)
+	p.invalidateCheckinCache() // 签到后状态已变，下次拉配置必须重新查
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": outcomes})
 }
 
@@ -65,6 +66,7 @@ func (p *Panel) traeAccountCheckin(w http.ResponseWriter, r *http.Request) {
 			cls := apiErr.Classification()
 			if cls.Already {
 				// 9004 / 9095 不是失败：按「今日已签」回传。
+				p.invalidateCheckinCache()
 				writeJSON(w, http.StatusOK, map[string]any{
 					"ok": true, "uid": uid, "already": true,
 					"device_already": cls.Code == "9095" || cls.Code == "9004",
@@ -84,6 +86,7 @@ func (p *Panel) traeAccountCheckin(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.TraeCooldowns != nil && !res.Already {
 		p.cfg.TraeCooldowns.Clear(uid) // 签到成功即清冷却
 	}
+	p.invalidateCheckinCache()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "uid": uid, "already": res.Already,
 		"device_already": res.DeviceAlready, "unverified": res.Unverified,

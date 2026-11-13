@@ -70,7 +70,8 @@ type Config struct {
 	AppID          string `json:"app_id"`
 	// TimeoutSeconds 非流式总超时；流式只约束首字节。
 	TimeoutSeconds int `json:"timeout_seconds"`
-	// AuthDir Trae 账号凭证目录（缺省 ./auths，与 CodeBuddy 共用目录但文件名前缀区分）。
+	// AuthDir Trae 账号凭证目录（缺省取 trae.json 同级的 auths/）。
+	// 一账号一文件：trae-<uid>.json（见 accounts.go）。
 	AuthDir string `json:"auth_dir"`
 	// OAuthClientID / OAuthClientSecret 覆盖内置公开常量（上游更换凭证时免发版）。
 	OAuthClientID     string `json:"oauth_client_id"`
@@ -80,9 +81,12 @@ type Config struct {
 	// OAuthCallbackURL 授权回调地址（缺省本机回环 http://127.0.0.1:17388/authorize）。
 	// 服务端部署时可改为公网回调端点，或保持缺省并在面板里手工粘贴回调 URL。
 	OAuthCallbackURL string `json:"oauth_callback_url"`
-	// Accounts 账号列表。凭证字段（access_token / refresh_token / 设备私钥）
-	// 建议通过面板导入而非手写在本文件里——本文件不加密。
-	Accounts []Account `json:"accounts"`
+	// Accounts 账号列表。
+	//
+	// **不落盘到 trae.json**（`json:"-"`）：账号存在 auth_dir 下的一账号一文件里，
+	// 由 AuthDir 指向（见 accounts.go）。这里保留字段是为了让运行期代码
+	// 继续按 `cfg.Accounts` 访问，Load 时从目录装配。
+	Accounts []Account `json:"-"`
 	// Schedule 签到排程（缺省不启用；由 trae.Scheduler 消费）。
 	Schedule CheckinSchedule `json:"schedule"`
 
@@ -107,12 +111,12 @@ type Config struct {
 	// 参考实现互相矛盾（1 / 2），故可配置；发 `{}` 是本项目已实测可用的形态。
 	CheckinReqSource int `json:"checkin_req_source"`
 
-	// SaveHook 续期成功后把轮换后的凭证落盘的钩子（由启动方注入，不参与 JSON）。
+	// SaveAccount 续期成功后把**单个账号**落盘的钩子（由启动方注入，不参与 JSON）。
 	//
 	// 为什么需要：Trae 的 refreshToken 是**轮换链**——每次续期产生新值、旧值作废。
 	// 若只在内存里更新，进程重启后拿旧值续期会直接失败（参考实现都强调这点）。
-	// trae 包不直接写配置文件，是为了不把"哪个文件、什么权限"的知识搬进 provider。
-	SaveHook func(*Config) error `json:"-"`
+	// trae 包不直接写文件，是为了不把"目录在哪、什么权限"的知识搬进 provider。
+	SaveAccount saveAccountFunc `json:"-"`
 }
 
 // Account 一个 Trae 账号。
@@ -235,7 +239,22 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// Load 读取 trae.json。文件缺失返回 (nil, nil)——调用方据此判定"未启用 Trae"。
+// legacyAccounts 兼容旧版 trae.json 里内嵌的 accounts 数组（迁移用）。
+//
+// 旧版本把所有账号塞在 trae.json 的同名字段里。现在改为 auth_dir 下的一账号
+// 一文件，由 MigrateLegacyAccounts 在启动时拆出去。这里用独立的解码目标
+// 而不是给 Config.Accounts 加 tag，是为了让"从文件读"与"运行期装配"分开。
+type legacyConfig struct {
+	Accounts []Account `json:"accounts"`
+}
+
+// Load 读取 trae.json 与账号目录。
+//
+// 文件缺失返回 (nil, nil)——调用方据此判定"未启用 Trae"。
+// 账号来自 cfg.AuthDir（缺省为 trae.json 同级的 auths/）。
+//
+// 注意：本函数**不迁移**旧版内嵌账号，迁移在 MigrateLegacyAccounts 里显式做，
+// 免得"每分钟都在写的调度器读路径"顺手改磁盘。
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -248,10 +267,97 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
+	if strings.TrimSpace(c.AuthDir) == "" {
+		c.AuthDir = DefaultAuthDir(path)
+	}
+	accounts, err := LoadAccounts(c.AuthDir)
+	if err != nil {
+		return nil, fmt.Errorf("加载账号目录 %s: %w", c.AuthDir, err)
+	}
+	c.Accounts = accounts
 	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &c, nil
+}
+
+// DefaultAuthDir trae.json 缺省账号目录：同级的 auths/（与 CodeBuddy 共用）。
+func DefaultAuthDir(configPath string) string {
+	return filepath.Join(filepath.Dir(configPath), "auths")
+}
+
+// MigrateLegacyAccounts 把旧版 trae.json 内嵌的 accounts 拆成一账号一文件。
+//
+// 迁移是**一次性且幂等**的：写完全部账号文件后把 trae.json 的 accounts 清空。
+// 单个账号写失败不影响其余账号，但只要还有没写成功的就不清空源数组——
+// 宁可下次启动再试，也不能让账号凭空消失。
+//
+// 返回迁移的账号数（0 表示无需迁移）。
+func MigrateLegacyAccounts(configPath string) (int, error) {
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read %s: %w", configPath, err)
+	}
+	var legacy legacyConfig
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		return 0, fmt.Errorf("parse %s: %w", configPath, err)
+	}
+	if len(legacy.Accounts) == 0 {
+		return 0, nil
+	}
+
+	// AuthDir 可能配在同一个文件里，先取出来（缺省同级 auths/）。
+	var meta struct {
+		AuthDir string `json:"auth_dir"`
+	}
+	_ = json.Unmarshal(raw, &meta)
+	dir := strings.TrimSpace(meta.AuthDir)
+	if dir == "" {
+		dir = DefaultAuthDir(configPath)
+	}
+
+	migrated := 0
+	var failed []string
+	for i := range legacy.Accounts {
+		a := legacy.Accounts[i]
+		a.normalize()
+		if a.UID == "" {
+			failed = append(failed, fmt.Sprintf("accounts[%d]: 缺少 uid", i))
+			continue
+		}
+		if err := SaveAccount(dir, &a); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", a.UID, err))
+			continue
+		}
+		migrated++
+	}
+	if len(failed) > 0 {
+		return migrated, fmt.Errorf("部分账号迁移失败（源配置保持不变，下次启动重试）: %s",
+			strings.Join(failed, "; "))
+	}
+
+	// 全部成功才清空源数组，其余全局配置原样保留。
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return migrated, fmt.Errorf("parse %s: %w", configPath, err)
+	}
+	delete(doc, "accounts")
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return migrated, fmt.Errorf("序列化失败: %w", err)
+	}
+	out = append(out, '\n')
+	tmp := configPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return migrated, fmt.Errorf("写入失败: %w", err)
+	}
+	if err := os.Rename(tmp, configPath); err != nil {
+		return migrated, fmt.Errorf("原子替换失败: %w", err)
+	}
+	return migrated, nil
 }
 
 // ConfigPath 返回与 config.json 同目录的 trae.json 路径。

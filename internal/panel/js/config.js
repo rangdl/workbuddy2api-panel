@@ -412,10 +412,17 @@ function traeAccountRow(a, cool) {
 
   const actions = document.createElement('span');
   actions.style.cssText = 'margin-left:auto;display:flex;gap:6px';
+  // 今日签到状态：Done=账号已签，DeviceAlready=该设备已签（多账号共用设备号时
+  // 只有第一个账号是 Done，其余是 DeviceAlready）。
+  const done = a.checkin_done === true;
+  const devDone = a.checkin_device_already === true;
   const ck = document.createElement('button');
   ck.type = 'button';
   ck.className = 'xs';
-  ck.textContent = '签到';
+  ck.textContent = done ? '已签' : (devDone ? '设备已签' : '签到');
+  if (done) ck.title = '今日已签到；点一下可重新查询并刷新状态';
+  else if (devDone) ck.title = '该设备今日已签（签到限额按设备算，本账号今日无法再签）；点一下可重新查询';
+  else if (a.checkin_error) ck.title = '签到状态查询失败：' + a.checkin_error;
   ck.onclick = async () => {
     ck.disabled = true;
     ck.textContent = '签到中…';
@@ -427,7 +434,7 @@ function traeAccountRow(a, cool) {
       else toast('签到失败：' + (d.message || '未知错误'), 'err');
       loadTraeConfig();
     } catch (e) { toast('签到失败：' + e.message, 'err'); }
-    finally { ck.disabled = false; ck.textContent = '签到'; }
+    finally { ck.disabled = false; ck.textContent = done ? '已签' : '签到'; }
   };
   const cr = document.createElement('button');
   cr.type = 'button';
@@ -439,9 +446,12 @@ function traeAccountRow(a, cool) {
     try {
       const d = await api('trae/accounts/' + encodeURIComponent(a.uid) + '/credits', { method: 'POST' });
       if (d.ok && d.credits) {
+        // 后端字段是小写（general/work/total/limit）；用 num() 兜底，
+        // 避免任何缺失字段把整个提示变成 NaN。
         const c = d.credits;
-        toast('通用 ' + Math.round(c.general) + ' / Work ' + Math.round(c.work) +
-          '（合计 ' + Math.round(c.total) + '，额度 ' + Math.round(c.limit) + '）', 'ok');
+        const num = v => (typeof v === 'number' && isFinite(v)) ? Math.round(v).toLocaleString() : '—';
+        toast('通用 ' + num(c.general) + ' / Work ' + num(c.work) +
+          '（合计 ' + num(c.total) + '，额度 ' + num(c.limit) + '）', 'ok');
       } else {
         toast('积分查询失败：' + (d.message || '未知错误'), 'err');
       }

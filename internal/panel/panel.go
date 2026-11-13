@@ -122,6 +122,10 @@ type Panel struct {
 	loginMu sync.Mutex
 	logins  map[string]loginSession
 
+	// traeCheckin Trae 逐账号签到状态缓存（见 trae_config.go 的
+	// fillTraeCheckinStatus）：切视图会重新拉配置，缓存避免重复打上游。
+	traeCheckin traeCheckinCache
+
 	// taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 	// （单任务 / 全量）同时只允许一条在跑。重复点击直接返回 409"仍在执行"，
 	// 而不是并发跑两遍浪费上游请求（动作虽幂等，expert 系每遍含 8 次真实对话）。

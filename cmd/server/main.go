@@ -327,13 +327,12 @@ func main() {
 	// 用 trae.Load 而非 loadTraeConfig 是为了避免每分钟重复打启动摘要日志。
 	traeSched := trae.NewScheduler(func() *trae.Config {
 		cfg, err := trae.Load(trae.ConfigPath(*cfgPath))
-		if err != nil {
+		if err != nil || cfg == nil {
 			return nil
 		}
-		if cfg != nil {
-			// 续期轮换后的 refreshToken 必须落盘（否则重启后续期全废）。
-			cfg.SaveHook = saveTraeConfigFunc(trae.ConfigPath(*cfgPath))
-		}
+		// 续期轮换后的 refreshToken 必须落盘（否则重启后续期全废）。
+		// 一账号一文件：只写变化的那个账号，不重写整个配置。
+		cfg.SaveAccount = saveTraeAccountFunc(cfg.AuthDir)
 		return cfg
 	}, traeClient, traeCool)
 

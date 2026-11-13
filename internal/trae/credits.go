@@ -93,18 +93,18 @@ type CheckinResult struct {
 // CreditPack 一个积分包。
 type CreditPack struct {
 	// ProductID 208 = 通用积分（IDE 使用）、209 = Work 积分（SOLO Agent）、其余（如 221）归通用。
-	ProductID int64
+	ProductID int64 `json:"product_id"`
 	// CreditsLimit 本周期总额度。
-	CreditsLimit float64
+	CreditsLimit float64 `json:"credits_limit"`
 	// CreditsUsed 已用（usage.credits_amount；缺失按 0 计）。
-	CreditsUsed float64
+	CreditsUsed float64 `json:"credits_used"`
 	// StartTime / EndTime 周期起止（上游原样字符串，如 "2026-09-14 15:52:38"）。
-	StartTime string
-	EndTime   string
+	StartTime string `json:"start_time"`
+	EndTime   string `json:"end_time"`
 	// GroupName 分组名（如"会员积分"）。
-	GroupName string
+	GroupName string `json:"group_name"`
 	// NextBillingTime 会员套餐下次扣款时间（Unix 秒；0 = 无）。
-	NextBillingTime int64
+	NextBillingTime int64 `json:"next_billing_time"`
 }
 
 // Remaining 该包剩余额度。
@@ -122,17 +122,20 @@ func (p CreditPack) Remaining() float64 {
 func (p CreditPack) IsWork() bool { return p.ProductID == 209 }
 
 // CreditsSummary 积分汇总。
+//
+// JSON tag 必须显式写出：默认序列化用字段名（General/Work/…），
+// 前端读的是小写（c.general），漏了就会显示 NaN。
 type CreditsSummary struct {
 	// General 通用积分剩余（product_id != 209 的包合计）。
-	General float64
+	General float64 `json:"general"`
 	// Work Work 积分剩余（product_id == 209 的包合计）。
-	Work float64
+	Work float64 `json:"work"`
 	// Total 全部包剩余合计。
-	Total float64
+	Total float64 `json:"total"`
 	// Limit 全部包额度合计。
-	Limit float64
+	Limit float64 `json:"limit"`
 	// Packs 明细。
-	Packs []CreditPack
+	Packs []CreditPack `json:"packs"`
 }
 
 // Checkin 执行一次签到：先 status 预检（已签则跳过），否则 claim。

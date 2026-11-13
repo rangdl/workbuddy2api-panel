@@ -1035,25 +1035,30 @@ Trae 接入使用**独立前缀 `/trae/v1/*`**，与 `/v1/*`（CodeBuddy）、`/
 
 ### 配置（`config/trae.json`，与 `config/config.json` 同目录）
 
+`trae.json` **只放全局配置**，账号一账号一文件放在 `auths/`（与 CodeBuddy 一致）：
+
 ```json
 {
   "enabled": false,
   "chat_base": "https://trae-api-cn.mchost.guru",
   "api_trae_base": "https://api.trae.cn",
-  "schedule": { "checkin_enabled": false, "checkin_hours": [9] },
-  "accounts": [
-    {
-      "uid": "123456",
-      "name": "trae-1",
-      "access_token": "eyJhbGciOi...",
-      "refresh_token": "...",
-      "device_id": "7123456789012345678",
-      "machine_id": "...",
-      "private_key_pem": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
-    }
-  ]
+  "auth_dir": "",
+  "schedule": { "checkin_enabled": false, "checkin_hours": [9] }
 }
 ```
+
+```
+auths/
+├── workbuddy-<uid>.json       CodeBuddy 账号
+└── trae-<uid>.json            Trae 账号（含 token + 设备公私钥，权限 0600）
+```
+
+`auth_dir` 留空 = `trae.json` 同级的 `auths/`。早于本版的 `trae.json` 若内嵌了
+`accounts` 数组，启动时自动拆成一账号一文件后清空该数组（幂等；写失败则保留
+源数组并在下次启动重试）。
+
+> 为什么分文件：refreshToken 是轮换链，两个账号并发续期时共写一个 `trae.json`
+> 会让后写者覆盖先写者刚更新的另一个账号。分文件后各写各的。
 
 `enabled` 缺省 `false`：未启用时 `/trae/v1/*` 一律 404，现有功能完全不受影响。
 
@@ -1118,7 +1123,7 @@ Trae 接入使用**独立前缀 `/trae/v1/*`**，与 `/v1/*`（CodeBuddy）、`/
 > 在 `trae.json` 里设：
 >
 > ```json
-> { "checkin_user_agent": "VSCode 1.107.1 (TRAE SOLO CN)", "checkin_market_client_id": "VSCode 1.107.1" }
+> { "checkin_user_agent": "VSCode 1.107.1 (TRAE SOLO CN)" }
 > ```
 >
 > 另有两个可选覆盖项：`checkin_req_source`（缺省 `0` = 发 `{}`；填 `1` / `2` 则发
@@ -1126,7 +1131,8 @@ Trae 接入使用**独立前缀 `/trae/v1/*`**，与 `/v1/*`（CodeBuddy）、`/
 > `verify_claim` / `refresh_before_checkin`（缺省均 `true`）。
 
 > **凭证安全**：面板**永不回显凭证**——只返回"是否已配置"与 token 尾 4 位；
-> 凭证写入只有两条路径（OAuth 换取、用户粘贴设备密文），落盘权限 `0600`，`trae.json` 已 gitignore。
+> 凭证写入只有两条路径（OAuth 换取、用户粘贴设备密文），落盘为
+> `auths/trae-<uid>.json`、权限 `0600`，`auths/` 已 gitignore。
 
 **OAuth 登录与设备凭证（重要）**
 
