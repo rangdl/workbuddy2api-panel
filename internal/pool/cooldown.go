@@ -13,7 +13,7 @@ import (
 func (p *Pool) SetCredits(uid string, credits, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		e.credits = credits
 		e.creditsTotal = total
 		p.dirty.Store(true)
@@ -28,7 +28,7 @@ func (p *Pool) SetNickname(uid, nickname string) bool {
 		return false
 	}
 	p.mu.RLock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	p.mu.RUnlock()
 	if !ok {
 		return false
@@ -65,7 +65,7 @@ type Nicknamer interface {
 func (p *Pool) NoteCheckinDone(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		day := time.Now().Format("2006-01-02")
 		if e.lastCheckinDay != day {
 			e.lastCheckinDay = day
@@ -92,7 +92,7 @@ type CreditsSnapshot struct {
 func (p *Pool) SetCreditsSnapshot(uid string, s CreditsSnapshot) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return
 	}
@@ -200,7 +200,7 @@ func (p *Pool) ClearExpiringSnapshots() {
 func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		e.until = time.Now().Add(d)
 		e.coolKind = kind
 		e.reason = reason
@@ -226,7 +226,7 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		now := time.Now()
 		if !resetAt.IsZero() {
 			// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
@@ -263,7 +263,7 @@ func (p *Pool) RecordModelRateLimitAudit(uid, model, reason string) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return
 	}
@@ -323,7 +323,7 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return
 	}
@@ -359,7 +359,7 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok || len(e.modelCooldowns) == 0 {
 		return
 	}
@@ -460,7 +460,7 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Time, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		now := time.Now()
 		if !resetAt.IsZero() {
 			e.until = p.cappedSoftUntilLocked(now, resetAt)

@@ -775,6 +775,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级——提取本身与粘性无关。
 	sessKey := session.ExtractKey(body)
 	stickyUID := ""
+	stickyBackend := ""
 	if h.cfg.Session != nil && sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
@@ -782,8 +783,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.Pool.StrategyForRealm(realm) != pool.WeightedRandom {
 			resolve = h.cfg.Session.LookupForModel
 		}
-		if uid, ok := resolve(sessKey, peek.Model); ok {
-			stickyUID = uid
+		if v, ok := resolve(sessKey, peek.Model); ok {
+			// 绑定值是 gateway.QualifiedUID（"backend:uid"）。带 backend 是必需品
+			// 而非防撞车：同一会话必须落在同一上游，否则 prompt cache 全废
+			// （跨上游缓存绝不共享），省下的那点负载均衡远不值这个代价。
+			stickyBackend, stickyUID = gateway.SplitQualifiedUID(v)
 		}
 	}
 
@@ -960,7 +964,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acc gateway.Account
 		if stickyUID != "" {
-			acc = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
+			// 粘性值带 backend（"codebuddy:uid"）：先按复合键精确取回原账号，
+			// 避免两个上游同 uid 时粘错上游。
+			acc = h.cfg.Pool.PickByUIDForBackend(stickyBackend, stickyUID, bareModel)
 			// 跨域回退开启且请求为裸名时，粘性号可以落在任一域（回退成功后绑定的是另一域
 			// 的账号，下一轮不该被 realm 校验立刻解绑）。
 			if acc == nil || (realm != "" && acc.Realm() != realm && !crossRealm) {
@@ -981,11 +987,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 避免拿全冷却兜底捞回来的旧域账号白撞一次上游。
 				pickRealm = otherRealm(realm)
 			}
-			acc = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, pickRealm)
-			if acc == nil && crossRealm {
+			// 粘性绑定存在时锁定其上游：同一会话跨上游切换会让 prompt cache
+			// 全部失效（缓存绝不跨上游共享），省下的负载均衡远不值这个代价。
+			acc = h.cfg.Pool.PickForBackend(tried, bareModel, pickRealm, stickyBackend)
+			if acc == nil && crossRealm && stickyBackend == "" {
 				// 该域选不到（并发抢名额/轮换耗尽/另一域刚冷却完）→ 另一域再试一次，
 				// 保持尽力而为语义；tried 已记录失败号，轮转仍由 MaxRotate 封顶。
-				acc = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, otherRealm(pickRealm))
+				acc = h.cfg.Pool.PickForBackend(tried, bareModel, otherRealm(pickRealm), stickyBackend)
 			}
 		}
 		if acc == nil {
@@ -1272,7 +1280,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.cfg.Pool.NoteSuccess(acct.UID)
 				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 				if sessKey != "" && h.cfg.Session != nil {
-					h.cfg.Session.Bind(sessKey, acct.UID)
+					h.cfg.Session.Bind(sessKey, pool.TriedKey(acc))
 				}
 			default:
 				// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
@@ -1284,7 +1292,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 				// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
 				if sessKey != "" && h.cfg.Session != nil {
-					h.cfg.Session.Bind(sessKey, acct.UID)
+					h.cfg.Session.Bind(sessKey, pool.TriedKey(acc))
 				}
 			}
 			credit, hasCredit := stats.Credit()
@@ -1365,7 +1373,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
+			h.cfg.Session.Bind(sessKey, pool.TriedKey(acc))
 		}
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if hasCredit {

@@ -170,7 +170,6 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			sessionDeadFails:         s.SessionDeadFails,
 			consecutiveFails:         s.ConsecutiveFails,
 		}
-		e.acc = p.placeholderAccount(backend, uid)
 		// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
 		if e.creditsExpiring < 0 {
 			e.creditsExpiring = 0
@@ -227,7 +226,12 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				e.modelCost[m] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
 			}
 		}
-		p.byUID[uid] = e
+		// byUID 的键恒为复合键（"backend:uid"）：落盘键对 CodeBuddy 是裸 uid、
+		// 对 Trae 已带前缀，这里统一补全，保证内存索引与查找口径一致。
+		e.acc = p.placeholderAccount(backend, uid)
+		idxKey := backend + ":" + uid
+		p.byUID[idxKey] = e
+		p.uidIndex[uid] = append(p.uidIndex[uid], idxKey)
 	}
 }
 
@@ -242,6 +246,9 @@ func (p *Pool) adoptSnapshot(s snapshot) {
 }
 func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.byUID = map[string]*entry{}
+	// uidIndex 必须一起重置：否则指向已删除条目的旧键会残留，
+	// lookupLocked 反查时命中不存在的复合键，表现为账号"查不到"。
+	p.uidIndex = map[string][]string{}
 	p.applyAccountsLocked(s.Accounts)
 	p.restoreSchedulingLocked(s.Scheduling)
 }
@@ -299,9 +306,10 @@ func (p *Pool) notePersistFail(err error) {
 func (p *Pool) stateOverviewLocked() stateFile {
 	now := time.Now()
 	sf := stateFile{Accounts: map[string]stateAccount{}, Scheduling: p.scheduling}
-	for uid, e := range p.byUID {
-		// 落盘键带 backend 前缀（"codebuddy:xxx"），避免两个上游的 uid 撞车
-		// 导致状态互相覆盖。单 backend 时仍是裸 uid，旧文件读得回来。
+	for _, e := range p.byUID {
+		uid := e.acc.UID()
+		// 落盘键：CodeBuddy 保持裸 uid（旧 state.json 直接读得回来，零迁移），
+		// 其他上游带 backend 前缀（"trae:xxx"）避免 uid 撞车互相覆盖。
 		key := uid
 		if e.acc != nil && e.acc.Backend() != "" && e.acc.Backend() != BackendCodeBuddy {
 			key = gateway.QualifiedUID(e.acc)

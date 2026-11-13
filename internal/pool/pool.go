@@ -14,6 +14,14 @@ import (
 type Pool struct {
 	mu    sync.RWMutex
 	byUID map[string]*entry
+	// uidIndex 裸 uid → 复合键列表（反查用）。
+	//
+	// byUID 的键是 gateway.QualifiedUID（"backend:uid"）：两个上游的 uid 形态
+	// 可能相同（CodeBuddy 是 UUID、Trae 是数字串，但都不保证），裸 uid 作键会
+	// 让后加载的账号覆盖先加载的，表现为「账号凭空消失」。
+	// uidIndex 保留裸 uid → 全部候选，供只有 uid 的旧调用方（面板/调度器）
+	// 在**唯一匹配**时仍能查到账号。
+	uidIndex map[string][]string
 	// placeholder 占位账号工厂（持久化恢复时构造 entry.acc；nil = 只支持 CodeBuddy）。
 	placeholder func(backend, uid string) gateway.Account
 	stateFp     string
@@ -95,6 +103,7 @@ type Pool struct {
 func New(stateFp string) *Pool {
 	p := &Pool{
 		byUID:              map[string]*entry{},
+		uidIndex:           map[string][]string{},
 		scheduling:         map[string]scheduleCursor{},
 		stateFp:            stateFp,
 		breakerThreshold:   defaultBreakerThreshold,
@@ -307,7 +316,7 @@ func (p *Pool) SetStore(s StoreSnapshotter) {
 // （global 档 maxInFlightGlobal，P1-1；未设置回落 maxInFlight）。
 func (p *Pool) Acquire(uid string) bool {
 	p.mu.RLock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		p.mu.RUnlock()
 		return false
@@ -333,7 +342,7 @@ func (p *Pool) Acquire(uid string) bool {
 // Release 释放一个在途名额。幂等减到 0 为止（防重复释放扣成负数）。
 func (p *Pool) Release(uid string) {
 	p.mu.RLock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	p.mu.RUnlock()
 	if !ok {
 		return
@@ -369,18 +378,20 @@ func (p *Pool) Add(a gateway.Account) {
 func (p *Pool) SyncToDir(auths []gateway.Account) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// seen 用复合键：SyncToDir 的语义是「本次扫描到的账号集合」，
+	// 用裸 uid 会让两个上游的同名 uid 互相视为「已存在」而漏删。
 	seen := make(map[string]bool, len(auths))
 	for _, a := range auths {
 		if a == nil {
 			continue
 		}
-		seen[a.UID()] = true
+		seen[gateway.QualifiedUID(a)] = true
 		p.upsertLocked(a)
 	}
 	changed := false
-	for uid := range p.byUID {
-		if !seen[uid] {
-			delete(p.byUID, uid)
+	for key := range p.byUID {
+		if !seen[key] {
+			p.removeIndexedLocked(key)
 			changed = true
 		}
 	}
@@ -395,11 +406,11 @@ func (p *Pool) SyncToDir(auths []gateway.Account) {
 func (p *Pool) Remove(uid string) gateway.Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return nil
 	}
-	delete(p.byUID, uid)
+	p.removeIndexedLocked(gateway.QualifiedUID(e.acc))
 	p.dirty.Store(true)
 	p.saveLocked()
 	return e.acc
@@ -411,12 +422,58 @@ func (p *Pool) upsertLocked(a gateway.Account) {
 	if a == nil {
 		return
 	}
-	uid := a.UID()
-	if e, ok := p.byUID[uid]; ok {
-		e.acc = a // 保留 credits/cooling 状态
+	key := gateway.QualifiedUID(a)
+	if e, ok := p.byUID[key]; ok {
+		// 保留 credits/cooling 状态，只换账号对象。注意账号可能换了 backend
+		// 归属（不会发生，但键已包含 backend 所以旧键会残留——由 removeIndexed 清理）。
+		e.acc = a
 		return
 	}
-	p.byUID[uid] = &entry{acc: a}
+	p.byUID[key] = &entry{acc: a}
+	p.uidIndex[a.UID()] = append(p.uidIndex[a.UID()], key)
+}
+
+// lookupLocked 按 uid 查账号。
+//
+// 优先精确匹配复合键（"backend:uid"），其次按裸 uid 反查——后者仅在**唯一**
+// 匹配时返回，多个上游共用同一 uid 时返回 nil（有歧义时宁可查不到，也不要
+// 返回错误上游的账号）。调用方必须已持有 p.mu。
+func (p *Pool) lookupLocked(uid string) (*entry, bool) {
+	if uid == "" {
+		return nil, false
+	}
+	if e, ok := p.byUID[uid]; ok {
+		return e, true
+	}
+	keys := p.uidIndex[uid]
+	if len(keys) != 1 {
+		return nil, false // 无匹配或跨上游歧义
+	}
+	e, ok := p.byUID[keys[0]]
+	return e, ok
+}
+
+// removeIndexedLocked 删除账号并清理索引。调用方必须已持有 p.mu。
+func (p *Pool) removeIndexedLocked(key string) *entry {
+	e, ok := p.byUID[key]
+	if !ok {
+		return nil
+	}
+	delete(p.byUID, key)
+	bare := e.acc.UID()
+	list := p.uidIndex[bare]
+	for i, k := range list {
+		if k == key {
+			list = append(list[:i], list[i+1:]...)
+			break
+		}
+	}
+	if len(list) == 0 {
+		delete(p.uidIndex, bare)
+	} else {
+		p.uidIndex[bare] = list
+	}
+	return e
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。

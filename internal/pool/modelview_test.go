@@ -25,7 +25,11 @@ func lockViewPool(t *testing.T) *Pool {
 // setModelCooldown 直接写模型级冷却（与 modelblocked_test.go 同法）。
 func setModelCooldown(p *Pool, uid, model string, until time.Time, reason string, auditOnly bool) {
 	p.mu.Lock()
-	e := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
+	if !ok {
+		p.mu.Unlock()
+		return
+	}
 	if e.modelCooldowns == nil {
 		e.modelCooldowns = map[string]modelCooldown{}
 	}
@@ -146,7 +150,7 @@ func TestModelLockViewSkipsDisabledAndPaused(t *testing.T) {
 	p := lockViewPool(t)
 	setModelCooldown(p, "u1", "glm-5.3", time.Now().Add(time.Hour), "6004", false)
 	p.mu.Lock()
-	p.byUID["u2"].disabled = true
+	p.byUID["codebuddy:u2"].disabled = true
 	p.mu.Unlock()
 
 	rows := p.ModelLockView()
@@ -161,8 +165,8 @@ func TestModelLockViewSkipsDisabledAndPaused(t *testing.T) {
 	}
 
 	p.mu.Lock()
-	p.byUID["u2"].disabled = false
-	p.byUID["u2"].paused = true
+	p.byUID["codebuddy:u2"].disabled = false
+	p.byUID["codebuddy:u2"].paused = true
 	p.mu.Unlock()
 
 	rows = p.ModelLockView()

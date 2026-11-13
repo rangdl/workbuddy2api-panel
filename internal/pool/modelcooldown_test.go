@@ -26,7 +26,7 @@ func TestModelCooldownsIndependent(t *testing.T) {
 	resetB := base.Add(1 * time.Hour)
 
 	p.mu.Lock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	e.modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: resetA, ResetAt: resetA},
 		"hy3-x":   {Until: resetB, ResetAt: resetB},
@@ -56,7 +56,7 @@ func TestModelCooldownsBDoesNotOverwriteA(t *testing.T) {
 	p.CooldownSoftForModel("u1", 600*time.Second, time.Now().Add(1*time.Hour), "hy3-x", "6004 model rate limit")
 
 	p.mu.RLock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	mcA, okA := e.modelCooldowns["glm-5.3"]
 	until := e.until
 	p.mu.RUnlock()
@@ -79,7 +79,7 @@ func TestCooldownSoftForModelDoesNotClobberUntil(t *testing.T) {
 	reset := time.Now().Add(30 * time.Minute)
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	until := e.until
 	mc, ok := e.modelCooldowns["glm-5.3"]
 	p.mu.RUnlock()
@@ -100,7 +100,7 @@ func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 	reset := time.Now().Add(2 * time.Hour) // 远超封顶 → until 截断到 10m，reset_at 保留 2h
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
-	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
+	mc, ok := p.byUID["codebuddy:u1"].modelCooldowns["glm-5.3"]
 	p.mu.RUnlock()
 	if !ok {
 		t.Fatal("modelCooldowns 缺少 glm-5.3")
@@ -121,7 +121,7 @@ func TestHealthyForModelAfterModelSpecific6004(t *testing.T) {
 	reset := time.Now().Add(30 * time.Minute)
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	p.mu.RUnlock()
 
 	now := time.Now()
@@ -144,7 +144,7 @@ func TestModelCooldownsTwoLimitsBothBlock(t *testing.T) {
 	resetA := time.Now().Add(2 * time.Hour)
 	resetB := time.Now().Add(2 * time.Hour)
 	p.mu.Lock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	e.modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: resetA, ResetAt: resetA},
 		"hy3-x":   {Until: resetB, ResetAt: resetB},
@@ -172,7 +172,7 @@ func TestModelCooldownsPreservedByNoteSuccess(t *testing.T) {
 	p.CooldownSoftForModel("u1", 600*time.Second, resetA, "glm-5.3", "6004 model rate limit")
 	p.NoteSuccess("u1") // 其他模型成功
 	p.mu.RLock()
-	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
+	mc, ok := p.byUID["codebuddy:u1"].modelCooldowns["glm-5.3"]
 	p.mu.RUnlock()
 	if !ok {
 		t.Fatalf("NoteSuccess 后 A(glm-5.3) 独立冷却被清除——模型独立性被破坏")
@@ -193,7 +193,7 @@ func TestModelCooldownsSurviveRevive(t *testing.T) {
 	p.CooldownSoftForModel("u1", 600*time.Second, time.Now().Add(time.Hour), "glm-5.3", "6004")
 	p.ReenableIfCredits("u1", 500, 0)
 	p.mu.RLock()
-	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
+	mc, ok := p.byUID["codebuddy:u1"].modelCooldowns["glm-5.3"]
 	p.mu.RUnlock()
 	if !ok {
 		t.Fatal("revive 后 modelCooldowns[glm-5.3] 应保留——余额恢复不构成限流解除证据")
@@ -208,7 +208,7 @@ func TestModelCooldownsLazyCleanup(t *testing.T) {
 	p := New("")
 	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.mu.Lock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	e.modelCooldowns = map[string]modelCooldown{
 		"old": {Until: time.Now().Add(-time.Minute), ResetAt: time.Now().Add(-time.Minute)},
 	}
@@ -230,7 +230,7 @@ func TestModelCooldownsExpiredAllowsSameModel(t *testing.T) {
 	p := New("")
 	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.mu.Lock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	e.modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: time.Now().Add(-time.Nanosecond), ResetAt: time.Now().Add(-time.Nanosecond)},
 	}
@@ -247,7 +247,7 @@ func TestRateLimitedModelsMultiModel(t *testing.T) {
 	resetA := time.Now().Add(2 * time.Hour)
 	resetB := time.Now().Add(1 * time.Hour)
 	p.mu.Lock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	e.modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: resetA, ResetAt: resetA, Reason: "6004 model rate limit"},
 		"hy3-x":   {Until: resetB, ResetAt: resetB, Reason: "6004 model rate limit"},
@@ -284,7 +284,7 @@ func TestModelRateLimitAuditDoesNotAffectRouting(t *testing.T) {
 	p.RecordModelRateLimitAudit("u1", "glm-5.3", "6004 model rate limit (reset unknown)")
 
 	p.mu.Lock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	mc, ok := e.modelCooldowns["glm-5.3"]
 	if ok && mc.AuditOnly {
 		mc.Until = time.Now().Add(time.Hour)
@@ -331,12 +331,12 @@ func TestModelRateLimitAuditPersists(t *testing.T) {
 	p2 := New(fp)
 	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p2.mu.RLock()
-	mc, ok := p2.byUID["u1"].modelCooldowns["glm-5.3"]
+	mc, ok := p2.byUID["codebuddy:u1"].modelCooldowns["glm-5.3"]
 	p2.mu.RUnlock()
 	if !ok || !mc.AuditOnly {
 		t.Fatalf("audit entry not restored: %+v ok=%v", mc, ok)
 	}
-	if p2.byUID["u1"].modelExempt() {
+	if p2.byUID["codebuddy:u1"].modelExempt() {
 		t.Fatal("restored AuditOnly entry must not create model exemption")
 	}
 }
@@ -348,7 +348,7 @@ func TestRateLimitedModelsMultiModelStableOutput(t *testing.T) {
 	resetA := time.Now().Add(2 * time.Hour)
 	resetB := time.Now().Add(1 * time.Hour)
 	p.mu.Lock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	e.modelCooldowns = map[string]modelCooldown{
 		"hy3-x":   {Until: resetB, ResetAt: resetB, Reason: "r"},
 		"glm-5.3": {Until: resetA, ResetAt: resetA, Reason: "r"},
@@ -370,7 +370,7 @@ func TestRateLimitedModelsEachModelHasOwnUntil(t *testing.T) {
 	resetA := time.Now().Add(2 * time.Hour)
 	resetB := time.Now().Add(1 * time.Hour)
 	p.mu.Lock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	e.modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: resetA, ResetAt: resetA, Reason: "r"},
 		"hy3-x":   {Until: resetB, ResetAt: resetB, Reason: "r"},
@@ -437,7 +437,7 @@ func TestHealthyForModelAccountCooledBeatsModelNotCooled(t *testing.T) {
 	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit") // 全账号级 until 冷却，无 modelCooldowns
 	p.mu.RLock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	p.mu.RUnlock()
 
 	if e.healthyForModel(time.Now(), "glm-5.3") {
@@ -456,7 +456,7 @@ func TestHealthyForModelAccountCooledWithModelCooldownStillBlocked(t *testing.T)
 	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit")
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
 	p.mu.RLock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	p.mu.RUnlock()
 	if e.healthyForModel(time.Now(), "glm-5.3") {
 		t.Fatal("全账号冷却 + 模型独立冷却双拦截，仍应不可选")
@@ -470,7 +470,7 @@ func TestHealthyForModelDisabledBeatsModelNotCooled(t *testing.T) {
 	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Disable("u1", "session dead")
 	p.mu.RLock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	p.mu.RUnlock()
 	if e.healthyForModel(time.Now(), "glm-5.3") {
 		t.Fatal("disabled 账号即使模型无独立冷却也不可选")
@@ -485,7 +485,7 @@ func TestHealthyForModelBreakerBeatsModelNotCooled(t *testing.T) {
 	p.SetBreaker(1, time.Hour, time.Hour)
 	p.NoteError("u1") // 触发熔断
 	p.mu.RLock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	bt := e.breakerUntil
 	p.mu.RUnlock()
 	if bt.IsZero() {
@@ -502,7 +502,7 @@ func TestHealthyForModelHealthyAccountNoModelCooldown(t *testing.T) {
 	p := New("")
 	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.mu.RLock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	p.mu.RUnlock()
 	for _, m := range []string{"glm-5.3", "hy3-x", ""} {
 		if !e.healthyForModel(time.Now(), m) {
@@ -518,7 +518,7 @@ func TestHealthyForModelAccountCooledAllowsNothingAfterUntil(t *testing.T) {
 	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Cooldown("u1", CoolSoft, time.Millisecond, "429")
 	p.mu.RLock()
-	e := p.byUID["u1"]
+	e := p.byUID["codebuddy:u1"]
 	p.mu.RUnlock()
 	// until 尚未到期：不可选（优先级：全账号级先判）。
 	if e.healthyForModel(time.Now(), "glm-5.3") {
@@ -577,7 +577,7 @@ func TestModelCooldownsPersist(t *testing.T) {
 	p2 := New(fp)
 	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p2.mu.RLock()
-	n := len(p2.byUID["u1"].modelCooldowns)
+	n := len(p2.byUID["codebuddy:u1"].modelCooldowns)
 	p2.mu.RUnlock()
 	if n != 1 {
 		t.Errorf("重载后 modelCooldowns=%d want 1（持久化恢复）", n)
@@ -596,8 +596,8 @@ func TestModelCooldownsPersistCompatOldState(t *testing.T) {
 	p := New(fp)
 	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.mu.RLock()
-	n := len(p.byUID["u1"].modelCooldowns)
-	until := p.byUID["u1"].until
+	n := len(p.byUID["codebuddy:u1"].modelCooldowns)
+	until := p.byUID["codebuddy:u1"].until
 	p.mu.RUnlock()
 	if n != 0 {
 		t.Errorf("旧文件加载后 modelCooldowns=%d want 0", n)

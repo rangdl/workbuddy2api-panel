@@ -160,7 +160,7 @@ func (p *Pool) pickOrderedLocked(cands []*entry, tried map[string]bool, model, r
 	}
 	advance := true
 	if strategy == SequentialExhaust && cursor.UID != "" {
-		current := p.byUID[cursor.UID]
+		current, _ := p.lookupLocked(cursor.UID)
 		if current != nil && current.acc.Realm() == realm && current.healthyForModel(now, model) &&
 			!p.floorBlockedForRealmModel(current, model, realm, now) &&
 			(explored || tried[gateway.QualifiedUID(current.acc)] || p.inFlightFull(current)) {

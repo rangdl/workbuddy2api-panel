@@ -95,6 +95,11 @@ func (b *bindStore) lastUID(key string) (string, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	u, ok := b.binds[key]
+	// 绑定值形如 "backend:uid"（多上游下用于锁定上游）。测试关心的是
+	// 「绑到了哪个账号」，故剥掉前缀后返回。
+	if i := strings.IndexByte(u, ':'); i >= 0 {
+		u = u[i+1:]
+	}
 	return u, ok
 }
 

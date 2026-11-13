@@ -21,11 +21,11 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 	defer p.mu.RUnlock()
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
+	for _, e := range p.byUID {
 		if !p.gateLocked(e, gateSpec{realm: realm, now: now}).ok() {
 			continue
 		}
-		uids = append(uids, uid)
+		uids = append(uids, e.acc.UID()) // 返回裸 uid
 	}
 	sort.Strings(uids)
 	return uids
@@ -68,11 +68,11 @@ func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string 
 	defer p.mu.RUnlock()
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
+	for _, e := range p.byUID {
 		if !p.gateLocked(e, gateSpec{model: model, realm: realm, now: now}).ok() {
 			continue
 		}
-		uids = append(uids, uid)
+		uids = append(uids, e.acc.UID()) // 返回裸 uid（调用方按裸 uid 使用）
 	}
 	sort.Strings(uids)
 
@@ -80,7 +80,7 @@ func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string 
 	for _, uid := range uids {
 		slots := 1
 		if p.preferExpiring {
-			if e := p.byUID[uid]; expiringNow(e, now) {
+			if e, ok := p.lookupLocked(uid); ok && expiringNow(e, now) {
 				slots = expiringVirtualSlots
 			}
 		}
@@ -102,11 +102,11 @@ func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 	defer p.mu.RUnlock()
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
+	for _, e := range p.byUID {
 		if !p.gateLocked(e, gateSpec{model: model, realm: realm, now: now}).ok() {
 			continue
 		}
-		uids = append(uids, uid)
+		uids = append(uids, e.acc.UID()) // 返回裸 uid
 	}
 	sort.Strings(uids)
 	return uids

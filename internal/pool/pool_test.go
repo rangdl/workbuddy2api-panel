@@ -196,7 +196,7 @@ func TestPickTopFiveByIdleNotCredits(t *testing.T) {
 	// a1..a5 全部"刚被用过"，闲置补偿归零；a6 从未使用 → 闲置满分。
 	p.mu.Lock()
 	for _, u := range []string{"a1", "a2", "a3", "a4", "a5"} {
-		p.byUID[u].lastUsed = now
+		p.byUID["codebuddy:"+u].lastUsed = now
 	}
 	p.mu.Unlock()
 
@@ -283,7 +283,7 @@ func TestPickLRUFallbackWhenTopAllRecentlyUsed(t *testing.T) {
 	order := []string{"a4", "a3", "a2", "a1", "a0"}
 	p.mu.Lock()
 	for i, uid := range order {
-		p.byUID[uid].lastUsed = time.Now().Add(-time.Duration(len(order)-i) * time.Second) // a4 最旧
+		p.byUID["codebuddy:"+uid].lastUsed = time.Now().Add(-time.Duration(len(order)-i) * time.Second) // a4 最旧
 	}
 	p.mu.Unlock()
 
@@ -692,7 +692,7 @@ func wantCoolSec(t *testing.T, p *Pool, uid string, want int64, tol int64) {
 // （CooldownSoftRate 只在"不在有效软冷却中"时推进 streak——跨冷却期堆加）。
 func expireCooldown(p *Pool, uid string) {
 	p.mu.Lock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		e.until = time.Now().Add(-time.Second)
 	}
 	p.mu.Unlock()
@@ -1186,7 +1186,7 @@ func TestSaveFailureRecordedAndRecovers(t *testing.T) {
 func (p *Pool) breakerUntil(uid string) (time.Time, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return time.Time{}, false
 	}
@@ -1197,14 +1197,17 @@ func (p *Pool) breakerUntil(uid string) (time.Time, bool) {
 func (p *Pool) breakerFails(uid string) int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.byUID[uid].fails
+	if e, ok := p.lookupLocked(uid); ok {
+		return e.fails
+	}
+	return 0
 }
 
 // internalHealthy 曝露 entry.healthy 供测试断言（包内私有 helper）。
 func (p *Pool) internalHealthy(uid string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return false
 	}
@@ -1362,7 +1365,7 @@ func TestFallbackNilWhenAllDisabled(t *testing.T) {
 func (p *Pool) entryWeight(uid string) float64 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	e := p.byUID[uid]
+	e, _ := p.lookupLocked(uid)
 	var maxCredits int64
 	for _, x := range p.byUID {
 		if x.credits > maxCredits {
@@ -1392,7 +1395,7 @@ func TestWeightIdleCompensation(t *testing.T) {
 	p.SetCredits("idle", 100, 0)
 	// used 1 小时前被选中过、idle 从未使用 → idle 权重更高（闲置补偿）。
 	p.mu.Lock()
-	p.byUID["used"].lastUsed = time.Now().Add(-1 * time.Hour)
+	p.byUID["codebuddy:used"].lastUsed = time.Now().Add(-1 * time.Hour)
 	p.mu.Unlock()
 	wUsed, wIdle := p.entryWeight("used"), p.entryWeight("idle")
 	if wIdle <= wUsed {
@@ -1407,7 +1410,7 @@ func TestWeightAllZeroCreditsStillWeighted(t *testing.T) {
 	p.Add(WrapAuth(&auth.Auth{UID: "bursty"}))
 	// idle 从未使用、bursty 半分钟前刚用过 → idle 权重更高。
 	p.mu.Lock()
-	p.byUID["bursty"].lastUsed = time.Now().Add(-30 * time.Second)
+	p.byUID["codebuddy:bursty"].lastUsed = time.Now().Add(-30 * time.Second)
 	p.mu.Unlock()
 	wIdle, wBursty := p.entryWeight("idle"), p.entryWeight("bursty")
 	if wIdle <= wBursty {
@@ -1426,8 +1429,8 @@ func TestWeightTopFiveSelectionChanges(t *testing.T) {
 	p.SetCredits("a", 90, 0) // a credits 略低，但久置
 	p.SetCredits("b", 100, 0)
 	p.mu.Lock()
-	p.byUID["b"].lastUsed = time.Now()
-	p.byUID["a"].lastUsed = time.Now().Add(-48 * time.Hour)
+	p.byUID["codebuddy:b"].lastUsed = time.Now()
+	p.byUID["codebuddy:a"].lastUsed = time.Now().Add(-48 * time.Hour)
 	p.mu.Unlock()
 	if wA, wB := p.entryWeight("a"), p.entryWeight("b"); wA <= wB {
 		t.Errorf("idle a should outweigh busy higher-credit b: a=%v b=%v", wA, wB)
@@ -1513,7 +1516,7 @@ func TestInFlightCountNotExceedLimit(t *testing.T) {
 			if p.Acquire("u1") {
 				// 峰值检查：acquire 成功后立即读计数，应 ≤ 2。
 				p.mu.RLock()
-				if n := p.byUID["u1"].inFlight.Load(); n > 2 {
+				if n := p.byUID["codebuddy:u1"].inFlight.Load(); n > 2 {
 					t.Errorf("in-flight exceeded limit: %d", n)
 				}
 				p.mu.RUnlock()
@@ -1525,7 +1528,7 @@ func TestInFlightCountNotExceedLimit(t *testing.T) {
 
 	// 全部释放后计数必须为 0。
 	p.mu.RLock()
-	n := p.byUID["u1"].inFlight.Load()
+	n := p.byUID["codebuddy:u1"].inFlight.Load()
 	p.mu.RUnlock()
 	if n != 0 {
 		t.Fatalf("in-flight should be 0 after all releases, got %d", n)
@@ -1820,8 +1823,8 @@ func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 	p.SetCreditsDetailed("b", 100, 100, 0, time.Time{}, 0)
 
 	p.mu.Lock()
-	we := p.routingWeightOf(p.byUID["a"], 100, now)
-	wn := p.routingWeightOf(p.byUID["b"], 100, now)
+	we := p.routingWeightOf(p.byUID["codebuddy:a"], 100, now)
+	wn := p.routingWeightOf(p.byUID["codebuddy:b"], 100, now)
 	p.mu.Unlock()
 	if we != wn*expiringVirtualSlots {
 		t.Fatalf("enabled expiring weight=%v want %v", we, wn*expiringVirtualSlots)
@@ -1830,8 +1833,8 @@ func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 	p.SetPreferExpiring(false)
 
 	p.mu.Lock()
-	wa := p.routingWeightOf(p.byUID["a"], 100, now)
-	wb := p.routingWeightOf(p.byUID["b"], 100, now)
+	wa := p.routingWeightOf(p.byUID["codebuddy:a"], 100, now)
+	wb := p.routingWeightOf(p.byUID["codebuddy:b"], 100, now)
 	p.mu.Unlock()
 	if wa != wb {
 		t.Fatalf("disabled expiring weights differ: %v/%v", wa, wb)

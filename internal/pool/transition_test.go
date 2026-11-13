@@ -23,7 +23,7 @@ func coolingDomain(t *testing.T, p *Pool, uid string) (until time.Time, coolKind
 	t.Helper()
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		t.Fatalf("uid %s missing", uid)
 	}

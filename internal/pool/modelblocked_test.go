@@ -21,10 +21,10 @@ func TestModelBlockedAllAccountsCooled(t *testing.T) {
 	base := time.Now()
 	// 两个号对同一模型都有冷却，解封时间不同 → 应取最早的。
 	p.mu.Lock()
-	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+	p.byUID["codebuddy:u1"].modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: base.Add(2 * time.Hour), Reason: "11102 model [glm-5.3] service info not found"},
 	}
-	p.byUID["u2"].modelCooldowns = map[string]modelCooldown{
+	p.byUID["codebuddy:u2"].modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: base.Add(1 * time.Hour), Reason: "11102 model [glm-5.3] service info not found"},
 	}
 	p.mu.Unlock()
@@ -52,7 +52,7 @@ func TestModelBlockedOneAccountStillServes(t *testing.T) {
 	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.mu.Lock()
-	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+	p.byUID["codebuddy:u1"].modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: time.Now().Add(time.Hour), Reason: "11102 ..."},
 	}
 	p.mu.Unlock()
@@ -62,7 +62,7 @@ func TestModelBlockedOneAccountStillServes(t *testing.T) {
 	}
 	// 但 u2 对该模型无冷却这一点必须是真的（防止测试自身构造错误）。
 	p.mu.RLock()
-	cooled := p.byUID["u2"].modelCooled(time.Now(), "glm-5.3")
+	cooled := p.byUID["codebuddy:u2"].modelCooled(time.Now(), "glm-5.3")
 	p.mu.RUnlock()
 	if cooled {
 		t.Fatalf("测试构造有误：u2 不该对该模型冷却")
@@ -106,10 +106,10 @@ func TestModelBlockedDisabledDoesNotCount(t *testing.T) {
 	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.mu.Lock()
-	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+	p.byUID["codebuddy:u1"].modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: time.Now().Add(time.Hour), Reason: "11102 ..."},
 	}
-	p.byUID["u2"].disabled = true // 唯一还能服务的号被禁用了
+	p.byUID["codebuddy:u2"].disabled = true // 唯一还能服务的号被禁用了
 	p.mu.Unlock()
 
 	st := p.ModelBlocked("glm-5.3")
@@ -127,7 +127,7 @@ func TestModelBlockedAuditOnlyNotBlocking(t *testing.T) {
 	p := New("")
 	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.mu.Lock()
-	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+	p.byUID["codebuddy:u1"].modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: time.Now().Add(time.Hour), Reason: "audit", AuditOnly: true},
 	}
 	p.mu.Unlock()
@@ -142,7 +142,7 @@ func TestModelBlockedExpiredNotBlocking(t *testing.T) {
 	p := New("")
 	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.mu.Lock()
-	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+	p.byUID["codebuddy:u1"].modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: time.Now().Add(-time.Minute), Reason: "11102 ..."},
 	}
 	p.mu.Unlock()
@@ -196,10 +196,10 @@ func TestModelBlockedPausedDoesNotMaskBlock(t *testing.T) {
 	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.mu.Lock()
-	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+	p.byUID["codebuddy:u1"].modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: time.Now().Add(time.Hour), Reason: "11102 ..."},
 	}
-	p.byUID["u2"].paused = true // 唯一「健康」的号在暂停让位
+	p.byUID["codebuddy:u2"].paused = true // 唯一「健康」的号在暂停让位
 	p.mu.Unlock()
 
 	st := p.ModelBlocked("glm-5.3")

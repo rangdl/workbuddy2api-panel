@@ -16,7 +16,7 @@ import (
 func (p *Pool) Disable(uid, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		p.disableLocked(e, reason)
 	}
 }
@@ -33,7 +33,7 @@ func (p *Pool) Disable(uid, reason string) {
 func (p *Pool) NoteSessionDead(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return false
 	}
@@ -51,7 +51,7 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 func (p *Pool) ClearSessionDead(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		e.sessionDeadFails = 0
 	}
 }
@@ -63,7 +63,7 @@ func (p *Pool) ClearSessionDead(uid string) {
 func (p *Pool) ReviveDisabled(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok && e.disabled {
+	if e, ok := p.lookupLocked(uid); ok && e.disabled {
 		e.disabled = false
 		e.reason = ""
 		e.sessionDeadFails = 0
@@ -78,7 +78,7 @@ func (p *Pool) ReviveDisabled(uid string) {
 func (p *Pool) Revive(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return false
 	}
@@ -104,7 +104,7 @@ func (p *Pool) Revive(uid string) bool {
 func (p *Pool) Pause(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return false
 	}
@@ -116,7 +116,7 @@ func (p *Pool) Pause(uid string) bool {
 func (p *Pool) Resume(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return false
 	}
@@ -133,7 +133,7 @@ func (p *Pool) Resume(uid string) bool {
 func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		if remain > 0 && !e.disabled {
 			p.reviveCoolingLocked(e, remain, total)
 		} else {
@@ -155,7 +155,7 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 func (p *Pool) NoteError(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		e.errTotal++
 		e.lastErr = time.Now()
 		p.recordBreakerFailureLocked(e)
@@ -175,7 +175,7 @@ func (p *Pool) NoteError(uid string) {
 func (p *Pool) NoteSuccess(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		e.successCount++
 		e.lastSuccess = time.Now()
 		e.fails = 0
@@ -218,7 +218,7 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return
 	}
@@ -316,7 +316,7 @@ func (p *Pool) deductExpiryLocked(e *entry, d int64) {
 func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return
 	}
@@ -359,7 +359,7 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 func (p *Pool) Status(uid string) (Status, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return Status{}, false
 	}
@@ -375,7 +375,7 @@ func (p *Pool) Status(uid string) (Status, bool) {
 func (p *Pool) AuthByUID(uid string) *auth.Auth {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return nil
 	}
@@ -389,11 +389,12 @@ func (p *Pool) AvailableUIDs() []string {
 	defer p.mu.RUnlock()
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
+	for _, e := range p.byUID {
 		if !p.gateLocked(e, gateSpec{now: now}).ok() {
 			continue
 		}
-		uids = append(uids, uid)
+		// 返回裸 uid：调用方（session / 面板）按裸 uid 使用，池内索引键才是复合的。
+		uids = append(uids, e.acc.UID())
 	}
 	sort.Strings(uids)
 	return uids
@@ -410,11 +411,11 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 	defer p.mu.RUnlock()
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
+	for _, e := range p.byUID {
 		if !p.gateLocked(e, gateSpec{model: model, now: now}).ok() {
 			continue
 		}
-		uids = append(uids, uid)
+		uids = append(uids, e.acc.UID())
 	}
 	sort.Strings(uids)
 	return uids
@@ -427,10 +428,27 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 func (p *Pool) PickByUIDForModel(uid, model string) gateway.Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return nil
 	}
+	return p.pickEntryLocked(e, model)
+}
+
+// pickByKey 按池内复合键精确取号（粘性绑定用）。
+func (p *Pool) pickByKey(key, model string) gateway.Account {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[key]
+	if !ok {
+		return nil
+	}
+	return p.pickEntryLocked(e, model)
+}
+
+// pickEntryLocked 校验单个账号在指定模型下是否可选，并记录 selected 序号。
+// 调用方必须已持有 p.mu。
+func (p *Pool) pickEntryLocked(e *entry, model string) gateway.Account {
 	now := time.Now()
 	// 统一判据（gate.go）。realm 取账号自己的域：粘性号已确定，无需外部传入，
 	// 但积分保底里的上游倍率表按 (域, 模型) 分桶，所以必须带上它而不是留空。
@@ -458,7 +476,7 @@ func (p *Pool) PickByUIDForModel(uid, model string) gateway.Account {
 func (p *Pool) PickByUID(uid string) gateway.Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return nil
 	}
@@ -571,14 +589,17 @@ func (p *Pool) ServableForRealm(realm string) bool {
 func (p *Pool) List() []Status {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	uids := make([]string, 0, len(p.byUID))
-	for uid := range p.byUID {
-		uids = append(uids, uid)
+	keys := make([]string, 0, len(p.byUID))
+	for k := range p.byUID {
+		keys = append(keys, k)
 	}
-	sort.Strings(uids)
-	out := make([]Status, 0, len(uids))
-	for _, uid := range uids {
-		out = append(out, p.statusOf(uid, p.byUID[uid]))
+	sort.Strings(keys)
+	out := make([]Status, 0, len(keys))
+	for _, k := range keys {
+		e := p.byUID[k]
+		// Status.UID 保持裸 uid（面板/调度器按裸 uid 调用各接口），
+		// 池内索引键才是复合的。
+		out = append(out, p.statusOf(e.acc.UID(), e))
 	}
 	return out
 }
@@ -729,4 +750,16 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 		return nil
 	}
 	return rows
+}
+
+// PickByUIDForBackend 按 (backend, uid) 精确取回粘性账号。
+//
+// 与 PickByUIDForModel 的差异：后者只按裸 uid 反查，两个上游共用同一 uid
+// 时会因歧义返回 nil（或取到错误上游的账号）。粘性绑定值带 backend，
+// 这里用它做精确匹配，是「同一会话只落在同一上游」的实现基础。
+func (p *Pool) PickByUIDForBackend(backend, uid, model string) gateway.Account {
+	if backend == "" {
+		return p.PickByUIDForModel(uid, model)
+	}
+	return p.pickByKey(gateway.QualifiedUID(bareAccount{backend: backend, uid: uid}), model)
 }
