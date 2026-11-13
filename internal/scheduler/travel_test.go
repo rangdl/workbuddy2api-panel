@@ -145,7 +145,6 @@ func fastTravel(t *testing.T) {
 func fastTravelTimer(t *testing.T, s *Scheduler) {
 	t.Helper()
 	s.travelTimerCfg = travelTimerParams{
-		poll:      50 * time.Millisecond,
 		step:      5 * time.Millisecond,
 		minWait:   0,
 		jitterMax: 0,
@@ -917,8 +916,49 @@ func TestRunTravelTimerClaimsPastArrivalImmediately(t *testing.T) {
 	}
 }
 
+// TestTravelDepartPokesTimer 派出成功后必须唤醒到站定时器。
+//
+// 事件驱动模型下这是最主要的唤醒源：定时器在「无在途行程」时阻塞，不轮询。
+// 若派出后不 poke，新行程永远不会被定时，只能等下一个 travel_hours 整点兜底
+// ——那就退回到修复前的状态了。
+func TestTravelDepartPokesTimer(t *testing.T) {
+	fastTravel(t)
+	stub := &travelStub{
+		buddy: `{"id":7}`,
+		state: `{"state":"idle","daily_limit_reached":false}`,
+	}
+	srv := stub.server()
+	defer srv.Close()
+
+	s, _ := newTravelScheduler(t, srv, "u1")
+	fastTravelTimer(t, s)
+
+	// 先排空 rearm channel，确保后续断言看到的是 depart 触发的那次 poke。
+	select {
+	case <-s.rearmTravel:
+	default:
+	}
+
+	s.travelMu.Lock()
+	s.travelOne(s.cfg.Pool.AuthByUID("u1"))
+	s.travelMu.Unlock()
+
+	if n := stub.departCalls.Load(); n != 1 {
+		t.Fatalf("depart calls=%d want 1（前置条件：本趟应派出）", n)
+	}
+	select {
+	case <-s.rearmTravel:
+		// ok：派出后 poke 了
+	default:
+		t.Error("派出成功后未唤醒到站定时器（新行程不会被定时）")
+	}
+}
+
 // TestRunTravelTimerNoBusyLoop 上游持续返回「已过点但仍是 traveling」的行程时，
 // 同一趟行程只触发一次：不得以 travelTimerMinWait 的节奏无限重查（空转上游）。
+//
+// 事件驱动模型下更严格：该趟被 fired 过滤后没有其它事件，定时器应直接阻塞，
+// 期间**一个 status 请求都不再发**。
 func TestRunTravelTimerNoBusyLoop(t *testing.T) {
 	fastTravel(t)
 	stub := &travelStub{
@@ -941,10 +981,13 @@ func TestRunTravelTimerNoBusyLoop(t *testing.T) {
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
-	// 之后应退回轮询间隔（50ms），200ms 内最多再多 5 轮扫描；留足余量断言 < 20。
-	time.Sleep(200 * time.Millisecond)
-	if n := stub.statusCalls.Load(); n > 20 {
-		t.Errorf("status calls=%d（空转：已触发的行程被反复重查）", n)
+	time.Sleep(100 * time.Millisecond) // 让触发后的收尾请求落定
+	after := stub.statusCalls.Load()
+
+	// 之后应完全阻塞等事件，不再有任何周期性 status 查询。
+	time.Sleep(300 * time.Millisecond)
+	if n := stub.statusCalls.Load(); n != after {
+		t.Errorf("status calls %d → %d（事件驱动模型下不应周期重查）", after, n)
 	}
 }
 

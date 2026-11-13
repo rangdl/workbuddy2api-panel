@@ -26,7 +26,6 @@ import (
 // 测试改写时会与运行中的 goroutine 形成数据竞争（-race 实测）。作为实例字段，
 // 每个 Scheduler（每个测试）各持一份，互不影响。
 type travelTimerParams struct {
-	poll    time.Duration // 无在途行程时的兜底重查间隔
 	step    time.Duration // 分段等待段长（墙钟重判，规避休眠冻结单调时钟）
 	minWait time.Duration // 到站时刻距 now 的最小睡眠（吸收上游与本地秒级偏差）
 	// jitterMax 到站后额外等待的上限（随机 0..jitterMax）。
@@ -40,15 +39,14 @@ type travelTimerParams struct {
 }
 
 // travelTimerDefaults 生产取值：
-//   - poll 10min：所有账号 idle / 查询失败时没有 arrive_at 可等，周期重查既覆盖
-//     「上游刚给出新行程」，也覆盖启动初期的临时失败；
+//   （没有 poll 项：无在途行程时定时器阻塞等事件，不做周期轮询——猫一天只派出
+//     一趟，周期重查等于每小时对全池空发一次 travel/status。）
 //   - step 与 wallclockCheckStep 同口径；
 //   - minWait 1s：到点瞬间查 status 可能仍返回 traveling（上游时间只到秒），
 //     留 1s 缓冲避免白跑一趟。已过点的行程不受此限，立即触发；
 //   - jitterMax 15min：到站后随机再等 0~15 分钟才领奖，避免「0 秒领取」的机器特征。
 //     猫到站后奖励不会过期（实测挂 19 天仍可领），等待无风险。
 var travelTimerDefaults = travelTimerParams{
-	poll:      10 * time.Minute,
 	step:      wallclockCheckStep,
 	minWait:   time.Second,
 	jitterMax: 15 * time.Minute,
@@ -57,9 +55,6 @@ var travelTimerDefaults = travelTimerParams{
 // travelTimer 返回本调度器生效的时间参数（零值回落默认，New 构造的实例恒有值）。
 func (s *Scheduler) travelTimer() travelTimerParams {
 	p := s.travelTimerCfg
-	if p.poll <= 0 {
-		p.poll = travelTimerDefaults.poll
-	}
 	if p.step <= 0 {
 		p.step = travelTimerDefaults.step
 	}
@@ -101,18 +96,25 @@ type travelArrival struct {
 
 // RunTravelTimer 到站定时器主循环，阻塞直到 ctx 取消。
 //
-// 每轮：
-//  1. 遍历全池查 travel/status，收集所有在途账号的到站时刻；
-//  2. 取最早的一个（同一账号本轮只跑一次），sleep 到点；
+// **事件驱动，不做周期轮询**：没有在途行程时直接阻塞等 rearm 信号，不发任何
+// 上游请求。唤醒源只有三个：
+//  1. 启动：进程起来先扫一轮（覆盖关机期间已到站未领的行程，即「启动补跑」）；
+//  2. 派出成功：travelDepart 成功后 PokeTravelTimer，新行程的 arrive_at 才需要等；
+//  3. 手动触发/配置变更：面板「旅行巡检」按钮、保存配置（Reconfigure）。
+//
+// 之前是「无在途行程时每 10 分钟重查一遍」——纯浪费：猫一天只派出一趟，
+// 其余 23 小时全在空转，每个周期对全池发一遍 travel/status。
+//
+// 每轮（被唤醒后）：
+//  1. 遍历全池查 travel/status，收集在途账号的到站时刻；
+//  2. 取最早的一个，sleep 到点；
 //  3. 到点只对那个账号跑 travelOne（领奖 → 重查 → 盲盒 → 再派出）；
 //  4. 重算下一轮。
 //
-// 第一轮本身就是「启动补跑」：覆盖关机期间已到站未领的行程，无需额外 goroutine。
-// 无在途行程时按 travelTimerPoll 周期重查（此时上游无新请求，纯空闲）。
-//
 // fired 记「哪一趟行程已经触发过」（uid → 上游 arrive_at）：上游若持续返回
 // 状态未更新的在途行程（arrive_at 已过点却仍是 traveling），没有这份记录就会
-// 以 travelTimerMinWait 的节奏无限重查——退回轮询间隔等它自愈。
+// 以 travelTimerMinWait 的节奏无限重查——有了它则该趟被过滤掉，退回等下一次
+// 事件（派出新行程 / 整点兜底巡检 / 手动触发）。
 func (s *Scheduler) RunTravelTimer(ctx context.Context) {
 	fired := make(map[string]int64)
 	tp := s.travelTimer()
@@ -122,10 +124,20 @@ func (s *Scheduler) RunTravelTimer(ctx context.Context) {
 		s.travelMu.Lock()
 		arrivals := filterUnfired(s.scanTravelArrivals(), fired)
 		s.travelMu.Unlock()
-		wait, target := travelTimerNext(arrivals, time.Now(), tp.minWait, tp.poll)
-		// 到站抖动：只在「等一趟真实在途行程」时加，兜底轮询（target==nil）不加。
-		// 目的见 travelTimerParams.jitterMax——把「到达即领」的 0 秒延迟打散。
-		if target != nil && !target.immediate && tp.jitterMax > 0 {
+		wait, target := travelTimerNext(arrivals, time.Now(), tp.minWait)
+		if target == nil {
+			// 没有在途行程：阻塞等事件，不空转。
+			log.Printf("travel-timer: 无在途行程，等待派出/启动/手动触发事件")
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.rearmTravel:
+				continue
+			}
+		}
+		// 到站抖动：只在「等一趟真实在途行程」时加。目的见
+		// travelTimerParams.jitterMax——把「到达即领」的 0 秒延迟打散。
+		if !target.immediate && tp.jitterMax > 0 {
 			j := tp.jitter(tp.jitterMax)
 			if j > 0 {
 				wait += j
@@ -134,8 +146,6 @@ func (s *Scheduler) RunTravelTimer(ctx context.Context) {
 			}
 		}
 		switch {
-		case target == nil:
-			log.Printf("travel-timer: 无可等待行程，%s 后重查", tp.poll)
 		case wait <= tp.minWait:
 			// arrived（启动补跑）或已过点的行程：立即执行，不喊「还剩 0s」。
 			log.Printf("travel-timer %s: 有到站奖励待领，立即唤醒", logfmt.Label(target.uid, target.nick))
@@ -162,10 +172,10 @@ func (s *Scheduler) RunTravelTimer(ctx context.Context) {
 				log.Printf("travel-timer %s: 唤醒时账号已不在池中，跳过", logfmt.Label(target.uid, target.nick))
 			}
 			// 唤醒后这一趟行程不再参与定时（去重），若上游仍报同一趟在途，
-			// 下一轮扫描会看到它但被 filterUnfired 过滤，退回兜底轮询等它自愈。
+			// 下一轮扫描会看到它但被 filterUnfired 过滤，退回等下一次事件
+			// （派出新行程 / 整点兜底巡检 / 手动触发）。
 			// 补一行让「为什么没继续等」在日志里可解释。
-			log.Printf("travel-timer %s: 本趟已触发，等待上游刷新状态（兜底 %s 后重扫）",
-				logfmt.Label(target.uid, target.nick), tp.poll)
+			log.Printf("travel-timer %s: 本趟已触发，等上游刷新状态或下一次事件", logfmt.Label(target.uid, target.nick))
 		}
 	}
 }
@@ -258,15 +268,11 @@ func travelDueTime(ts *upstream.TravelState, now time.Time) (at time.Time, key i
 	}
 }
 
-// travelTimerNext 取最早到站时刻与对应账号；无候选时返回兜底轮询间隔。
+// travelTimerNext 取最早到站时刻与对应账号；无候选时返回 nil（调用方阻塞等事件）。
 // wait 恒为正：到点账号留 minWait 缓冲，避免与上游秒级偏差白跑。
-//
-// poll 由调用方传入（而非在此读 travelTimerDefaults）：Scheduler 的时间参数
-// 可被测试覆盖，硬编码默认值会让「无候选」这条路径绕过覆盖，与日志里打印的
-// tp.poll 不一致。
-func travelTimerNext(arrivals []travelArrival, now time.Time, minWait, poll time.Duration) (time.Duration, *travelArrival) {
+func travelTimerNext(arrivals []travelArrival, now time.Time, minWait time.Duration) (time.Duration, *travelArrival) {
 	if len(arrivals) == 0 {
-		return poll, nil
+		return 0, nil
 	}
 	best := 0
 	for i := 1; i < len(arrivals); i++ {

@@ -647,7 +647,7 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 
 两条触发路径并存：
 
-- **到站定时器（主路径）**：独立 goroutine 周期性查 `travel/status`，按上游返回的 `arrive_at` 精确定时唤醒，到点只对那个账号跑一趟 `travelOne`。剩余时长用 `arrive_at - server_now` 换算，不受本机时钟偏差影响；等待按 1 分钟分段（`wallclockCheckStep`），机器休眠后醒来仍能立即补跑。无在途行程时按 10 分钟周期重查（纯 sleep，不产生上游请求）。
+- **到站定时器（主路径）**：独立 goroutine，按上游返回的 `arrive_at` 精确定时唤醒，到点只对那个账号跑一趟 `travelOne`。剩余时长用 `arrive_at - server_now` 换算，不受本机时钟偏差影响；等待按 1 分钟分段（`wallclockCheckStep`），机器休眠后醒来仍能立即补跑。**事件驱动、不做周期轮询**：没有在途行程时直接阻塞，只有三个唤醒源——进程启动（兼作关机期间到站奖励的补跑）、派出成功（`travelDepart` 后 poke）、手动触发或配置变更。到站后还会等一段 0~15 分钟的随机抖动才领奖，避免「到达时刻与领奖时刻完全重合」的机器特征；已到站待领的补跑场景不加抖动。
 - **`travel_hours` 定点点检（兜底）**：默认 `[9, 21]`，覆盖定时器漏唤醒 / 长期关机后的补跑。
 
 单趟最多三个动作（claim → 盲盒 → depart），不再「每趟只做一个」：

@@ -34,7 +34,15 @@ const (
 	// EndpointCheckinClaim 执行签到。
 	EndpointCheckinClaim = "/trae/api/v2/ug/checkin_credits/claim"
 	// EndpointEntUsage 积分包查询。
-	EndpointEntUsage = "/trae/api/v2/pay/ide_user_ent_usage"
+	//
+	// 必须是 **web_user_ent_usage**：dsh-connect-trae 的实测文档
+	// （docs/USAGE_API_RESEARCH.md，2026-09）里，能读到「总可用额度/积分来源」
+	// 的只有 web_user_ent_usage（别名 user_current_entitlement_list）；
+	// 早先用的 ide_user_ent_usage **不在可用列表里**——它返回 200 但不含
+	// user_entitlement_pack_list，于是所有数值都算成 0。
+	EndpointEntUsage = "/trae/api/v2/pay/web_user_ent_usage"
+	// EndpointEntUsageAlias 同上接口的别名，主端点异常时兜底。
+	EndpointEntUsageAlias = "/trae/api/v2/pay/user_current_entitlement_list"
 	// checkinUserAgent 签到接口的 UA（对齐真实客户端形态）。
 	//
 	// 2026-11 客户端合并（TraeWork + TraeCode → 统一 TRAE，桌面端改名 Trae CN）后，
@@ -136,6 +144,9 @@ type CreditsSummary struct {
 	Limit float64 `json:"limit"`
 	// Packs 明细。
 	Packs []CreditPack `json:"packs"`
+	// TotalFromSummary true = Limit/Total 取自上游 usage_summary；
+	// false = 上游没给 usage_summary，退回逐包求和。
+	TotalFromSummary bool `json:"total_from_summary"`
 }
 
 // Checkin 执行一次签到：先 status 预检（已签则跳过），否则 claim。
@@ -249,12 +260,33 @@ func (c *Client) CheckinClaim(ctx context.Context, cfg *Config, acc *Account) (*
 }
 
 // QueryCredits 查询积分包明细与汇总。
+//
+// 端点顺序：web_user_ent_usage → user_current_entitlement_list（别名）。
+// 两者结构相同，任一个返回了 pack 列表即可。
 func (c *Client) QueryCredits(ctx context.Context, cfg *Config, acc *Account) (*CreditsSummary, error) {
-	payload := map[string]any{"require_usage": true, "req_source": 2}
-	body, err := c.apiPost(ctx, cfg, acc, EndpointEntUsage, payload)
-	if err != nil {
-		return nil, err
+	payload := map[string]any{"require_usage": true}
+	var lastErr error
+	for _, endpoint := range []string{EndpointEntUsage, EndpointEntUsageAlias} {
+		body, err := c.apiPost(ctx, cfg, acc, endpoint, payload)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		sum, err := summarizeCredits(body)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return sum, nil
 	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("积分接口无可用响应")
+	}
+	return nil, lastErr
+}
+
+// summarizeCredits 把一次积分接口响应转成汇总。
+func summarizeCredits(body map[string]any) (*CreditsSummary, error) {
 	packsRaw, ok := findPayloadField(unwrapScopes(body), "user_entitlement_pack_list")
 	if !ok {
 		return nil, fmt.Errorf("响应中缺少 user_entitlement_pack_list")
@@ -263,26 +295,125 @@ func (c *Client) QueryCredits(ctx context.Context, cfg *Config, acc *Account) (*
 	if !ok {
 		return nil, fmt.Errorf("user_entitlement_pack_list 不是数组")
 	}
-	sum := &CreditsSummary{Packs: make([]CreditPack, 0, len(list))}
+	sum := &CreditsSummary{
+		Packs: make([]CreditPack, 0, len(list)),
+		// 上游给的总额/已用（usage_summary）优先作为合计口径：
+		// 逐包求和会漏掉没有 credits_limit 的包（免费包等）。
+		TotalFromSummary: true,
+	}
+	if ss, ok := findPayloadField(unwrapScopes(body), "usage_summary"); ok {
+		if m, ok := ss.(map[string]any); ok {
+			total := floatOf(m["total_amount"])
+			used := floatOf(m["consumed_amount"])
+			if total > 0 {
+				sum.Limit = total
+				sum.Total = maxFloat(total-used, 0)
+			}
+		}
+	}
+	packTotal, packLimit := 0.0, 0.0
 	for _, raw := range list {
 		pack, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}
 		p := parseCreditPack(pack)
-		if p.CreditsLimit <= 0 {
-			continue // 无额度的包（如纯权益包）不计入统计
+		if p.CreditsLimit <= 0 && p.CreditsUsed <= 0 {
+			continue // 纯权益包（无额度）不计入
 		}
 		sum.Packs = append(sum.Packs, p)
-		sum.Limit += p.CreditsLimit
-		sum.Total += p.Remaining()
+		packLimit += p.CreditsLimit
+		packTotal += p.Remaining()
 		if p.IsWork() {
 			sum.Work += p.Remaining()
 		} else {
 			sum.General += p.Remaining()
 		}
 	}
+	// usage_summary 缺失时退回逐包求和。
+	if sum.Limit <= 0 {
+		sum.Limit = packLimit
+		sum.Total = packTotal
+		sum.TotalFromSummary = false
+	}
 	return sum, nil
+}
+
+// maxFloat 取较大值（避免为一次比较引入 math）。
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// parseCreditPack 解析单个积分包（字段全部宽容取值）。
+//
+// 字段位置以 L0NE-6 / dsh 的实测结构为准，credits_limit 有**三处**可能：
+//
+//	entitlement_base_info.product_extra.package_extra.quota.credits_limit（会员包）
+//	entitlement_base_info.quota.credits_limit（常规包）
+//	entitlement_base_info.credits_limit（旧形态兜底）
+//
+// 早先只读最后一种，于是所有包都算成 0 额度、整页显示 0。
+func parseCreditPack(pack map[string]any) CreditPack {
+	var p CreditPack
+	base, _ := pack["entitlement_base_info"].(map[string]any)
+	if base == nil {
+		base = pack // 部分形态字段直接在顶层
+	}
+	quota, _ := base["quota"].(map[string]any)
+	if quota == nil {
+		if q, ok := pack["quota"].(map[string]any); ok {
+			quota = q
+		} else {
+			quota = map[string]any{}
+		}
+	}
+	var packageQuota map[string]any
+	if pe, ok := base["product_extra"].(map[string]any); ok {
+		if pkg, ok := pe["package_extra"].(map[string]any); ok {
+			packageQuota, _ = pkg["quota"].(map[string]any)
+		}
+	}
+	p.ProductID = intOf(firstNonNil(base["product_id"], quota["product_id"]))
+	p.CreditsLimit = firstPositive(
+		floatOf(packageQuota["credits_limit"]),
+		floatOf(quota["credits_limit"]),
+		floatOf(base["credits_limit"]),
+	)
+	// usage.credits_amount 的语义是「该包已消耗」，剩余 = limit - used。
+	// 注意它**不是**剩余量（dsh 的 USAGE_API_RESEARCH 记录里"剩余 179.63"
+	// 是 limit-usage 的结果，字段本身是消耗量）。
+	if usage, ok := pack["usage"].(map[string]any); ok {
+		p.CreditsUsed = floatOf(usage["credits_amount"])
+	}
+	p.StartTime = str(base["start_time"])
+	p.EndTime = firstNonEmpty(str(base["end_time"]), str(base["expire_time"]),
+		str(pack["expire_time"]))
+	p.GroupName = firstNonEmpty(str(pack["display_desc"]), str(base["group_name"]))
+	p.NextBillingTime = intOf(base["next_billing_time"])
+	return p
+}
+
+// firstNonNil 返回第一个非 nil 值。
+func firstNonNil(vals ...any) any {
+	for _, v := range vals {
+		if v != nil {
+			return v
+		}
+	}
+	return nil
+}
+
+// firstPositive 返回第一个 > 0 的值（全为 0 时返回 0）。
+func firstPositive(vals ...float64) float64 {
+	for _, v := range vals {
+		if v > 0 {
+			return v
+		}
+	}
+	return 0
 }
 
 // parseCreditPack 解析单个积分包（字段全部宽容取值）。

@@ -313,6 +313,9 @@ func (s *Scheduler) travelDepart(a *auth.Auth, ts *upstream.TravelState) {
 		return
 	}
 	log.Printf("travel %s: depart ok location=%d", logfmt.Label(a.UID, a.NicknameValue()), travelLocationID)
+	// 新行程已派出：通知到站定时器去取这一趟的 arrive_at 并定时唤醒。
+	// 事件驱动模型下这是最主要的唤醒源（没有周期轮询兜底）。
+	s.PokeTravelTimer()
 }
 
 // travelClaim 到站领奖（必须带 record_id）；返回是否领奖成功（成功才值得重查状态）。
