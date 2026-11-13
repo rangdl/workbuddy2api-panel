@@ -27,11 +27,11 @@ func TestExpiringCreditsEnterShortlist(t *testing.T) {
 	// 6 个高余额、从未使用过的号：权重最高（credits 项满 + 闲置项满）。
 	for i := 0; i < 6; i++ {
 		uid := fmt.Sprintf("rich%d", i)
-		p.Add(&auth.Auth{UID: uid})
+		p.Add(WrapAuth(&auth.Auth{UID: uid}))
 		p.SetCredits(uid, 1_000_000, 1_000_000)
 	}
 	// 一个只剩快过期积分的号，先让它「刚被用过」→ 闲置补偿为 0，权重最低。
-	p.Add(&auth.Auth{UID: "expiring"})
+	p.Add(WrapAuth(&auth.Auth{UID: "expiring"}))
 	p.SetCreditsDetailed("expiring", 196, 196, 196, time.Now().Add(6*time.Hour), 196)
 	if a := p.PickByUID("expiring"); a == nil {
 		t.Fatal("PickByUID(expiring)=nil，无法构造「刚被用过」状态")
@@ -39,10 +39,10 @@ func TestExpiringCreditsEnterShortlist(t *testing.T) {
 
 	// 6 个 rich 的权重（11 + 闲置满分）远高于 expiring（≈1×3），无硬键时 expiring
 	// 排第 7、必被截断；有硬键时它是短名单第 1 个，r=0 必然抽中它。
-	if a := p.PickExcludingForRealm(nil, "", ""); a == nil || a.UID != "expiring" {
+	if a := p.PickExcludingForRealm(nil, "", ""); a == nil || a.UID() != "expiring" {
 		got := "<nil>"
 		if a != nil {
-			got = a.UID
+			got = a.UID()
 		}
 		t.Fatalf("选中 %s，want expiring（快过期积分必须进入短名单）", got)
 	}
@@ -59,10 +59,10 @@ func TestExpiringPriorityHonorsSwitch(t *testing.T) {
 
 	for i := 0; i < 6; i++ {
 		uid := fmt.Sprintf("rich%d", i)
-		p.Add(&auth.Auth{UID: uid})
+		p.Add(WrapAuth(&auth.Auth{UID: uid}))
 		p.SetCredits(uid, 1_000_000, 1_000_000)
 	}
-	p.Add(&auth.Auth{UID: "expiring"})
+	p.Add(WrapAuth(&auth.Auth{UID: "expiring"}))
 	p.SetCreditsDetailed("expiring", 196, 196, 196, time.Now().Add(6*time.Hour), 196)
 	if a := p.PickByUID("expiring"); a == nil {
 		t.Fatal("PickByUID(expiring)=nil，无法构造「刚被用过」状态")
@@ -72,7 +72,7 @@ func TestExpiringPriorityHonorsSwitch(t *testing.T) {
 	if a == nil {
 		t.Fatal("选号返回 nil")
 	}
-	if a.UID == "expiring" {
+	if a.UID() == "expiring" {
 		t.Fatal("prefer_expiring=false 时快过期号仍被优先，开关失效")
 	}
 }

@@ -103,7 +103,7 @@ func newSweepPanel(t *testing.T, b *sweepBackend, accounts ...*auth.Auth) *Panel
 	t.Cleanup(srv.Close)
 	p := pool.New("")
 	for _, a := range accounts {
-		p.Add(a)
+		p.Add(pool.WrapAuth(a))
 	}
 	return &Panel{cfg: Config{
 		Pool: p,

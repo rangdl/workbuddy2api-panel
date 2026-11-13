@@ -8,14 +8,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 )
 
 type Pool struct {
-	mu      sync.RWMutex
-	byUID   map[string]*entry
-	stateFp string
-	dirty   atomic.Bool // 内存有变更待落盘
+	mu    sync.RWMutex
+	byUID map[string]*entry
+	// placeholder 占位账号工厂（持久化恢复时构造 entry.acc；nil = 只支持 CodeBuddy）。
+	placeholder func(backend, uid string) gateway.Account
+	stateFp     string
+	dirty       atomic.Bool // 内存有变更待落盘
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
 	// SaveState/LoadState 经它接线，与本地 state.json 并存作启动恢复备份。
 	store StoreSnapshotter
@@ -283,7 +285,7 @@ func (p *Pool) SetMaxInFlightGlobal(n int) {
 // inFlightLimit 报告账号的生效在途上限（global 分档优先，回落 maxInFlight）；
 // 0 = 不限。调用方需已持 p.mu（或快照过 limit，见 Acquire）。
 func (p *Pool) inFlightLimit(e *entry) int {
-	if p.maxInFlightGlobal > 0 && e.a.Realm() == "global" {
+	if p.maxInFlightGlobal > 0 && e.acc.Realm() == "global" {
 		return p.maxInFlightGlobal
 	}
 	return p.maxInFlight
@@ -356,7 +358,7 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
-func (p *Pool) Add(a *auth.Auth) {
+func (p *Pool) Add(a gateway.Account) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.upsertLocked(a)
@@ -364,12 +366,15 @@ func (p *Pool) Add(a *auth.Auth) {
 
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
 // 剔除结果持久化回 state.json，避免已删账号在下次启动时被 load() 复活。
-func (p *Pool) SyncToDir(auths []*auth.Auth) {
+func (p *Pool) SyncToDir(auths []gateway.Account) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	seen := make(map[string]bool, len(auths))
 	for _, a := range auths {
-		seen[a.UID] = true
+		if a == nil {
+			continue
+		}
+		seen[a.UID()] = true
 		p.upsertLocked(a)
 	}
 	changed := false
@@ -387,7 +392,7 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 // Remove 从池中移除账号并立即落盘（管理面板用）。返回被移除账号的凭证
 // （含 FilePath，供调用方删除 auth 文件）；uid 不存在返回 nil。
 // 在途请求的 Release 对已删条目是 no-op，无需等待。
-func (p *Pool) Remove(uid string) *auth.Auth {
+func (p *Pool) Remove(uid string) gateway.Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -397,17 +402,21 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 	delete(p.byUID, uid)
 	p.dirty.Store(true)
 	p.saveLocked()
-	return e.a
+	return e.acc
 }
 
 // upsertLocked 更新或插入单个账号；已存在则只换凭证、保留 credits/cooling 状态。
 // 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
-func (p *Pool) upsertLocked(a *auth.Auth) {
-	if e, ok := p.byUID[a.UID]; ok {
-		e.a = a // 保留 credits/cooling 状态
+func (p *Pool) upsertLocked(a gateway.Account) {
+	if a == nil {
 		return
 	}
-	p.byUID[a.UID] = &entry{a: a}
+	uid := a.UID()
+	if e, ok := p.byUID[uid]; ok {
+		e.acc = a // 保留 credits/cooling 状态
+		return
+	}
+	p.byUID[uid] = &entry{acc: a}
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。

@@ -93,12 +93,12 @@ func TestUpgConcurrentFullRefreshLedgerConsistent(t *testing.T) {
 	p := pool.New(filepath.Join(dir, "data", "state.json"))
 	t.Cleanup(p.Close)
 	for _, uid := range uids {
-		p.Add(&auth.Auth{
+		p.Add(pool.WrapAuth(&auth.Auth{
 			UID:          uid,
 			AccessToken:  "at-" + uid,
 			RefreshToken: "rt-" + uid,
 			ExpiresAt:    time.Now().Add(24 * time.Hour).Unix(),
-		})
+		}))
 		fake.add(uid, 1000)
 	}
 

@@ -111,8 +111,8 @@ func main() {
 		_ = store.Close()
 	}()
 	p.SetStore(store)
-	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
-	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
+	p.RestoreFromSnapshot()            // 择新恢复：Redis 快照比本地新才采用，否则本地优先
+	p.SyncToDir(pool.WrapAuths(auths)) // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
 
 	// 熔断器 + 在途上限（含 global 分档）+ 连败降权 + 闲置补偿调优（从 config 注入，
 	// 非正值回退默认）。
@@ -323,6 +323,8 @@ func main() {
 	traeCfg := loadTraeConfig(*cfgPath, cfg.AuthDir)
 	traeClient := trae.NewClient()
 	traeCool := trae.NewCooldowns()
+	// 运行期计数同样要在 main 构造：面板展示与 handler 记账必须是同一实例。
+	traeStats := trae.NewStats()
 	// 签到调度器：ConfigFn 每次 tick 重新读文件（热重载自然生效）；
 	// 用 trae.Load 而非 loadTraeConfig 是为了避免每分钟重复打启动摘要日志。
 	traeSched := trae.NewScheduler(func() *trae.Config {
@@ -397,6 +399,7 @@ func main() {
 		TraePath:      trae.ConfigPath(*cfgPath),
 		TraeClient:    traeClient,
 		TraeCooldowns: traeCool,
+		TraeStats:     traeStats,
 		TraeScheduler: traeSched,
 		ReloadTrae: func() error {
 			if handlerRef == nil {
@@ -454,6 +457,7 @@ func main() {
 		Trae:          traeCfg,
 		TraeClient:    traeClient,
 		TraeCooldowns: traeCool,
+		TraeStats:     traeStats,
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
 		// Live 为 nil 的裸用/测试路径。
 		ModelsHidden: cfg.Models.Hidden,

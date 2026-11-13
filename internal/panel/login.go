@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 )
 
 const (
@@ -239,7 +241,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "save auth: "+err.Error())
 		return
 	}
-	p.cfg.Pool.Add(a)
+	p.cfg.Pool.Add(pool.WrapAuth(a))
 	p.cfg.Pool.Revive(acct.UID) // 全新登录 = 人工恢复口径：清掉旧号遗留的禁用/冷却/熔断
 
 	// 顺带签到 + 余额刷新（幂等；失败不影响登录结果，只体现在返回字段里）。

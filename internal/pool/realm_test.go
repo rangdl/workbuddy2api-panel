@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 )
 
 // realmPool 构造一个含 cn/global 账号的池，并确保 globalEnabled 开关开启（缺省）。
@@ -16,16 +18,16 @@ func realmPool(t *testing.T) *Pool {
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	p := New("")
 	// CN 账号（显式 cn realm 或空 realm+cn domain 均可）→ Realm()=="cn"
-	p.Add(&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"})
-	p.Add(&auth.Auth{UID: "cn2", Domain: ""}) // 空 domain → cn
+	p.Add(WrapAuth(&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "cn2", Domain: ""})) // 空 domain → cn
 	// global 账号 → Realm()=="global"
-	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
-	p.Add(&auth.Auth{UID: "g2", Domain: "workbuddy.ai"})
+	p.Add(WrapAuth(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "g2", Domain: "workbuddy.ai"}))
 	return p
 }
 
 // realmOf 直接读账号 realm（等价 e.a.Realm()）。
-func realmOf(a *auth.Auth) string { return a.Realm() }
+func realmOf(a gateway.Account) string { return a.Realm() }
 
 func TestAvailableUIDsForRealm(t *testing.T) {
 	p := realmPool(t)
@@ -114,9 +116,9 @@ func TestPickExcludingForRealm(t *testing.T) {
 		if a == nil {
 			t.Fatal("PickExcludingForRealm(cn) returned nil")
 		}
-		seen[a.UID] = true
+		seen[a.UID()] = true
 		if realmOf(a) != "cn" {
-			t.Fatalf("PickExcludingForRealm(cn) returned global account %s", a.UID)
+			t.Fatalf("PickExcludingForRealm(cn) returned global account %s", a.UID())
 		}
 	}
 	// global 同样只从 global 集合。
@@ -126,7 +128,7 @@ func TestPickExcludingForRealm(t *testing.T) {
 			t.Fatal("PickExcludingForRealm(global) returned nil")
 		}
 		if realmOf(a) != "global" {
-			t.Fatalf("PickExcludingForRealm(global) returned cn account %s", a.UID)
+			t.Fatalf("PickExcludingForRealm(global) returned cn account %s", a.UID())
 		}
 	}
 	// realm=="" → 退化现状：所有 healthy 都能选。
@@ -145,10 +147,10 @@ func TestPickExcludingForRealmTried(t *testing.T) {
 	if a == nil {
 		t.Fatal("tried cn1 → nil")
 	}
-	if a.UID == "cn1" {
-		t.Fatalf("tried cn1 still picked: %s", a.UID)
+	if a.UID() == "cn1" {
+		t.Fatalf("tried cn1 still picked: %s", a.UID())
 	}
 	if realmOf(a) != "cn" {
-		t.Fatalf("picked non-cn %s", a.UID)
+		t.Fatalf("picked non-cn %s", a.UID())
 	}
 }

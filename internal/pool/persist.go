@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 )
 
 var flushInterval = 5 * time.Second
@@ -134,7 +134,13 @@ func (p *Pool) load() {
 // 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
 func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 	now := time.Now()
-	for uid, s := range accounts {
+	for key, s := range accounts {
+		// 键形态：单 backend 时代是裸 uid；合池后是 "backend:uid"。
+		// 无冒号 → 视为 CodeBuddy（旧 state.json 全部属于它，向后兼容）。
+		backend, uid := gateway.SplitQualifiedUID(key)
+		if backend == "" {
+			backend = BackendCodeBuddy
+		}
 		// err_total 优先；旧文件的 err_count（连续错误）作一次性迁移源映射进来（二者取较大者，
 		// 尽最大可能保留历史观测信号——旧语义下 err_count 也真实发生过错误，不应丢）。
 		errTotal := s.ErrTotal
@@ -142,7 +148,8 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			errTotal = int64(s.ErrCount)
 		}
 		e := &entry{
-			a:                        &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			// placeholder：只为承载 credits/冷却等状态，SyncToDir/Add 时
+			// 会被真实账号替换（upsertLocked 保留状态、只换 acc）。
 			credits:                  s.Credits,
 			creditsTotal:             s.CreditsTotal,
 			creditsExpiring:          s.CreditsExpiring,
@@ -163,6 +170,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			sessionDeadFails:         s.SessionDeadFails,
 			consecutiveFails:         s.ConsecutiveFails,
 		}
+		e.acc = p.placeholderAccount(backend, uid)
 		// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
 		if e.creditsExpiring < 0 {
 			e.creditsExpiring = 0
@@ -292,6 +300,12 @@ func (p *Pool) stateOverviewLocked() stateFile {
 	now := time.Now()
 	sf := stateFile{Accounts: map[string]stateAccount{}, Scheduling: p.scheduling}
 	for uid, e := range p.byUID {
+		// 落盘键带 backend 前缀（"codebuddy:xxx"），避免两个上游的 uid 撞车
+		// 导致状态互相覆盖。单 backend 时仍是裸 uid，旧文件读得回来。
+		key := uid
+		if e.acc != nil && e.acc.Backend() != "" && e.acc.Backend() != BackendCodeBuddy {
+			key = gateway.QualifiedUID(e.acc)
+		}
 		s := stateAccount{
 			Credits:                  e.credits,
 			CreditsTotal:             e.creditsTotal,
@@ -349,7 +363,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 				s.ModelCosts[m] = stateModelCost{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
 			}
 		}
-		sf.Accounts[uid] = s
+		sf.Accounts[key] = s
 	}
 	return sf
 }

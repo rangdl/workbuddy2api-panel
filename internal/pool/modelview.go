@@ -70,7 +70,7 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 	routable := make(map[string]int) // realm → 参与选号的账号数
 
 	for _, e := range p.byUID {
-		realm := e.a.Realm()
+		realm := e.acc.Realm()
 		if e.disabled || e.paused {
 			continue
 		}
@@ -113,7 +113,7 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 			Reason:        a.reason,
 		}
 		for _, e := range p.byUID {
-			if e.a.Realm() != realm {
+			if e.acc.Realm() != realm {
 				continue
 			}
 			if e.healthyForModel(now, model) && !p.inFlightFull(e) {

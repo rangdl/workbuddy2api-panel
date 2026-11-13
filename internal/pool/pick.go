@@ -8,41 +8,41 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
 // Pick 单一选号入口（无请求级轮换、无 realm 过滤，模型感知缺省账号级）。
 // 需要请求级轮换（tried）或分池（realm）时用 PickExcludingForRealm。
-func (p *Pool) Pick() *auth.Auth {
+func (p *Pool) Pick() gateway.Account {
 	return p.pick(nil, "", "")
 }
 
 // PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
 // 挑选策略：healthy 账号中按权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
 // 意图是打散热点，避免永远打同一个账号。
-func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
+func (p *Pool) PickExcluding(tried map[string]bool) gateway.Account {
 	return p.pick(tried, "", "")
 }
 
 // PickExcludingForModel 模型感知选号：等同 PickExcluding，但对「6004 模型级冷却中的
 // 账号」进行模型豁免——请求模型与其 trigger 模型不同时视为可用（issue #31）。
 // reqModel 为空时即普通 PickExcluding（不影响既有调用语义）。
-func (p *Pool) PickExcludingForModel(tried map[string]bool, reqModel string) *auth.Auth {
+func (p *Pool) PickExcludingForModel(tried map[string]bool, reqModel string) gateway.Account {
 	return p.pick(tried, reqModel, "")
 }
 
 // PickExcludingForRealm 模型感知 + 分池选号：候选集先按 Realm()==realm 过滤
 // （realm 空 = 不过滤，退化为 PickExcludingForModel），再按模型健康口径判定。
 // 供 handler 在 global/cn 双域下分流（global 模型请求只路由 global 账号）。
-func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm string) *auth.Auth {
+func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm string) gateway.Account {
 	return p.pick(tried, reqModel, realm)
 }
 
 // pick 在 healthy 候选集中按权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）。
-func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+func (p *Pool) pick(tried map[string]bool, reqModel, realm string) gateway.Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -167,9 +167,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		p.pickSeq++
 		e.usedSeq = p.pickSeq
 		if explored {
-			log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s", reqModel, realm, logfmt.Label(e.a.UID, e.a.NicknameValue()), p.costExploreInterval)
+			log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s", reqModel, realm, logfmt.Label(e.acc.UID(), e.acc.Nickname()), p.costExploreInterval)
 		}
-		return e.a
+		return e.acc
 	}
 	// 等权重洗牌：仅当存在权重相等且候选数超过 top5 时，才对 ws 做 Fisher-Yates
 	// 洗牌（且**不消耗 p.randInt64N 注入源**，避免改变 pickWeighted 的确定性语义，
@@ -209,7 +209,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if ws[i].w != ws[j].w {
 			return ws[i].w > ws[j].w
 		}
-		return ws[i].e.a.UID < ws[j].e.a.UID // 稳定兜底（洗牌后此项几乎不触发）
+		return ws[i].e.acc.UID() < ws[j].e.acc.UID() // 稳定兜底（洗牌后此项几乎不触发）
 	})
 	cands = cands[:0]
 	for _, c := range ws {
@@ -251,12 +251,12 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		// 毕业结果由相邻的既有日志闭环（免费号无日志、收费号走 NoteModelCost
 		// 常规路径）。
 		log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s",
-			reqModel, realm, logfmt.Label(e.a.UID, e.a.NicknameValue()), p.costExploreInterval)
+			reqModel, realm, logfmt.Label(e.acc.UID(), e.acc.Nickname()), p.costExploreInterval)
 	}
 	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
 	p.pickSeq++
 	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
-	return e.a
+	return e.acc
 }
 
 // floorBlockedForModel 积分保底拦截判定（pick 普通轮换与 PickByUIDForModel 粘性
@@ -320,7 +320,7 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 // 这里，若兜底不看保底，触底号会被「捞回来」继续接收费模型——表现为同一条
 // floor WARN 反复刷同一个号（实测：credits=1 < floor=150 仍持续中选）。
 // 兜底是**最后一道**选号路径，保底在它之前挡不住就等于没挡。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, model string) *auth.Auth {
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, model string) gateway.Account {
 	var best *entry
 	// 兜底口径的差异全部收在 gateSpec.allowCooling（软冷却/熔断号可参与试探，
 	// 禁用/暂停与有效 CoolHard 仍排除）——不需要也不允许在本处另写一份条件表。
@@ -340,7 +340,7 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	if best == nil {
 		return nil
 	}
-	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s", logfmt.Label(best.a.UID, best.a.NicknameValue()), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
+	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s", logfmt.Label(best.acc.UID(), best.acc.Nickname()), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = time.Now()
 	// 兜底同样是「选中」，必须与 pick() 正常路径、粘性命中路径（PickByUIDForModel）
 	// 一样推进 usedSeq/pickSeq：否则被兜底反复选中的账号 usedSeq 恒为 0，在 pick 的
@@ -348,7 +348,7 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	// 防集中/防惊群失效（entry.usedSeq 契约：每次被选中时取 p.pickSeq 自增值）。
 	p.pickSeq++
 	best.usedSeq = p.pickSeq
-	return best.a
+	return best.acc
 }
 
 // inFlightFull 报告账号是否已占满在途名额（上限按 realm 分档，见 inFlightLimit；

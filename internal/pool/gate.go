@@ -59,10 +59,10 @@ type gateSpec struct {
 // 条件顺序有意为之：先便宜的过滤（tried/域），再健康口径，最后成本与租约
 // （后两者各含一次表查询 / 原子读）。
 func (p *Pool) gateLocked(e *entry, s gateSpec) exclusion {
-	if s.tried != nil && s.tried[e.a.UID] {
+	if s.tried != nil && s.tried[e.acc.UID()] {
 		return excludeTried
 	}
-	if s.realm != "" && e.a.Realm() != s.realm {
+	if s.realm != "" && e.acc.Realm() != s.realm {
 		return excludeRealm
 	}
 	if s.allowCooling {

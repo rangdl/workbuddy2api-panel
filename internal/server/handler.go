@@ -29,6 +29,8 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 )
 
 // Config handler 依赖。
@@ -97,6 +99,9 @@ type Config struct {
 	// TraeCooldowns Trae 账号冷却表（可选；nil 时 handler 自建）。
 	// 由外部注入的原因：面板需要读同一实例才能展示冷却状态。
 	TraeCooldowns *trae.Cooldowns
+	// TraeStats Trae 账号运行期计数（可选；nil 时 handler 自建）。
+	// 与 TraeCooldowns 同理：面板要读同一实例才能展示成功/失败/在途/用量。
+	TraeStats *trae.Stats
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
 
@@ -162,6 +167,9 @@ type Handler struct {
 	traeCfg atomic.Pointer[trae.Config]
 	// traeCool Trae 账号级冷却表（进程内，重启清零）。nil 时不做冷却判定。
 	traeCool *trae.Cooldowns
+	// traeStats Trae 账号运行期计数（成功/失败/在途/用量，进程内）。
+	// 与 pool 分账：Trae 账号不进 CodeBuddy 账号池，但面板要按同口径展示。
+	traeStats *trae.Stats
 }
 
 // NewHandler 构建 handler。
@@ -183,6 +191,11 @@ func NewHandler(cfg Config) *Handler {
 	h.traeCool = cfg.TraeCooldowns
 	if h.traeCool == nil {
 		h.traeCool = trae.NewCooldowns()
+	}
+	// 运行期计数同理：面板要展示成功/失败/在途/用量，必须共用同一实例。
+	h.traeStats = cfg.TraeStats
+	if h.traeStats == nil {
+		h.traeStats = trae.NewStats()
 	}
 	h.responsesCfg.Store(cfg.Responses)
 	h.anthropicCfg.Store(cfg.Anthropic)
@@ -611,7 +624,12 @@ func (h *Handler) modelList() []map[string]any {
 // FetchGlobalModels 共享缓存，不会触发第二次上游探测）。
 // GlobalEnabled=false 时 modelList 已不进入本分支（逃生门在调用方 gate）。
 func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
-	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "global")
+	acc := h.cfg.Pool.PickExcludingForRealm(nil, "", "global")
+	if acc == nil {
+		return nil, nil
+	}
+	// 全球模型探测是 CodeBuddy 专有能力。
+	acct := pool.UnwrapAuth(acc)
 	if acct == nil {
 		return nil, nil
 	}
@@ -940,19 +958,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
-		var acct *auth.Auth
+		var acc gateway.Account
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
+			acc = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
 			// 跨域回退开启且请求为裸名时，粘性号可以落在任一域（回退成功后绑定的是另一域
 			// 的账号，下一轮不该被 realm 校验立刻解绑）。
-			if acct == nil || (realm != "" && acct.Realm() != realm && !crossRealm) {
+			if acc == nil || (realm != "" && acc.Realm() != realm && !crossRealm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
 				// 本次回落普通轮换。
 				unbindSticky()
-				acct = nil
+				acc = nil
 			}
 		}
-		if acct == nil {
+		if acc == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
 			pickRealm := realm
@@ -963,14 +981,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 避免拿全冷却兜底捞回来的旧域账号白撞一次上游。
 				pickRealm = otherRealm(realm)
 			}
-			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, pickRealm)
-			if acct == nil && crossRealm {
+			acc = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, pickRealm)
+			if acc == nil && crossRealm {
 				// 该域选不到（并发抢名额/轮换耗尽/另一域刚冷却完）→ 另一域再试一次，
 				// 保持尽力而为语义；tried 已记录失败号，轮转仍由 MaxRotate 封顶。
-				acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, otherRealm(pickRealm))
+				acc = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, otherRealm(pickRealm))
 			}
 		}
-		if acct == nil {
+		if acc == nil {
 			st.status = http.StatusServiceUnavailable
 			// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
 			//   (a) 池子真的没有可用号（账号级冷却/在途占满/积分保底）；
@@ -980,10 +998,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			modelBlock = h.cfg.Pool.ModelBlockedForRealm(bareModel, realm)
 			break
 		}
-		st.uid = acct.UID
+		st.uid = acc.UID()
 		// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
-		st.nick = acct.NicknameValue()
-		if crossRealm && h.cfg.Upstream != nil && acct.Realm() != realm {
+		st.nick = acc.Nickname()
+		// 本链路（/v1/*）是 CodeBuddy 专用：非该上游的账号不参与，
+		// 记录已试后跳过换下一个。
+		acct := pool.UnwrapAuth(acc)
+		if acct == nil {
+			tried[acc.UID()] = true
+			continue
+		}
+		if crossRealm && h.cfg.Upstream != nil && acc.Realm() != realm {
 			// 跨域回退命中：按实际服务域取积分倍率，用量/账本记的是真实域口径，
 			// 而不是请求前缀声明的域。
 			modelRate = h.cfg.Upstream.ModelRate(acct.Realm(), bareModel)

@@ -15,7 +15,7 @@ import (
 func benchPool(b *testing.B) *Pool {
 	p := New("")
 	for i := 0; i < 46; i++ {
-		p.Add(&auth.Auth{UID: fmt.Sprintf("u%02d", i)})
+		p.Add(WrapAuth(&auth.Auth{UID: fmt.Sprintf("u%02d", i)}))
 		p.SetCredits(fmt.Sprintf("u%02d", i), int64(1000-i*13%900), 0)
 	}
 	return p

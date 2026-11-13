@@ -36,7 +36,7 @@ func coolingDomain(t *testing.T, p *Pool, uid string) (until time.Time, coolKind
 // 与残留 modelCooldowns 的杂交态。
 func TestTransitionDisableClearsCoolingDomain(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Cooldown("u1", CoolSoft, 600*time.Second, "429")                                          // until + coolKind=soft + softStreak=1
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004") // modelCooldowns=1（softStreak 增到 2）
 
@@ -77,7 +77,7 @@ func TestTransitionDisableClearsCoolingDomain(t *testing.T) {
 // 熔断观测仍有效，不应被禁用覆盖。
 func TestTransitionDisablePreservesBreaker(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetBreaker(1, time.Hour, time.Hour)
 	p.NoteError("u1") // 触发熔断（fails=0, retryCount=1, breakerUntil=1h）
 
@@ -105,7 +105,7 @@ func TestTransitionDisablePreservesBreaker(t *testing.T) {
 // 的杂交态（此前 handler 走 Disable、阈值路径却残留冷却，同一信号不同处置）。
 func TestTransitionSessionDeadDisableClearsCooling(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit") // 软冷却中
 	until, _, _, _, _ := coolingDomain(t, p, "u1")
 	if until.IsZero() {
@@ -135,7 +135,7 @@ func TestTransitionSessionDeadDisableClearsCooling(t *testing.T) {
 // 字段集，锁定迁移原语对冷却域/熔断域的处置永远一致。
 func TestTransitionReviveKeepsSoftCoolingKeepsBreaker(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	// 冷却域：软冷却 + 6004 模型级冷却（softStreak 累计）。
 	p.Cooldown("u1", CoolSoft, 600*time.Second, "429")
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
@@ -170,7 +170,7 @@ func TestTransitionReviveKeepsSoftCoolingKeepsBreaker(t *testing.T) {
 // ReenableIfCredits 的解冻对象：余额恢复（remain>0）正是它的权威恢复证据。
 func TestTransitionReviveUnfreezesHardCooling(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.CooldownUntilTomorrow4AM("u1", "余额不足")
 	p.ReenableIfCredits("u1", 700, 0)
 	until, kind, reason, _, _ := coolingDomain(t, p, "u1")

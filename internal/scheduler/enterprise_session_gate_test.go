@@ -30,7 +30,7 @@ func personalWithSwitchClaimScheduler(t *testing.T) (*Scheduler, *recorderUpstre
 		EnterpriseID: "", // 关键：个人号
 	}
 	p := pool.New("")
-	p.Add(a)
+	p.Add(pool.WrapAuth(a))
 
 	up := &upstream.Client{
 		HTTP:          srv.Client(),
@@ -56,7 +56,7 @@ func enterpriseAccountScheduler(t *testing.T) (*Scheduler, *recorderUpstream) {
 		EnterpriseID: "e1", // 真企业版
 	}
 	p := pool.New("")
-	p.Add(a)
+	p.Add(pool.WrapAuth(a))
 
 	up := &upstream.Client{
 		HTTP:          srv.Client(),

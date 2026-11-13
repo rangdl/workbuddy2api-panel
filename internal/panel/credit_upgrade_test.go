@@ -223,7 +223,7 @@ func upgNewEnv(t *testing.T, seeds ...upgSeed) *upgEnv {
 	if err != nil {
 		t.Fatalf("LoadDir: %v", err)
 	}
-	e.pool.SyncToDir(auths)
+	e.pool.SyncToDir(pool.WrapAuths(auths))
 	e.up = &upstream.Client{HTTP: fake.srv.Client(), ChatBaseCN: fake.srv.URL, BillingBaseCN: fake.srv.URL}
 	e.ledger = credithist.New(e.ledgerPath, 2000)
 	e.up.SetCreditObserver(e.ledger.Observe)
@@ -260,7 +260,7 @@ func (e *upgEnv) addAccount(uid, nickname string) {
 	}
 	a.FilePath = path
 	e.fake.register(uid, 0)
-	e.pool.Add(a)
+	e.pool.Add(pool.WrapAuth(a))
 }
 
 // balance 走面板单号余额刷新接口，触发一次真实上游余额查询（观察者由此留痕）。
@@ -607,7 +607,7 @@ func TestUpgRestartContinuesBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadDir: %v", err)
 	}
-	p2.SyncToDir(auths)
+	p2.SyncToDir(pool.WrapAuths(auths))
 	st, ok := p2.Status("u1")
 	if !ok || st.Credits != 150 {
 		t.Fatalf("重启后余额快照应保留 150，得到 ok=%v %+v", ok, st)

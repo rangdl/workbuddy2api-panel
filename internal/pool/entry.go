@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 )
 
 // degradeReason 连败降权（issue #114）写 reason 的固定文案：与冷却域的
@@ -192,7 +192,12 @@ type modelCostEntry struct {
 	Samples   int
 }
 type entry struct {
-	a            *auth.Auth
+	// acc 账号身份（由 gateway.Account 抽象，pool 不感知具体上游）。
+	//
+	// 这里曾经是 *auth.Auth——换成接口后，pool 的调度状态机（权重、冷却、
+	// 熔断、降权、模型避让、在途租约）与上游协议彻底解耦，Trae 账号也能进池。
+	// pool 从不需要凭证，所以接口里只有身份字段。
+	acc          gateway.Account
 	credits      int64
 	creditsTotal int64 // 积分总额度（UserResource 聚合；0 = 未知）
 	// creditsExpiring 配置窗口内即将过期的可用积分子集，是 credits 的一部分。

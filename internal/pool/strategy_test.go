@@ -16,10 +16,10 @@ func orderedPool(t *testing.T, strategy string) *Pool {
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	p := New("")
 	for _, uid := range []string{"a", "b", "c", "d", "e", "f", "g"} {
-		p.Add(&auth.Auth{UID: uid})
+		p.Add(WrapAuth(&auth.Auth{UID: uid}))
 	}
 	for _, uid := range []string{"x", "y"} {
-		p.Add(&auth.Auth{UID: uid, Domain: "workbuddy.ai"})
+		p.Add(WrapAuth(&auth.Auth{UID: uid, Domain: "workbuddy.ai"}))
 	}
 	if err := p.SetScheduling(RegionStrategies{strategy, strategy}, RegionAccountOrder{}); err != nil {
 		t.Fatal(err)
@@ -36,8 +36,8 @@ func wantPick(t *testing.T, p *Pool, tried map[string]bool, model, realm, uid st
 		}
 		return
 	}
-	if a.UID != uid {
-		t.Fatalf("pick %s; want %s", a.UID, uid)
+	if a.UID() != uid {
+		t.Fatalf("pick %s; want %s", a.UID(), uid)
 	}
 }
 func TestRoundRobinAllAccountsAndIndependentCursors(t *testing.T) {
@@ -127,7 +127,7 @@ func TestOrderedCustomOrderHotUpdateAndMembership(t *testing.T) {
 	}
 	p.Remove("c")
 	wantPick(t, p, nil, "m", "cn", "a")
-	p.Add(&auth.Auth{UID: "h"})
+	p.Add(WrapAuth(&auth.Auth{UID: "h"}))
 	p.SetScheduling(RegionStrategies{SequentialExhaust, RoundRobin}, RegionAccountOrder{})
 	wantPick(t, p, nil, "m", "cn", "a")
 	wantPick(t, p, nil, "m", "cn", "a")
@@ -142,7 +142,7 @@ func TestOrderedPersistenceLocalAndSnapshot(t *testing.T) {
 			fp := filepath.Join(t.TempDir(), "state.json")
 			p := New(fp)
 			accounts := []*auth.Auth{{UID: "a"}, {UID: "b"}, {UID: "x", Domain: "workbuddy.ai"}, {UID: "y", Domain: "workbuddy.ai"}}
-			p.SyncToDir(accounts)
+			p.SyncToDir(WrapAuths(accounts))
 			s := RegionStrategies{strategy, strategy}
 			p.SetScheduling(s, RegionAccountOrder{})
 			wantPick(t, p, nil, "m", "cn", "a")
@@ -151,7 +151,7 @@ func TestOrderedPersistenceLocalAndSnapshot(t *testing.T) {
 			p.Close()
 			q := New(fp)
 			defer q.Close()
-			q.SyncToDir(accounts)
+			q.SyncToDir(WrapAuths(accounts))
 			q.SetScheduling(s, RegionAccountOrder{})
 			want := "a"
 			gwant := "x"
@@ -175,7 +175,7 @@ func TestOrderedPersistenceLocalAndSnapshot(t *testing.T) {
 			}
 			r := New("")
 			r.adoptSnapshot(snap)
-			r.SyncToDir(accounts)
+			r.SyncToDir(WrapAuths(accounts))
 			r.SetScheduling(s, RegionAccountOrder{})
 			wantPick(t, r, nil, "m", "cn", want)
 		})
@@ -188,7 +188,7 @@ func TestRoundRobinConcurrentFairnessAndLeases(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); a := p.PickExcludingForRealm(nil, "m", "cn"); got <- a.UID }()
+		go func() { defer wg.Done(); a := p.PickExcludingForRealm(nil, "m", "cn"); got <- a.UID() }()
 	}
 	wg.Wait()
 	close(got)

@@ -33,21 +33,31 @@ func (p *Pool) SetNickname(uid, nickname string) bool {
 	if !ok {
 		return false
 	}
-	a := e.a
-	a.Lock()
-	changed := a.Nickname != nickname
-	if changed {
-		a.Nickname = nickname
-	}
-	a.Unlock()
-	if !changed {
+	// 昵称写回由账号自身负责：pool 只认 gateway.Account 接口，不知道凭证
+	// 存在哪个文件、用什么格式。实现了 Nicknamer 的账号才会真的落盘。
+	n, ok := e.acc.(Nicknamer)
+	if !ok {
 		return false
 	}
-	if err := a.SaveAtomic(); err != nil {
+	if n.NicknameValue() == nickname {
+		return false
+	}
+	if err := n.SetNickname(nickname); err != nil {
 		log.Printf("WARN: [pool] nickname save %s: %v", uid, err)
 		return false
 	}
 	return true
+}
+
+// Nicknamer 可选能力：账号能持久化自己的昵称（回写凭证文件）。
+//
+// 做成可选接口而不是塞进 gateway.Account 的原因：昵称回写是**凭证文件**
+// 的操作，不是调度需要的能力。Trae 的账号文件结构完全不同，但同样可以
+// 实现它——不需要的 backend 不实现即可。
+type Nicknamer interface {
+	NicknameValue() string
+	// SetNickname 更新昵称并落盘。
+	SetNickname(name string) error
 }
 
 // NoteCheckinDone 标记账号今日已签到（签到成功与上游"今天已签到"幂等拒绝均算）。
@@ -403,7 +413,7 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 
 	var st ModelBlockStatus
 	for _, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
+		if realm != "" && e.acc.Realm() != realm {
 			continue
 		}
 		// 暂停选号（paused）号与禁用号同口径跳过：它此刻不可选，「能服务」的

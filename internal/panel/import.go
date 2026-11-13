@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 )
 
 // cockpitAccount 映射 cockpit tools 导出格式的单个账号。
@@ -127,7 +128,7 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		p.cfg.Pool.Add(a)
+		p.cfg.Pool.Add(pool.WrapAuth(a))
 		p.cfg.Pool.Revive(uid)
 
 		// 顺带签到/激活（幂等；失败仅记日志，不阻断导入）。

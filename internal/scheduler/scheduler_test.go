@@ -148,7 +148,7 @@ func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	up := &upstream.Client{
 		HTTP:          srv.Client(),
 		ChatBaseCN:    srv.URL,
@@ -246,7 +246,7 @@ func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
 
 	p := pool.New("")
 	a := &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}
-	p.Add(a)
+	p.Add(pool.WrapAuth(a))
 	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足")
 
 	up := &upstream.Client{
@@ -280,7 +280,7 @@ func TestRunKeepaliveRefreshesTokens(t *testing.T) {
 
 	p := pool.New("")
 	a := &auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1}
-	p.Add(a)
+	p.Add(pool.WrapAuth(a))
 
 	up := &upstream.Client{
 		HTTP:          srv.Client(),
@@ -306,7 +306,7 @@ func TestRunKeepaliveSessionDeadDisables(t *testing.T) {
 
 	p := pool.New("")
 	a := &auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1}
-	p.Add(a)
+	p.Add(pool.WrapAuth(a))
 
 	up := &upstream.Client{
 		HTTP:          srv.Client(),
@@ -350,7 +350,7 @@ func TestRunKeepaliveSessionDeadResetBySuccess(t *testing.T) {
 
 	p := pool.New("")
 	a := &auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1}
-	p.Add(a)
+	p.Add(pool.WrapAuth(a))
 
 	up := &upstream.Client{
 		HTTP:          srv.Client(),
@@ -384,7 +384,7 @@ func TestCheckinErrorDoesNotCrash(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	up := &upstream.Client{
 		HTTP:          srv.Client(),
 		ChatBaseCN:    srv.URL,
@@ -405,8 +405,8 @@ func TestRunBalanceRefreshNowUpdatesCreditsAndRevives(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
-	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足")
 	p.Disable("u2", "manual")
 
@@ -457,7 +457,7 @@ func TestRunBalanceRefreshReplacesExpirySnapshot(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	p.SetCreditsDetailed("u1", 999, 999, 999, time.Now().Add(time.Hour), 999)
 
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
@@ -479,7 +479,7 @@ func TestRunBalanceRefreshReplacesExpirySnapshot(t *testing.T) {
 
 func TestSetExpiringSoonWindowClearsSnapshot(t *testing.T) {
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetCreditsDetailed("u1", 100, 100, 50, time.Now().Add(time.Hour), 50)
 	s := New(Config{Pool: p, ExpiringSoonWindow: 7 * 24 * time.Hour})
 
@@ -500,8 +500,8 @@ func TestSetExpiringSoonWindowClearsSnapshot(t *testing.T) {
 // poolWithDisabledAccount 建一个两账号池：u1 可用、u2 被人工禁用（终态）。
 func poolWithDisabledAccount() *pool.Pool {
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
-	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	p.Disable("u2", "manual disable (test)")
 	return p
 }
@@ -545,7 +545,7 @@ func TestRunCheckinIncludesDisabledWhenConfigured(t *testing.T) {
 		t.Errorf("禁用号签到后不应被自动解冻: %+v", st)
 	}
 	// 选号侧不受本开关影响：禁用号依旧不可选。
-	if got := p.Pick(); got == nil || got.UID != "u1" {
+	if got := p.Pick(); got == nil || got.UID() != "u1" {
 		t.Errorf("选号应仍只给 u1, got %+v", got)
 	}
 }
@@ -620,8 +620,8 @@ func TestPausedAccountStillRunsKeepaliveTasks(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
-	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	if !p.Pause("u2") {
 		t.Fatal("Pause 失败")
 	}
@@ -645,7 +645,7 @@ func TestPausedAccountStillRunsKeepaliveTasks(t *testing.T) {
 		t.Errorf("保号任务后暂停状态应保持: %+v", st)
 	}
 	// 选号侧始终排除暂停号
-	if got := p.Pick(); got == nil || got.UID != "u1" {
+	if got := p.Pick(); got == nil || got.UID() != "u1" {
 		t.Errorf("选号应只给 u1, got %+v", got)
 	}
 }
@@ -658,9 +658,9 @@ func TestPausedVsDisabledTaskParticipation(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
-	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
-	p.Add(&auth.Auth{UID: "u3", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "u3", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	p.Pause("u2")
 	p.Disable("u3", "manual disable (test)")
 
@@ -684,8 +684,8 @@ func TestPausedStillTravels(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
-	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	p.Pause("u2")
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	s := New(Config{Pool: p, Upstream: up})

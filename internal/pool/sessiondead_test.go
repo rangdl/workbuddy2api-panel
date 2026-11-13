@@ -10,7 +10,7 @@ import (
 // TestNoteSessionDeadThresholdNotReached 前 2 次连续 12153 不 Disable（误判防护）。
 func TestNoteSessionDeadThresholdNotReached(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	if p.NoteSessionDead("u1") {
 		t.Fatal("第 1 次 12153 不应禁用")
 	}
@@ -25,7 +25,7 @@ func TestNoteSessionDeadThresholdNotReached(t *testing.T) {
 		t.Fatalf("连续 2 次 12153 不应禁用: %+v", st)
 	}
 	// 未达阈值时账号仍可选（keepalive 失败不污染选号）。
-	if got := p.Pick(); got == nil || got.UID != "u1" {
+	if got := p.Pick(); got == nil || got.UID() != "u1" {
 		t.Fatalf("账号应保持可选, got %+v", got)
 	}
 }
@@ -33,7 +33,7 @@ func TestNoteSessionDeadThresholdNotReached(t *testing.T) {
 // TestNoteSessionDeadDisablesAtThird 连续第 3 次 12153 → 禁用并清计数。
 func TestNoteSessionDeadDisablesAtThird(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.NoteSessionDead("u1")
 	p.NoteSessionDead("u1")
 	if !p.NoteSessionDead("u1") {
@@ -55,7 +55,7 @@ func TestNoteSessionDeadDisablesAtThird(t *testing.T) {
 // TestClearSessionDeadResetsCount 中间成功（refresh 成功）清计数，后续从 1 重新计。
 func TestClearSessionDeadResetsCount(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.NoteSessionDead("u1")
 	p.NoteSessionDead("u1")
 	p.ClearSessionDead("u1") // 模拟 refresh 成功：清计数
@@ -74,7 +74,7 @@ func TestClearSessionDeadResetsCount(t *testing.T) {
 // 同样清计数——与 refresh 成功口径一致。
 func TestNoteSuccessClearsSessionDeadCount(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.NoteSessionDead("u1")
 	p.NoteSessionDead("u1")
 	p.NoteSuccess("u1")
@@ -86,7 +86,7 @@ func TestNoteSuccessClearsSessionDeadCount(t *testing.T) {
 // TestReviveDisabled 复活入口：清 disabled + reason + 误判计数，账号回到池子。
 func TestReviveDisabled(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.NoteSessionDead("u1")
 	p.NoteSessionDead("u1")
 	p.NoteSessionDead("u1") // 触发禁用
@@ -104,7 +104,7 @@ func TestReviveDisabled(t *testing.T) {
 	if st.Reason != "" {
 		t.Errorf("reason=%q want 空（revive 清 reason）", st.Reason)
 	}
-	if got := p.Pick(); got == nil || got.UID != "u1" {
+	if got := p.Pick(); got == nil || got.UID() != "u1" {
 		t.Fatalf("复活后账号应回到池子, got %+v", got)
 	}
 	// 误判计数一并清零：复活后重新计满 3 次才禁用。
@@ -122,13 +122,13 @@ func TestReviveDisabledPersists(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Disable("u1", "12153 session dead")
 	p.ReviveDisabled("u1")
 	p.Flush()
 
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	st, ok := p2.Status("u1")
 	if !ok || st.Disabled || st.Reason != "" {
 		t.Fatalf("revive 应持久化（disabled=%v reason=%q）ok=%v", st.Disabled, st.Reason, ok)
@@ -138,7 +138,7 @@ func TestReviveDisabledPersists(t *testing.T) {
 // TestStatusDisabledReasonDisabled when disabled, Status 透出 disabled_reason。
 func TestStatusDisabledReasonDisabled(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Disable("u1", "12153 session dead")
 	st, _ := p.Status("u1")
 	if !st.Disabled || st.DisabledReason != "12153 session dead" {
@@ -149,7 +149,7 @@ func TestStatusDisabledReasonDisabled(t *testing.T) {
 // TestStatusDisabledReasonClearedByRevive 复活后 disabled_reason 归空。
 func TestStatusDisabledReasonClearedByRevive(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Disable("u1", "12153 session dead")
 	p.ReviveDisabled("u1")
 	st, _ := p.Status("u1")

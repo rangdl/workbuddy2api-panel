@@ -14,8 +14,8 @@ import (
 
 func TestNoteCheckinDoneMarksToday(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	if st, _ := p.Status("u1"); st.CheckinDone {
 		t.Fatal("未签到账号不应显示已签")
 	}
@@ -35,7 +35,7 @@ func TestCheckinDonePersists(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.NoteCheckinDone("u1")
 	p.Flush()
 	raw, err := os.ReadFile(fp)
@@ -46,7 +46,7 @@ func TestCheckinDonePersists(t *testing.T) {
 		t.Fatalf("state.json 缺少 last_checkin_day:\n%s", raw)
 	}
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	if st, _ := p2.Status("u1"); !st.CheckinDone {
 		t.Fatal("重启后当日已签状态丢失")
 	}
@@ -56,7 +56,7 @@ func TestCheckinDoneExpiredYesterday(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.NoteCheckinDone("u1")
 	p.Flush()
 	raw, err := os.ReadFile(fp)
@@ -69,7 +69,7 @@ func TestCheckinDoneExpiredYesterday(t *testing.T) {
 		t.Fatal(err)
 	}
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	if st, _ := p2.Status("u1"); st.CheckinDone {
 		t.Fatal("昨日签到记录不应显示为今日已签")
 	}
@@ -82,7 +82,7 @@ func TestSetNicknamePersists(t *testing.T) {
 	fp := filepath.Join(dir, "workbuddy-u1.json")
 	a := &auth.Auth{UID: "u1", Nickname: "旧名字", AccessToken: "at", FilePath: fp}
 	p := New("")
-	p.Add(a)
+	p.Add(WrapAuth(a))
 	if !p.SetNickname("u1", "新名字") {
 		t.Fatal("昵称变化应返回 true")
 	}

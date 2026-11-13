@@ -76,7 +76,7 @@ func enterpriseTestScheduler(t *testing.T, enterprise bool) (*Scheduler, *record
 		a.EnterpriseID = "ent-1"
 	}
 	p := pool.New("")
-	p.Add(a)
+	p.Add(pool.WrapAuth(a))
 
 	up := &upstream.Client{
 		HTTP:          srv.Client(),

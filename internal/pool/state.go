@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
@@ -366,13 +367,19 @@ func (p *Pool) Status(uid string) (Status, bool) {
 }
 
 // AuthByUID 返回账号的完整凭证（给调度器/运维接口用）。
+//
+// 语义说明：这里是**唯一**保留 CodeBuddy 具体类型的地方。调度器/面板的保号
+// 任务（签到/保活/旅行/任务）全是 CodeBuddy 专有能力，本来就要拿凭证；
+// 而选号路径走 gateway.Account 接口，两者互不干扰。
+// 非 CodeBuddy 账号（如 Trae）返回 nil——调用方按「无凭证」处理。
 func (p *Pool) AuthByUID(uid string) *auth.Auth {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	if e, ok := p.byUID[uid]; ok {
-		return e.a
+	e, ok := p.byUID[uid]
+	if !ok {
+		return nil
 	}
-	return nil
+	return UnwrapAuth(e.acc)
 }
 
 // AvailableUIDs 返回当前 healthy 且未占满在途名额的账号 UID 列表（按 UID 排序，稳定输出）。
@@ -417,7 +424,7 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 // 6004 限流时返回 nil，让调用方（handler）解绑并回落普通轮换。
 // 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
 // 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
-func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
+func (p *Pool) PickByUIDForModel(uid, model string) gateway.Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -427,7 +434,7 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	now := time.Now()
 	// 统一判据（gate.go）。realm 取账号自己的域：粘性号已确定，无需外部传入，
 	// 但积分保底里的上游倍率表按 (域, 模型) 分桶，所以必须带上它而不是留空。
-	switch x := p.gateLocked(e, gateSpec{model: model, realm: e.a.Realm(), now: now}); x {
+	switch x := p.gateLocked(e, gateSpec{model: model, realm: e.acc.Realm(), now: now}); x {
 	case excludeNone:
 	case excludeCreditFloor:
 		// 与 pick 的 floorBlocked 同判据——触底 + 收费即拦。返回 nil 后 handler 侧
@@ -435,7 +442,7 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 		// 日志频次：天然每请求至多一条——首次返回 nil 即解绑，后续轮转不再调入本路径
 		// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
 		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
-			logfmt.Label(e.a.UID, e.a.NicknameValue()), model, e.credits, p.creditFloor)
+			logfmt.Label(e.acc.UID(), e.acc.Nickname()), model, e.credits, p.creditFloor)
 		return nil
 	default:
 		return nil
@@ -443,12 +450,12 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	e.lastUsed = now
 	p.pickSeq++
 	e.usedSeq = p.pickSeq
-	return e.a
+	return e.acc
 }
 
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
 // 否则返回 nil。供会话粘性路由命中校验与直取使用。
-func (p *Pool) PickByUID(uid string) *auth.Auth {
+func (p *Pool) PickByUID(uid string) gateway.Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -462,7 +469,7 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 	e.lastUsed = now
 	p.pickSeq++
 	e.usedSeq = p.pickSeq
-	return e.a
+	return e.acc
 }
 
 // CountsDetailed 返回 total/healthy/cooling/disabled/inFlightFull 五类计数。
@@ -505,7 +512,7 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 	defer p.mu.RUnlock()
 	now := time.Now()
 	for _, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
+		if realm != "" && e.acc.Realm() != realm {
 			continue
 		}
 		total++
@@ -544,7 +551,7 @@ func (p *Pool) ServableForRealm(realm string) bool {
 	defer p.mu.RUnlock()
 	now := time.Now()
 	for _, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
+		if realm != "" && e.acc.Realm() != realm {
 			continue
 		}
 		if p.inFlightFull(e) {
@@ -584,9 +591,9 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
 		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
-		Realm:                    e.a.Realm(),
-		Enterprise:               e.a.IsEnterprise(),
-		Nickname:                 e.a.NicknameValue(),
+		Realm:                    e.acc.Realm(),
+		Enterprise:               e.acc.Enterprise(),
+		Nickname:                 e.acc.Nickname(),
 		Credits:                  e.credits,
 		CreditsTotal:             e.creditsTotal,
 		CreditsExpiring:          e.creditsExpiring,

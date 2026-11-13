@@ -17,8 +17,8 @@ func lockViewPool(t *testing.T) *Pool {
 	t.Helper()
 	withNoPickGap(t)
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	return p
 }
 

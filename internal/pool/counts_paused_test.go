@@ -14,9 +14,9 @@ import (
 // 成"已禁用"，或 /status 少报不可用账号）。
 func TestCountsPausedSeparate(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"}) // 健康
-	p.Add(&auth.Auth{UID: "u2"}) // 暂停选号
-	p.Add(&auth.Auth{UID: "u3"}) // 真禁用
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"})) // 健康
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"})) // 暂停选号
+	p.Add(WrapAuth(&auth.Auth{UID: "u3"})) // 真禁用
 	if !p.Pause("u2") {
 		t.Fatal("Pause 对存在的账号应返回 true")
 	}

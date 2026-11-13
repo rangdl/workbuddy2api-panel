@@ -20,7 +20,7 @@ import (
 //  2. until（全账号级）不被任何模型的 6004 覆盖。
 func TestModelCooldownsIndependent(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	base := time.Now()
 	resetA := base.Add(2 * time.Hour)
 	resetB := base.Add(1 * time.Hour)
@@ -49,7 +49,7 @@ func TestModelCooldownsIndependent(t *testing.T) {
 // 这是本 issue 的核心——旧实现用单 until 字段，B 会覆盖 A。
 func TestModelCooldownsBDoesNotOverwriteA(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	resetA := time.Now().Add(2 * time.Hour)
 	// 模拟真实路径两次 6004：A(2h) 然后 B(1h)。
 	p.CooldownSoftForModel("u1", 600*time.Second, resetA, "glm-5.3", "6004 model rate limit")
@@ -75,7 +75,7 @@ func TestModelCooldownsBDoesNotOverwriteA(t *testing.T) {
 // （否则全账号级冷却被模型重置时间污染），只写 modelCooldowns[model]。
 func TestCooldownSoftForModelDoesNotClobberUntil(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	reset := time.Now().Add(30 * time.Minute)
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
@@ -95,7 +95,7 @@ func TestCooldownSoftForModelDoesNotClobberUntil(t *testing.T) {
 // until 截断到 soft_rate_max，reset_at 保留上游原始墙钟（issue #36 台账语义迁移）。
 func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetSoftRateMax(10 * time.Minute)
 	reset := time.Now().Add(2 * time.Hour) // 远超封顶 → until 截断到 10m，reset_at 保留 2h
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
@@ -117,7 +117,7 @@ func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 // 账号对触发模型不可选、对其他模型仍可选（issue #31 豁免保持）；账号级 healthy 仍真。
 func TestHealthyForModelAfterModelSpecific6004(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	reset := time.Now().Add(30 * time.Minute)
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
@@ -140,7 +140,7 @@ func TestHealthyForModelAfterModelSpecific6004(t *testing.T) {
 // （无账号级冷却），其他模型仍可选。
 func TestModelCooldownsTwoLimitsBothBlock(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	resetA := time.Now().Add(2 * time.Hour)
 	resetB := time.Now().Add(2 * time.Hour)
 	p.mu.Lock()
@@ -167,7 +167,7 @@ func TestModelCooldownsTwoLimitsBothBlock(t *testing.T) {
 // 若清除，B 模型成功会抹掉 A 模型的独立冷却——正是本 issue 要修的核心缺陷。
 func TestModelCooldownsPreservedByNoteSuccess(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	resetA := time.Now().Add(2 * time.Hour)
 	p.CooldownSoftForModel("u1", 600*time.Second, resetA, "glm-5.3", "6004 model rate limit")
 	p.NoteSuccess("u1") // 其他模型成功
@@ -189,7 +189,7 @@ func TestModelCooldownsPreservedByNoteSuccess(t *testing.T) {
 // 号每 5 分钟被抹一次台账，expiring>0 的号走 SetCreditsDetailed 幸免，行为不对称）。
 func TestModelCooldownsSurviveRevive(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.CooldownSoftForModel("u1", 600*time.Second, time.Now().Add(time.Hour), "glm-5.3", "6004")
 	p.ReenableIfCredits("u1", 500, 0)
 	p.mu.RLock()
@@ -206,7 +206,7 @@ func TestModelCooldownsSurviveRevive(t *testing.T) {
 // TestModelCooldownsLazyCleanup 已过期的模型冷却在 pick（写锁路径）时被惰性清理。
 func TestModelCooldownsLazyCleanup(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.mu.Lock()
 	e := p.byUID["u1"]
 	e.modelCooldowns = map[string]modelCooldown{
@@ -214,7 +214,7 @@ func TestModelCooldownsLazyCleanup(t *testing.T) {
 	}
 	p.mu.Unlock()
 	got := p.PickExcludingForModel(nil, "fresh")
-	if got == nil || got.UID != "u1" {
+	if got == nil || got.UID() != "u1" {
 		t.Fatalf("过期模型冷却不应拦截 u1, got %+v", got)
 	}
 	p.mu.RLock()
@@ -228,7 +228,7 @@ func TestModelCooldownsLazyCleanup(t *testing.T) {
 // TestModelCooldownsExpiredAllowsSameModel 过期后同模型请求也放行（read 路径无清理也可选）。
 func TestModelCooldownsExpiredAllowsSameModel(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.mu.Lock()
 	e := p.byUID["u1"]
 	e.modelCooldowns = map[string]modelCooldown{
@@ -243,7 +243,7 @@ func TestModelCooldownsExpiredAllowsSameModel(t *testing.T) {
 // TestRateLimitedModelsMultiModel 6004 多模型同时限流 → /status 台账全部展示。
 func TestRateLimitedModelsMultiModel(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	resetA := time.Now().Add(2 * time.Hour)
 	resetB := time.Now().Add(1 * time.Hour)
 	p.mu.Lock()
@@ -279,7 +279,7 @@ func TestRateLimitedModelsMultiModel(t *testing.T) {
 // 无重置时间的 6004 只写 AuditOnly 台账：账号页可见，但不得改变模型路由。
 func TestModelRateLimitAuditDoesNotAffectRouting(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.CooldownSoftRate("u1", time.Minute, time.Time{}, "429 rate limit")
 	p.RecordModelRateLimitAudit("u1", "glm-5.3", "6004 model rate limit (reset unknown)")
 
@@ -310,7 +310,7 @@ func TestModelRateLimitAuditDoesNotAffectRouting(t *testing.T) {
 // 11102 与 6004 共用台账但必须输出不同 kind。
 func TestRateLimitedModelKindModelUnavailable(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.BlockModelBackoff("u1", "missing-model", "11102 model unavailable")
 	st, _ := p.Status("u1")
 	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Kind != "model_unavailable" {
@@ -323,13 +323,13 @@ func TestModelRateLimitAuditPersists(t *testing.T) {
 	dir := t.TempDir()
 	fp := dir + "/state.json"
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.CooldownSoftRate("u1", time.Minute, time.Time{}, "429 rate limit")
 	p.RecordModelRateLimitAudit("u1", "glm-5.3", "6004 model rate limit (reset unknown)")
 	p.Flush()
 
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p2.mu.RLock()
 	mc, ok := p2.byUID["u1"].modelCooldowns["glm-5.3"]
 	p2.mu.RUnlock()
@@ -344,7 +344,7 @@ func TestModelRateLimitAuditPersists(t *testing.T) {
 // TestRateLimitedModelsMultiModelStableOutput 多模型台账行按模型名排序（稳定输出）。
 func TestRateLimitedModelsMultiModelStableOutput(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	resetA := time.Now().Add(2 * time.Hour)
 	resetB := time.Now().Add(1 * time.Hour)
 	p.mu.Lock()
@@ -366,7 +366,7 @@ func TestRateLimitedModelsMultiModelStableOutput(t *testing.T) {
 // Status.Until（账号级）不受 6004 影响（无账号级冷却时为零值）。
 func TestRateLimitedModelsEachModelHasOwnUntil(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	resetA := time.Now().Add(2 * time.Hour)
 	resetB := time.Now().Add(1 * time.Hour)
 	p.mu.Lock()
@@ -399,16 +399,16 @@ func TestRateLimitedModelsEachModelHasOwnUntil(t *testing.T) {
 func TestModelCooldownsPickSkipsLimitedModel(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.SetCredits("u1", 1000, 0)
 	p.SetCredits("u2", 1, 0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
-	if got := p.PickExcludingForModel(nil, "glm-5.3"); got == nil || got.UID != "u2" {
+	if got := p.PickExcludingForModel(nil, "glm-5.3"); got == nil || got.UID() != "u2" {
 		t.Fatalf("glm-5.3 请求应跳过 u1, got %+v", got)
 	}
-	if got := p.PickExcludingForModel(nil, "hy3-x"); got == nil || got.UID != "u1" {
+	if got := p.PickExcludingForModel(nil, "hy3-x"); got == nil || got.UID() != "u1" {
 		t.Fatalf("hy3-x 请求应豁免 u1, got %+v", got)
 	}
 }
@@ -417,7 +417,7 @@ func TestModelCooldownsPickSkipsLimitedModel(t *testing.T) {
 // 全账号冷却（until）则不可服务。
 func TestServableNowModelCooldownStillServable(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
 	if !p.ServableNow() {
 		t.Fatal("6004 模型冷却不锁账号，ServableNow 应 true")
@@ -434,7 +434,7 @@ func TestServableNowModelCooldownStillServable(t *testing.T) {
 // 全账号冷却优先）。
 func TestHealthyForModelAccountCooledBeatsModelNotCooled(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit") // 全账号级 until 冷却，无 modelCooldowns
 	p.mu.RLock()
 	e := p.byUID["u1"]
@@ -452,7 +452,7 @@ func TestHealthyForModelAccountCooledBeatsModelNotCooled(t *testing.T) {
 // 也有 6004 独立冷却 → 不可选（无论哪条拦截都一致，优先级短路不误放行）。
 func TestHealthyForModelAccountCooledWithModelCooldownStillBlocked(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit")
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
 	p.mu.RLock()
@@ -467,7 +467,7 @@ func TestHealthyForModelAccountCooledWithModelCooldownStillBlocked(t *testing.T)
 // 即使模型没有独立冷却也永不可选（disabled > 模型级）。
 func TestHealthyForModelDisabledBeatsModelNotCooled(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Disable("u1", "session dead")
 	p.mu.RLock()
 	e := p.byUID["u1"]
@@ -481,7 +481,7 @@ func TestHealthyForModelDisabledBeatsModelNotCooled(t *testing.T) {
 // 冷却：熔断期内即使模型没有独立冷却也不可选。
 func TestHealthyForModelBreakerBeatsModelNotCooled(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetBreaker(1, time.Hour, time.Hour)
 	p.NoteError("u1") // 触发熔断
 	p.mu.RLock()
@@ -500,7 +500,7 @@ func TestHealthyForModelBreakerBeatsModelNotCooled(t *testing.T) {
 // 所有模型都可选（基线）。
 func TestHealthyForModelHealthyAccountNoModelCooldown(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.mu.RLock()
 	e := p.byUID["u1"]
 	p.mu.RUnlock()
@@ -515,7 +515,7 @@ func TestHealthyForModelHealthyAccountNoModelCooldown(t *testing.T) {
 // 全账号 until 冷却到期后，模型无独立冷却的请求恢复正常（模型级判定接管）。
 func TestHealthyForModelAccountCooledAllowsNothingAfterUntil(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Cooldown("u1", CoolSoft, time.Millisecond, "429")
 	p.mu.RLock()
 	e := p.byUID["u1"]
@@ -536,8 +536,8 @@ func TestHealthyForModelAccountCooledAllowsNothingAfterUntil(t *testing.T) {
 func TestHealthyForModelPriorityViaPick(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
-	p.Add(&auth.Auth{UID: "cooled"})
-	p.Add(&auth.Auth{UID: "exempt"})
+	p.Add(WrapAuth(&auth.Auth{UID: "cooled"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "exempt"}))
 	p.SetCredits("cooled", 100, 0)
 	p.SetCredits("exempt", 50, 0)
 	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 最高分 cooled
@@ -546,13 +546,13 @@ func TestHealthyForModelPriorityViaPick(t *testing.T) {
 
 	// 请求 other：cooled 被全账号冷却拦截（即使无模型独立冷却），exempt 模型豁免
 	// （6004 只锁 glm-5.3）→ 唯一候选 exempt。
-	if got := p.PickExcludingForModel(nil, "other"); got == nil || got.UID != "exempt" {
+	if got := p.PickExcludingForModel(nil, "other"); got == nil || got.UID() != "exempt" {
 		t.Fatalf("other 模型请求应豁免 exempt（全账号冷却的 cooled 仍拦截），got %+v", got)
 	}
 	// 请求 glm-5.3：cooled 全账号冷却拦截；exempt 自身 6004 拦截 → 无健康候选 →
 	// 全冷却兜底只认账号级冷却（exempt 无 until/breakerUntil,expiry 零值被排除），
 	// 选 cooled（软冷却参与兜底）。
-	if got := p.PickExcludingForModel(nil, "glm-5.3"); got == nil || got.UID != "cooled" {
+	if got := p.PickExcludingForModel(nil, "glm-5.3"); got == nil || got.UID() != "cooled" {
 		t.Fatalf("glm-5.3 请求：exempt 被自身 6004 拦截，兜底应选全账号冷却的 cooled，got %+v", got)
 	}
 }
@@ -564,7 +564,7 @@ func TestModelCooldownsPersist(t *testing.T) {
 	dir := t.TempDir()
 	fp := dir + "/state.json"
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
 	p.Flush()
 	raw, err := os.ReadFile(fp)
@@ -575,7 +575,7 @@ func TestModelCooldownsPersist(t *testing.T) {
 		t.Errorf("state.json 应持久化 model_cooldowns: %s", raw)
 	}
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p2.mu.RLock()
 	n := len(p2.byUID["u1"].modelCooldowns)
 	p2.mu.RUnlock()
@@ -594,7 +594,7 @@ func TestModelCooldownsPersistCompatOldState(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.mu.RLock()
 	n := len(p.byUID["u1"].modelCooldowns)
 	until := p.byUID["u1"].until

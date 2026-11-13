@@ -44,8 +44,8 @@ func TestSaveRegionSchedulingHotAppliesAndRejectsInvalid(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "a"})
-	p.Add(&auth.Auth{UID: "b"})
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "a"}))
+	p.Add(pool.WrapAuth(&auth.Auth{UID: "b"}))
 	live := livecfg.New(livecfg.Snapshot{})
 	up := upstream.New()
 	sch := scheduler.New(scheduler.Config{})
@@ -60,7 +60,7 @@ func TestSaveRegionSchedulingHotAppliesAndRejectsInvalid(t *testing.T) {
 		}
 	}
 	for _, uid := range []string{"b", "a", "b"} {
-		if a := p.PickExcludingForRealm(nil, "m", "cn"); a == nil || a.UID != uid {
+		if a := p.PickExcludingForRealm(nil, "m", "cn"); a == nil || a.UID() != uid {
 			t.Fatalf("hot pick=%v want %s", a, uid)
 		}
 	}
@@ -86,7 +86,7 @@ func TestSaveRegionSchedulingHotAppliesAndRejectsInvalid(t *testing.T) {
 	if string(saved) != string(after) {
 		t.Fatal("invalid save changed file")
 	}
-	if a := p.PickExcludingForRealm(nil, "m", "cn"); a == nil || a.UID != "a" {
+	if a := p.PickExcludingForRealm(nil, "m", "cn"); a == nil || a.UID() != "a" {
 		t.Fatalf("invalid save changed strategy: %v", a)
 	}
 }

@@ -67,7 +67,7 @@ func compensationScheduler(t *testing.T, rec *compensationRecorder, accts ...*au
 	srv := rec.server(t)
 	p := pool.New("")
 	for _, a := range accts {
-		p.Add(a)
+		p.Add(pool.WrapAuth(a))
 	}
 	up := &upstream.Client{
 		HTTP:          srv.Client(),

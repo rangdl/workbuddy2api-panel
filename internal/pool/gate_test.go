@@ -24,8 +24,8 @@ func TestGateAgreesAcrossEntryPoints(t *testing.T) {
 	p.SetCostExploreInterval(0)
 	p.SetCreditFloor(100)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
-	p.Add(&auth.Auth{UID: "poor"}) // 空 domain → Realm()=="cn"
-	p.Add(&auth.Auth{UID: "rich"})
+	p.Add(WrapAuth(&auth.Auth{UID: "poor"})) // 空 domain → Realm()=="cn"
+	p.Add(WrapAuth(&auth.Auth{UID: "rich"}))
 	p.SetCredits("poor", 30, 30)
 	p.SetCredits("rich", 1_000_000, 1_000_000)
 	p.NoteModelCost("poor", "hy4-preview", 2.9, 1000) // 实测收费 → floor 生效
@@ -60,7 +60,7 @@ func TestGateAgreesAcrossEntryPoints(t *testing.T) {
 
 	// ③ 粘性直取：分配阶段就得拒绝，不能「先粘上再解绑」。
 	if a := p.PickByUIDForModel("poor", model); a != nil {
-		t.Errorf("PickByUIDForModel(poor)=%s，want nil（触底号不得续期）", a.UID)
+		t.Errorf("PickByUIDForModel(poor)=%s，want nil（触底号不得续期）", a.UID())
 	}
 
 	// ④ 普通选号：不得选中触底号。
@@ -69,7 +69,7 @@ func TestGateAgreesAcrossEntryPoints(t *testing.T) {
 		if a == nil {
 			t.Fatalf("第 %d 次选号返回 nil，want rich", i)
 		}
-		if a.UID == "poor" {
+		if a.UID() == "poor" {
 			t.Fatalf("第 %d 次选中触底号 poor", i)
 		}
 	}
@@ -82,7 +82,7 @@ func TestGateAllowsFloorOnFreeModel(t *testing.T) {
 	p := New("")
 	p.SetCostExploreInterval(0)
 	p.SetCreditFloor(100)
-	p.Add(&auth.Auth{UID: "poor"})
+	p.Add(WrapAuth(&auth.Auth{UID: "poor"}))
 	p.SetCredits("poor", 30, 30)
 	p.NoteModelCost("poor", "free-model", 0, 1000) // 实测免费 → tier 0，floor 不拦
 

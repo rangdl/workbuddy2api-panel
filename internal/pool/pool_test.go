@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 )
 
 // withNoPickGap 临时关闭防并发撞号窗口（minPickGap=0），让纯加权分布测试不受影响。
@@ -30,15 +32,15 @@ func TestPickHighestCredits(t *testing.T) {
 	a1 := &auth.Auth{UID: "u1"}
 	a2 := &auth.Auth{UID: "u2"}
 	a3 := &auth.Auth{UID: "u3"}
-	p.Add(a1)
-	p.Add(a2)
-	p.Add(a3)
+	p.Add(WrapAuth(a1))
+	p.Add(WrapAuth(a2))
+	p.Add(WrapAuth(a3))
 	p.SetCredits("u1", 100, 0)
 	p.SetCredits("u2", 50000, 0)
 	p.SetCredits("u3", 300, 0)
 	counts := map[string]int{}
 	for i := 0; i < 3000; i++ {
-		counts[p.Pick().UID]++
+		counts[p.Pick().UID()]++
 	}
 	if counts["u2"] <= counts["u1"] || counts["u2"] <= counts["u3"] {
 		t.Errorf("u2 (highest credits) should be picked most: %v", counts)
@@ -49,13 +51,13 @@ func TestPickSkipsCooling(t *testing.T) {
 	p := New("")
 	a1 := &auth.Auth{UID: "u1"}
 	a2 := &auth.Auth{UID: "u2"}
-	p.Add(a1)
-	p.Add(a2)
+	p.Add(WrapAuth(a1))
+	p.Add(WrapAuth(a2))
 	p.SetCredits("u1", 100, 0)
 	p.SetCredits("u2", 50, 0)
 	p.Cooldown("u1", CoolHard, time.Hour, "test")
 	got := p.Pick()
-	if got == nil || got.UID != "u2" {
+	if got == nil || got.UID() != "u2" {
 		t.Fatalf("pick=%+v want u2", got)
 	}
 }
@@ -63,12 +65,12 @@ func TestPickSkipsCooling(t *testing.T) {
 func TestPickExpiredCooldownReturnsToHealthy(t *testing.T) {
 	p := New("")
 	a1 := &auth.Auth{UID: "u1"}
-	p.Add(a1)
+	p.Add(WrapAuth(a1))
 	p.SetCredits("u1", 100, 0)
 	p.Cooldown("u1", CoolSoft, time.Millisecond, "429")
 	time.Sleep(5 * time.Millisecond)
 	got := p.Pick()
-	if got == nil || got.UID != "u1" {
+	if got == nil || got.UID() != "u1" {
 		t.Fatalf("pick=%+v want u1 after cooldown expiry", got)
 	}
 }
@@ -76,7 +78,7 @@ func TestPickExpiredCooldownReturnsToHealthy(t *testing.T) {
 func TestPickNilWhenAllDisabled(t *testing.T) {
 	// 全禁用 → 兜底不参与（禁用账号永不参与兜底）→ 返回 nil。
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Disable("u1", "session dead")
 	if got := p.Pick(); got != nil {
 		t.Fatalf("want nil (all disabled), got %+v", got)
@@ -85,13 +87,13 @@ func TestPickNilWhenAllDisabled(t *testing.T) {
 
 func TestPickExcluding(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.SetCredits("u1", 100, 0)
 	p.SetCredits("u2", 50, 0)
 	tried := map[string]bool{"u1": true}
 	got := p.PickExcluding(tried)
-	if got == nil || got.UID != "u2" {
+	if got == nil || got.UID() != "u2" {
 		t.Fatalf("pick=%+v want u2", got)
 	}
 	tried["u2"] = true
@@ -104,14 +106,14 @@ func TestPickExcludingStaysWithinHealthy(t *testing.T) {
 	withNoPickGap(t)
 	// 加权随机不能选出冷却/禁用账号。
 	p := New("")
-	p.Add(&auth.Auth{UID: "u-cold"})
-	p.Add(&auth.Auth{UID: "u-hot"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u-cold"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u-hot"}))
 	p.SetCredits("u-cold", 9999, 0)
 	p.SetCredits("u-hot", 1, 0)
 	p.Cooldown("u-cold", CoolHard, time.Hour, "x")
 	for i := 0; i < 20; i++ {
 		got := p.PickExcluding(nil)
-		if got == nil || got.UID != "u-hot" {
+		if got == nil || got.UID() != "u-hot" {
 			t.Fatalf("iter %d: picked %+v, want only healthy u-hot", i, got)
 		}
 	}
@@ -122,13 +124,13 @@ func TestPickWeightedSkewTowardHighCredits(t *testing.T) {
 	// Top5 三因子加权：单账号 credits 占比足够高时，多数挑中它。
 	p := New("")
 	for _, u := range []string{"w1", "w2", "w3", "w4", "w5", "w6"} {
-		p.Add(&auth.Auth{UID: u})
+		p.Add(WrapAuth(&auth.Auth{UID: u}))
 		p.SetCredits(u, 1, 0)
 	}
 	p.SetCredits("w1", 1000, 0)
 	counts := map[string]int{}
 	for i := 0; i < 5000; i++ {
-		counts[p.Pick().UID]++
+		counts[p.Pick().UID()]++
 	}
 	mx, mxUID := 0, ""
 	for uid, n := range counts {
@@ -146,11 +148,11 @@ func TestPickWeightedUniformWhenAllZero(t *testing.T) {
 	// credits 全为 0 → 退化为均匀随机，不能只挑固定一个。
 	p := New("")
 	for _, u := range []string{"z1", "z2", "z3"} {
-		p.Add(&auth.Auth{UID: u})
+		p.Add(WrapAuth(&auth.Auth{UID: u}))
 	}
 	seen := map[string]bool{}
 	for i := 0; i < 30; i++ {
-		seen[p.Pick().UID] = true
+		seen[p.Pick().UID()] = true
 	}
 	if len(seen) != 3 {
 		t.Errorf("uniform fallback should hit all, seen=%v", seen)
@@ -162,7 +164,7 @@ func TestPickWeightedTopFiveOnly(t *testing.T) {
 	// 第 6 高 credits 的账号在 Top5 之外，权重抽签永远轮不到它。
 	p := New("")
 	for _, u := range []string{"a1", "a2", "a3", "a4", "a5", "a6"} {
-		p.Add(&auth.Auth{UID: u})
+		p.Add(WrapAuth(&auth.Auth{UID: u}))
 	}
 	p.SetCredits("a1", 1000, 0)
 	p.SetCredits("a2", 1000, 0)
@@ -171,7 +173,7 @@ func TestPickWeightedTopFiveOnly(t *testing.T) {
 	p.SetCredits("a5", 1000, 0)
 	p.SetCredits("a6", 5, 0) // Top5 之外
 	for i := 0; i < 2000; i++ {
-		if got := p.Pick(); got == nil || got.UID == "a6" {
+		if got := p.Pick(); got == nil || got.UID() == "a6" {
 			t.Fatalf("iter %d: picked %+v, a6 must stay outside top-5", i, got)
 		}
 	}
@@ -185,10 +187,10 @@ func TestPickTopFiveByIdleNotCredits(t *testing.T) {
 	p := New("")
 	now := time.Now()
 	for _, u := range []string{"a1", "a2", "a3", "a4", "a5"} {
-		p.Add(&auth.Auth{UID: u})
+		p.Add(WrapAuth(&auth.Auth{UID: u}))
 		p.SetCredits(u, 100, 0)
 	}
-	p.Add(&auth.Auth{UID: "a6"})
+	p.Add(WrapAuth(&auth.Auth{UID: "a6"}))
 	p.SetCredits("a6", 90, 0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	// a1..a5 全部"刚被用过"，闲置补偿归零；a6 从未使用 → 闲置满分。
@@ -198,7 +200,7 @@ func TestPickTopFiveByIdleNotCredits(t *testing.T) {
 	}
 	p.mu.Unlock()
 
-	if got := p.Pick(); got == nil || got.UID != "a6" {
+	if got := p.Pick(); got == nil || got.UID() != "a6" {
 		t.Fatalf("pick=%v, want a6 (idle low-credit must enter top5 by weight)", got)
 	}
 }
@@ -207,13 +209,13 @@ func TestPickDeterministicViaSetRandomSource(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
 	p.SetRandomSource(func(n int64) int64 { return 0 })
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.SetCredits("u1", 100, 0)
 	p.SetCredits("u2", 50, 0)
 	// r=0 ∈ [0,50) → 命中 u1。注入源应使选号完全确定。
 	for i := 0; i < 50; i++ {
-		if got := p.Pick(); got == nil || got.UID != "u1" {
+		if got := p.Pick(); got == nil || got.UID() != "u1" {
 			t.Fatalf("iter %d: pick=%+v want u1 (deterministic)", i, got)
 		}
 	}
@@ -233,7 +235,7 @@ func TestPickAntiThunderingHerd(t *testing.T) {
 
 	p := New("")
 	for i := 0; i < 10; i++ {
-		p.Add(&auth.Auth{UID: fmt.Sprintf("c%02d", i)})
+		p.Add(WrapAuth(&auth.Auth{UID: fmt.Sprintf("c%02d", i)}))
 	}
 	// 关键：验证并发中任意瞬间不会全选同一账号。
 	const N = 100
@@ -244,7 +246,7 @@ func TestPickAntiThunderingHerd(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			if a := p.Pick(); a != nil {
-				picked[idx] = a.UID
+				picked[idx] = a.UID()
 			}
 		}(i)
 	}
@@ -275,7 +277,7 @@ func TestPickLRUFallbackWhenTopAllRecentlyUsed(t *testing.T) {
 
 	p := New("")
 	for i := 0; i < 5; i++ {
-		p.Add(&auth.Auth{UID: fmt.Sprintf("a%d", i)})
+		p.Add(WrapAuth(&auth.Auth{UID: fmt.Sprintf("a%d", i)}))
 	}
 	// 直接构造 lastUsed：不经过 Pick（避免 Pick 改写 lastUsed）。
 	order := []string{"a4", "a3", "a2", "a1", "a0"}
@@ -289,8 +291,8 @@ func TestPickLRUFallbackWhenTopAllRecentlyUsed(t *testing.T) {
 	if got == nil {
 		t.Fatal("pick returned nil")
 	}
-	if got.UID != "a4" {
-		t.Errorf("LRU fallback picked %s want a4 (oldest lastUsed)", got.UID)
+	if got.UID() != "a4" {
+		t.Errorf("LRU fallback picked %s want a4 (oldest lastUsed)", got.UID())
 	}
 }
 
@@ -298,11 +300,11 @@ func TestCooldownPersists(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
 	p.Flush() // 状态变更走 dirty 标志，落盘由 Flush / 后台 goroutine 负责
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	st, ok := p2.Status("u1")
 	if !ok || !st.Cooling || st.Reason != "余额不足" {
 		t.Fatalf("cooldown lost after reload: %+v ok=%v", st, ok)
@@ -313,11 +315,11 @@ func TestDisablePersists(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Disable("u1", "12153 session dead")
 	p.Flush()
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	if p2.Pick() != nil {
 		t.Fatal("disabled account picked after reload")
 	}
@@ -331,7 +333,7 @@ func TestDisablePersists(t *testing.T) {
 // statusOf 不应再把过期 reason 透出给面板（避免「可用」旁挂着历史 429）。
 func TestStatusReasonHiddenAfterCooldownExpires(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	// 冷却中：reason 正常透出。
 	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit")
 	st, ok := p.Status("u1")
@@ -351,18 +353,18 @@ func TestStatusReasonHiddenAfterCooldownExpires(t *testing.T) {
 
 func TestReenableIfCredits(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
 	p.ReenableIfCredits("u1", 500, 0)
 	got := p.Pick()
-	if got == nil || got.UID != "u1" {
+	if got == nil || got.UID() != "u1" {
 		t.Fatalf("should reenable, pick=%+v", got)
 	}
 }
 
 func TestReenableZeroCreditsKeepsCooling(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
 	p.ReenableIfCredits("u1", 0, 0)
 	st, _ := p.Status("u1")
@@ -373,7 +375,7 @@ func TestReenableZeroCreditsKeepsCooling(t *testing.T) {
 
 func TestReenableDoesNotTouchDisabled(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Disable("u1", "session dead")
 	p.ReenableIfCredits("u1", 500, 0)
 	if p.Pick() != nil {
@@ -385,7 +387,7 @@ func TestNoteErrorAccumulatesErrTotal(t *testing.T) {
 	// NoteError 语义变更：不再有独立的 err 冷却（CoolErr 已并入熔断器），
 	// 只累计 errTotal（不清零，供成功率权重）并喂熔断器 fails。
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.NoteError("u1")
 	p.NoteError("u1")
 	st, _ := p.Status("u1")
@@ -403,7 +405,7 @@ func TestNoteErrorAccumulatesErrTotal(t *testing.T) {
 func TestNoteSuccessResetsBreakerNotErrTotal(t *testing.T) {
 	// NoteSuccess 清 fails/熔断（运行态），但不清 errTotal（累计值）。
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetBreaker(2, time.Hour, 2*time.Hour)
 	p.NoteError("u1")
 	p.NoteError("u1") // 触发熔断
@@ -422,7 +424,7 @@ func TestNoteSuccessResetsBreakerNotErrTotal(t *testing.T) {
 
 func TestNoteSuccessIncrementsAndRecords(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	before := time.Now()
 	p.NoteSuccess("u1")
 	p.NoteSuccess("u1")
@@ -443,7 +445,7 @@ func TestReenableClearsCoolingNotBreaker(t *testing.T) {
 	// （fails/retryCount/breakerUntil）。签到成功只证明余额与 billing 通道恢复，
 	// 不证明 chat 通道健康——熔断仍按 breakerUntil 退避到期或 NoteSuccess 恢复。
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.CooldownUntilTomorrow4AM("u1", "余额不足") // 硬冷却（喂 fails，但此时阈值默认 3，不熔断）
 	p.SetBreaker(1, time.Hour, time.Hour)
 	p.NoteError("u1") // 触发熔断（fails→阈值1→fails=0, retryCount=1, breakerUntil 非零）
@@ -467,7 +469,7 @@ func TestReenableClearsCoolingNotBreaker(t *testing.T) {
 func TestReenableKeepsBreaker(t *testing.T) {
 	// C5 回归锁定新语义：仅熔断（无冷却）的账号，签到解冻不得清熔断。
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetBreaker(1, time.Hour, time.Hour)
 	p.NoteError("u1") // 触发熔断
 	if bt, _ := p.breakerUntil("u1"); bt.IsZero() {
@@ -486,13 +488,13 @@ func TestCoolKindPersistsAcrossReload(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
 	p.Flush()
 
 	// 旧文件缺新字段时零值 → 冷却应仍工作（向后兼容）。
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	st, ok := p2.Status("u1")
 	if !ok || !st.Cooling {
 		t.Fatalf("cooldown state lost after reload: %+v ok=%v", st, ok)
@@ -506,7 +508,7 @@ func TestStateRoundTripExtendedFields(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
 	p.NoteSuccess("u1") // successCount=1，last_success 非零
 	p.NoteSuccess("u1") // successCount=2
@@ -529,7 +531,7 @@ func TestStateRoundTripExtendedFields(t *testing.T) {
 
 	// 重载后字段保留
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	st, ok := p2.Status("u1")
 	if !ok {
 		t.Fatal("no status")
@@ -554,7 +556,7 @@ func TestLoadLegacyErrCountMigratesToErrTotal(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	st, ok := p.Status("u1")
 	if !ok {
 		t.Fatal("legacy account should load")
@@ -568,7 +570,7 @@ func TestLoadLegacyErrCountMigratesToErrTotal(t *testing.T) {
 		t.Fatal(err)
 	}
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	if st2, _ := p2.Status("u1"); st2.ErrTotal != 9 {
 		t.Errorf("err_total=%d want 9 (new field wins over legacy)", st2.ErrTotal)
 	}
@@ -576,7 +578,7 @@ func TestLoadLegacyErrCountMigratesToErrTotal(t *testing.T) {
 
 func TestStatusCoolKindDefaultsWhenNotCooling(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	st, _ := p.Status("u1")
 	if st.CoolKind != "" || st.CoolRemaining != 0 {
 		t.Errorf("non-cooling portrait=%+v", st)
@@ -621,7 +623,7 @@ func TestNextDay4AMBoundaries(t *testing.T) {
 
 func TestCooldownUntilTomorrow4AM(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	before := time.Now()
 	p.CooldownUntilTomorrow4AM("u1", "余额不足")
 	after := time.Now()
@@ -656,11 +658,11 @@ func TestCooldownUntilTomorrow4AMPersists(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.CooldownUntilTomorrow4AM("u1", "余额不足")
 	p.Flush()
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	st, ok := p2.Status("u1")
 	if !ok || st.Until.Hour() != 4 || st.Reason != "余额不足" {
 		t.Errorf("status after reload=%+v ok=%v", st, ok)
@@ -700,7 +702,7 @@ func TestCooldownSoftExponentialBackoff(t *testing.T) {
 	// 同一账号**跨冷却期**连续软限流 → 时长按 2 倍指数增长（吸收上游：冷却中的
 	// 兜底探测不再堆加，堆加只发生在到期后的新一轮限流）。
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetSoftRateMax(time.Hour) // 封顶 1h：本用例三步（600/1200/2400）都不触及
 
 	for i, want := range []int64{600, 1200, 2400} {
@@ -716,7 +718,7 @@ func TestCooldownSoftExponentialBackoff(t *testing.T) {
 func TestCooldownSoftCappedBySoftRateMax(t *testing.T) {
 	// 注入封顶：streak 3 的 400s 被压到 250s（跨冷却期堆加）。
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetSoftRateMax(250 * time.Second)
 
 	p.CooldownSoftRate("u1", 100*time.Second, time.Time{}, "x")
@@ -732,7 +734,7 @@ func TestCooldownSoftCappedBySoftRateMax(t *testing.T) {
 func TestCooldownSoftDefaultCapWhenUnset(t *testing.T) {
 	// 未注入 softRateMax → 按 2h 封顶（避免裸用池时退避无上限）。
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	for i, want := range []int64{600, 1200, 2400, 4800, 7200} {
 		p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 		wantCoolSec(t, p, "u1", want, 3)
@@ -746,7 +748,7 @@ func TestCooldownSoftDefaultCapWhenUnset(t *testing.T) {
 func TestSetSoftRateMaxIgnoresNonPositive(t *testing.T) {
 	// 非正值保留原值（风格同 SetBreaker）：0 不应把封顶清零导致无上限。
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetSoftRateMax(0)
 	p.SetSoftRateMax(-time.Second)
 	for i := 0; i < 6; i++ {
@@ -761,7 +763,7 @@ func TestSetSoftRateMaxIgnoresNonPositive(t *testing.T) {
 func TestCooldownSoftStreakResetBySuccess(t *testing.T) {
 	// 成功即证明账号恢复 → streak 归零，下次软冷却回到基数。
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 	expireCooldown(p, "u1")
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
@@ -782,7 +784,7 @@ func TestCooldownSoftKeptByReenable(t *testing.T) {
 	// 不是余额恢复（余额刷新每 5 分钟一次，若在此清冷却域，限流保护实际寿命被压到
 	// 一个刷新周期内）。熔断域（fails/retryCount/breakerUntil）不动，与既有 C5 语义一致。
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 	expireCooldown(p, "u1") // 跨冷却期第二次限流，streak 累计到 2（冷却中重复触发不堆叠，#152）
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
@@ -809,7 +811,7 @@ func TestCooldownSoftKeptByReenable(t *testing.T) {
 func TestCooldownHardDoesNotAdvanceSoftStreak(t *testing.T) {
 	// 硬冷却（余额耗尽）时长由签到时点决定，不参与软退避指数。
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.CooldownUntilTomorrow4AM("u1", "余额不足")
 	if st, _ := p.Status("u1"); st.SoftStreak != 0 {
 		t.Fatalf("hard cooldown must not touch soft_streak, got %d", st.SoftStreak)
@@ -822,7 +824,7 @@ func TestSoftStreakPersistsAcrossReload(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 	expireCooldown(p, "u1")
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
@@ -837,7 +839,7 @@ func TestSoftStreakPersistsAcrossReload(t *testing.T) {
 	}
 
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	if st, _ := p2.Status("u1"); st.SoftStreak != 2 {
 		t.Fatalf("soft_streak after reload=%d want 2", st.SoftStreak)
 	}
@@ -855,7 +857,7 @@ func TestSoftStreakMissingInLegacyStateFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	if st, _ := p.Status("u1"); st.SoftStreak != 0 {
 		t.Fatalf("legacy file should load soft_streak=0, got %d", st.SoftStreak)
 	}
@@ -874,7 +876,7 @@ func TestCooldownSoftForModelParsedUntil(t *testing.T) {
 	// 新语义：只写 modelCooldowns（不写账号级 until）→ 账号不 cooling、台账单行。
 	reset := time.Now().Add(5 * time.Minute)
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "429 rate limit")
 	st, ok := p.Status("u1")
 	if !ok {
@@ -895,7 +897,7 @@ func TestCooldownSoftForModelParsedUntil(t *testing.T) {
 func TestCooldownSoftForModelCappedBySoftRateMax(t *testing.T) {
 	// 解析时间超出 soft_rate_max → 截断到 soft_rate_max（不无限期拉黑）。
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetSoftRateMax(10 * time.Minute)
 	reset := time.Now().Add(2 * time.Hour) // 远超过封顶 10m
 	before := time.Now()
@@ -914,7 +916,7 @@ func TestCooldownSoftForModelNoResetFallbackBackoff(t *testing.T) {
 	// **不推进 streak、不延长**（吸收上游：旧「每次探测都翻倍」正是全池被推到
 	// 2h 封顶的元凶）。
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetSoftRateMax(time.Hour)
 	p.CooldownSoftForModel("u1", 600*time.Second, time.Time{}, "", "429 rate limit")
 	wantCoolSec(t, p, "u1", 600, 3)
@@ -926,14 +928,14 @@ func TestCooldownSoftForModelNoResetFallbackBackoff(t *testing.T) {
 // 已记录模型）+ 同 model 请求 → 仍不可选（现状语义保持）。
 func TestPickExcludingForModelSkipsSoftCoolingSameModel(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.SetCredits("u1", 1000, 0)
 	p.SetCredits("u2", 1, 0)
 	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 最高分 u1
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
 	got := p.PickExcludingForModel(nil, "glm-5.3")
-	if got == nil || got.UID != "u2" {
+	if got == nil || got.UID() != "u2" {
 		t.Fatalf("same-model request must skip cooling u1, got %+v", got)
 	}
 }
@@ -942,14 +944,14 @@ func TestPickExcludingForModelSkipsSoftCoolingSameModel(t *testing.T) {
 // → 视为可用，可选到该号（真·单模型限流，切模型立即可用）。
 func TestPickExcludingForModelAllowsDifferentModel(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetCredits("u1", 1000, 0)
-	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.SetCredits("u2", 1, 0)
 	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 最高分 u1
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
 	got := p.PickExcludingForModel(nil, "hy3-x")
-	if got == nil || got.UID != "u1" {
+	if got == nil || got.UID() != "u1" {
 		t.Fatalf("different-model request should bypass u1 soft cooling, got %+v", got)
 	}
 }
@@ -958,15 +960,15 @@ func TestPickExcludingForModelAllowsDifferentModel(t *testing.T) {
 // 不记录 softRateModel）→ 不因模型切换而豁免（现状语义）。
 func TestCooldownSoftWithoutModelRecordsNone(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.SetCredits("u1", 1000, 0)
 	p.SetCredits("u2", 1, 0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.CooldownSoftForModel("u1", time.Minute, time.Time{}, "", "429 rate limit")
 	// 冷却中 + 不同 model 请求仍跳过 u1（无 softRateModel，不豁免）。
 	got := p.PickExcludingForModel(nil, "hy3-x")
-	if got == nil || got.UID != "u2" {
+	if got == nil || got.UID() != "u2" {
 		t.Fatalf("no model recorded → must not bypass, got %+v", got)
 	}
 }
@@ -975,8 +977,8 @@ func TestCooldownSoftWithoutModelRecordsNone(t *testing.T) {
 // 熔断（breakerUntil）仍拦截：6004 冷却 + 熔断中的账号，切模型也不可选。
 func TestPickExcludingForModelBreakerStillBlocks(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.SetCredits("u1", 1000, 0)
 	p.SetCredits("u2", 1, 0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
@@ -984,7 +986,7 @@ func TestPickExcludingForModelBreakerStillBlocks(t *testing.T) {
 	p.NoteError("u1") // u1 熔断
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
 	got := p.PickExcludingForModel(nil, "hy3-x")
-	if got == nil || got.UID != "u2" {
+	if got == nil || got.UID() != "u2" {
 		t.Fatalf("breaker must still block, got %+v", got)
 	}
 }
@@ -995,15 +997,15 @@ func TestPickExcludingForModelBreakerStillBlocks(t *testing.T) {
 func TestSoftRateModelClearedByPlainCooldown(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.SetCredits("u1", 1000, 0)
 	p.SetCredits("u2", 1, 0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 
 	// 1) 6004 带解析时间 → 记录模型 glm-5.3。
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
-	if got := p.PickExcludingForModel(nil, "hy3-x"); got == nil || got.UID != "u1" {
+	if got := p.PickExcludingForModel(nil, "hy3-x"); got == nil || got.UID() != "u1" {
 		t.Fatalf("precondition: different-model should bypass, got %+v", got)
 	}
 	// 2) 账号恢复后经历普通账号级软冷却（无模型语义）。
@@ -1011,7 +1013,7 @@ func TestSoftRateModelClearedByPlainCooldown(t *testing.T) {
 	p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
 	// 3) 换模型请求不得再豁免（softRateModel 已清空）。
 	got := p.PickExcludingForModel(nil, "hy3-x")
-	if got == nil || got.UID != "u2" {
+	if got == nil || got.UID() != "u2" {
 		t.Fatalf("plain cooldown must clear softRateModel (no bypass), got %+v", got)
 	}
 }
@@ -1026,7 +1028,7 @@ func TestSoftRateModelPersistsToState(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	// resetAt 必须显著晚于 now：传 time.Now() 会走"重置时间已过"分支把冷却压到 1ms。
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(10*time.Minute), "glm-5.3", "429 rate limit")
 	p.Flush()
@@ -1038,7 +1040,7 @@ func TestSoftRateModelPersistsToState(t *testing.T) {
 		t.Errorf("state.json 应持久化 model_cooldowns: %s", raw)
 	}
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	st, ok := p2.Status("u1")
 	if !ok {
 		t.Fatalf("account missing after reload")
@@ -1053,8 +1055,8 @@ func TestSoftRateModelPersistsToState(t *testing.T) {
 
 func TestList(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1", Nickname: "nick1"})
-	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1", Nickname: "nick1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.SetCredits("u1", 42, 0)
 	p.Cooldown("u2", CoolSoft, time.Minute, "429")
 	list := p.List()
@@ -1080,10 +1082,10 @@ func TestList(t *testing.T) {
 
 func TestRemoveMissingFromDir(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
-	p.SyncToDir([]*auth.Auth{{UID: "u2"}})
-	if p.Pick() == nil || p.Pick().UID != "u2" {
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
+	p.SyncToDir([]gateway.Account{WrapAuth(&auth.Auth{UID: "u2"})})
+	if p.Pick() == nil || p.Pick().UID() != "u2" {
 		t.Fatal("u1 should be removed")
 	}
 	if _, ok := p.Status("u1"); ok {
@@ -1095,11 +1097,11 @@ func TestFlushPersistsCredits(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetCredits("u1", 42, 0)
 	p.Flush()
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	st, ok := p2.Status("u1")
 	if !ok || st.Credits != 42 {
 		t.Fatalf("flush not persisted: %+v ok=%v", st, ok)
@@ -1114,7 +1116,7 @@ func TestAutoFlush(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetCredits("u1", 77, 0)
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -1128,7 +1130,7 @@ func TestAutoFlush(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	st, ok := p2.Status("u1")
 	if !ok || st.Credits != 77 {
 		t.Fatalf("auto flush not persisted: %+v ok=%v", st, ok)
@@ -1139,7 +1141,7 @@ func TestFlushIdempotentWhenClean(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Flush() // 无 dirty，不应写盘
 	if _, err := os.Stat(fp); !os.IsNotExist(err) {
 		t.Fatalf("flush on clean pool should not write: %v", err)
@@ -1155,7 +1157,7 @@ func TestSaveFailureRecordedAndRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := New(filepath.Join(block, "state.json"))
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetCredits("u1", 42, 0)
 	p.Flush()
 	if p.persistFails == 0 {
@@ -1165,7 +1167,7 @@ func TestSaveFailureRecordedAndRecovers(t *testing.T) {
 	// 换回可写目录 → 成功后 persistFails 归零（恢复日志由零值门槛触发）。
 	good := filepath.Join(t.TempDir(), "state.json")
 	p2 := New(good)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p2.SetCredits("u1", 42, 0)
 	p2.Flush()
 	if p2.persistFails != 0 {
@@ -1211,7 +1213,7 @@ func (p *Pool) internalHealthy(uid string) bool {
 
 func TestBreakerTripsAtThreshold(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetBreaker(3, time.Hour, 6*time.Hour)
 	for i := 0; i < 2; i++ {
 		p.NoteError("u1") // NoteError 只驱动熔断（不再有单独 err 冷却）
@@ -1228,7 +1230,7 @@ func TestBreakerTripsAtThreshold(t *testing.T) {
 
 func TestBreakerSuccessClears(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetBreaker(3, time.Hour, 6*time.Hour)
 	p.NoteError("u1")
 	p.NoteError("u1")
@@ -1247,7 +1249,7 @@ func TestBreakerSuccessClears(t *testing.T) {
 
 func TestBreakerExponentialBackoffCapped(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetBreaker(3, time.Minute, 4*time.Minute) // threshold=3：连续 3 次失败熔断一次
 	// 连续 9 次失败（无成功）→ 熔断 3 次，retryCount 1→2→3，退避 1m→2m→4m(封顶)。
 	for i := 0; i < 3; i++ {
@@ -1267,7 +1269,7 @@ func TestBreakerExponentialBackoffCapped(t *testing.T) {
 
 	// 对比第 1 次熔断（新账号重新来）：退避应更短。
 	p2 := New("")
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p2.SetBreaker(3, time.Minute, 4*time.Minute)
 	for j := 0; j < 3; j++ {
 		p2.NoteError("u1")
@@ -1280,25 +1282,25 @@ func TestBreakerExponentialBackoffCapped(t *testing.T) {
 
 func TestFallbackPicksEarliestExpiry(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "late"})
-	p.Add(&auth.Auth{UID: "early"})
+	p.Add(WrapAuth(&auth.Auth{UID: "late"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "early"}))
 	// 两个都软冷却；early 更早到期 → 兜底选 early。
 	p.Cooldown("late", CoolSoft, 2*time.Hour, "x")
 	p.Cooldown("early", CoolSoft, time.Hour, "x")
 	got := p.Pick()
-	if got == nil || got.UID != "early" {
+	if got == nil || got.UID() != "early" {
 		t.Fatalf("fallback should pick earliest expiry (early), got %+v", got)
 	}
 }
 
 func TestFallbackSkipsDisabled(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "cooled"})
-	p.Add(&auth.Auth{UID: "dead"})
+	p.Add(WrapAuth(&auth.Auth{UID: "cooled"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "dead"}))
 	p.Cooldown("cooled", CoolSoft, time.Hour, "x")
 	p.Disable("dead", "session dead") // 禁用不参与兜底
 	got := p.Pick()
-	if got == nil || got.UID != "cooled" {
+	if got == nil || got.UID() != "cooled" {
 		t.Fatalf("fallback should skip disabled, got %+v", got)
 	}
 }
@@ -1306,7 +1308,7 @@ func TestFallbackSkipsDisabled(t *testing.T) {
 func TestFallbackSkipsHardCooldown(t *testing.T) {
 	// D3：余额耗尽（CoolHard）号不参与兜底——调了必 402，浪费轮换并产生噪音日志。
 	p := New("")
-	p.Add(&auth.Auth{UID: "hard"})
+	p.Add(WrapAuth(&auth.Auth{UID: "hard"}))
 	p.Cooldown("hard", CoolHard, time.Hour, "余额不足")
 	if got := p.Pick(); got != nil {
 		t.Fatalf("hard-cooled account must not be fallback-picked, got %+v", got)
@@ -1316,8 +1318,8 @@ func TestFallbackSkipsHardCooldown(t *testing.T) {
 func TestFallbackAllHardReturnsNil(t *testing.T) {
 	// 全 hard 冷却 → 无软冷却/熔断号可兜底 → 返回 nil。
 	p := New("")
-	p.Add(&auth.Auth{UID: "h1"})
-	p.Add(&auth.Auth{UID: "h2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "h1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "h2"}))
 	p.Cooldown("h1", CoolHard, time.Hour, "x")
 	p.Cooldown("h2", CoolHard, 2*time.Hour, "x")
 	if got := p.Pick(); got != nil {
@@ -1328,8 +1330,8 @@ func TestFallbackAllHardReturnsNil(t *testing.T) {
 func TestFallbackSoftAndBreakerParticipate(t *testing.T) {
 	// D3：soft 与 breaker 冷却号允许参与兜底，取最早到期者。
 	p := New("")
-	p.Add(&auth.Auth{UID: "soft"})
-	p.Add(&auth.Auth{UID: "brk"})
+	p.Add(WrapAuth(&auth.Auth{UID: "soft"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "brk"}))
 	p.Cooldown("soft", CoolSoft, 10*time.Minute, "429") // soft: until=10m, fails=1
 	p.SetBreaker(2, 5*time.Minute, 5*time.Minute)       // 阈值 2：soft 的 1 次失败不熔断
 	p.NoteError("brk")                                  // brk: fails=1
@@ -1338,14 +1340,14 @@ func TestFallbackSoftAndBreakerParticipate(t *testing.T) {
 	if got == nil {
 		t.Fatal("fallback should pick breaker (earliest) account")
 	}
-	if got.UID != "brk" {
+	if got.UID() != "brk" {
 		t.Fatalf("fallback should pick earliest expiry brk (5m < soft 10m), got %+v", got)
 	}
 }
 
 func TestFallbackNilWhenAllDisabled(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Disable("u1", "session dead")
 	if got := p.Pick(); got != nil {
 		t.Fatalf("want nil when all disabled, got %+v", got)
@@ -1372,8 +1374,8 @@ func (p *Pool) entryWeight(uid string) float64 {
 
 func TestWeightHighCreditsDominates(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "hi"})
-	p.Add(&auth.Auth{UID: "lo"})
+	p.Add(WrapAuth(&auth.Auth{UID: "hi"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "lo"}))
 	p.SetCredits("hi", 1000, 0)
 	p.SetCredits("lo", 10, 0)
 	wHi, wLo := p.entryWeight("hi"), p.entryWeight("lo")
@@ -1384,8 +1386,8 @@ func TestWeightHighCreditsDominates(t *testing.T) {
 
 func TestWeightIdleCompensation(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "used"})
-	p.Add(&auth.Auth{UID: "idle"})
+	p.Add(WrapAuth(&auth.Auth{UID: "used"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "idle"}))
 	p.SetCredits("used", 100, 0)
 	p.SetCredits("idle", 100, 0)
 	// used 1 小时前被选中过、idle 从未使用 → idle 权重更高（闲置补偿）。
@@ -1401,8 +1403,8 @@ func TestWeightIdleCompensation(t *testing.T) {
 func TestWeightAllZeroCreditsStillWeighted(t *testing.T) {
 	// credits 全 0：权重完全由 idle+successRate 决定，不退化均匀随机（仍可选出更高分者）。
 	p := New("")
-	p.Add(&auth.Auth{UID: "idle"})
-	p.Add(&auth.Auth{UID: "bursty"})
+	p.Add(WrapAuth(&auth.Auth{UID: "idle"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "bursty"}))
 	// idle 从未使用、bursty 半分钟前刚用过 → idle 权重更高。
 	p.mu.Lock()
 	p.byUID["bursty"].lastUsed = time.Now().Add(-30 * time.Second)
@@ -1419,7 +1421,7 @@ func TestWeightTopFiveSelectionChanges(t *testing.T) {
 	// 即使 credits 排序里 b 在前（Top5 内权重排序可与 credits 排序不同）。
 	p := New("")
 	for _, u := range []string{"a", "b"} {
-		p.Add(&auth.Auth{UID: u})
+		p.Add(WrapAuth(&auth.Auth{UID: u}))
 	}
 	p.SetCredits("a", 90, 0) // a credits 略低，但久置
 	p.SetCredits("b", 100, 0)
@@ -1438,7 +1440,7 @@ func TestWeightTopFiveSelectionChanges(t *testing.T) {
 
 func TestAcquireReleaseLifecycle(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetMaxInFlight(2)
 	if !p.Acquire("u1") {
 		t.Fatal("first acquire should succeed")
@@ -1457,7 +1459,7 @@ func TestAcquireReleaseLifecycle(t *testing.T) {
 
 func TestAcquireUnlimited(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	// max=0 不限：连续 acquire 永不拒绝。
 	for i := 0; i < 100; i++ {
 		if !p.Acquire("u1") {
@@ -1477,21 +1479,21 @@ func TestAcquireUnknownUID(t *testing.T) {
 func TestPickSkipsInFlightFull(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
-	p.Add(&auth.Auth{UID: "full"})
-	p.Add(&auth.Auth{UID: "free"})
+	p.Add(WrapAuth(&auth.Auth{UID: "full"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "free"}))
 	p.SetCredits("full", 1000, 0)
 	p.SetCredits("free", 1, 0)
 	p.SetMaxInFlight(1)
 	// full 占满唯一名额 → Pick 应跳过它，选 free（即使 credits 更低）。
 	p.Acquire("full")
 	got := p.Pick()
-	if got == nil || got.UID != "free" {
+	if got == nil || got.UID() != "free" {
 		t.Fatalf("pick should skip in-flight-full account, got %+v", got)
 	}
 	p.Release("full")
 	// 释放后可重新被选中（确定性随机源 r=0 → 选 credits 最高的 full）。
 	p.SetRandomSource(func(n int64) int64 { return 0 })
-	if got := p.Pick(); got == nil || got.UID != "full" {
+	if got := p.Pick(); got == nil || got.UID() != "full" {
 		t.Fatalf("after release full should be pickable, got %+v", got)
 	}
 	p.Release("full")
@@ -1499,7 +1501,7 @@ func TestPickSkipsInFlightFull(t *testing.T) {
 
 func TestInFlightCountNotExceedLimit(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetMaxInFlight(2)
 
 	// 并发 50 次 acquire：CAS 保证任一时刻在途数不超上限；每次成功后立即 release。
@@ -1543,7 +1545,7 @@ func TestLoadLegacyStateFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "legacy"})
+	p.Add(WrapAuth(&auth.Auth{UID: "legacy"}))
 	st, ok := p.Status("legacy")
 	if !ok {
 		t.Fatal("legacy account should load")
@@ -1590,7 +1592,7 @@ func TestSaveMirrorsSnapshot(t *testing.T) {
 	p := New(fp)
 	ms := &memStore{}
 	p.SetStore(ms)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetCredits("u1", 42, 0)
 	p.Flush()
 	ms.mu.Lock()
@@ -1667,7 +1669,7 @@ func TestRestoreNoRedisUsesLocal(t *testing.T) {
 
 func TestStatusExposesRuntimeFields(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetMaxInFlight(2)
 	p.Acquire("u1") // in_flight=1
 	st, _ := p.Status("u1")
@@ -1685,7 +1687,7 @@ func TestStatusExposesRuntimeFields(t *testing.T) {
 
 func TestRecordTokenUsage(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	before := time.Now()
 	p.RecordTokenUsage("u1", TokenUsageDelta{
 		Model:               "glm-5.2",
@@ -1723,7 +1725,7 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.RecordTokenUsage("u1", TokenUsageDelta{
 		Model:               "deepseek-v4",
 		HasPromptTokens:     true,
@@ -1739,7 +1741,7 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 	})
 	p.Flush()
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	st, ok := p2.Status("u1")
 	if !ok {
 		t.Fatal("account missing after reload")
@@ -1765,9 +1767,9 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 func TestPickPrefersExpiringByVirtualWeight(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
-	p.Add(&auth.Auth{UID: "later"})
-	p.Add(&auth.Auth{UID: "soon"})
-	p.Add(&auth.Auth{UID: "none"})
+	p.Add(WrapAuth(&auth.Auth{UID: "later"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "soon"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "none"}))
 
 	now := time.Now()
 	p.SetCreditsDetailed("later", 100, 100, 100, now.Add(48*time.Hour), 100)
@@ -1784,7 +1786,7 @@ func TestPickPrefersExpiringByVirtualWeight(t *testing.T) {
 		if got == nil {
 			t.Fatal("pick returned nil")
 		}
-		counts[got.UID]++
+		counts[got.UID()]++
 	}
 	expiring := counts["soon"] + counts["later"]
 	if expiring < 1500 || counts["none"] == 0 {
@@ -1795,8 +1797,8 @@ func TestPickPrefersExpiringByVirtualWeight(t *testing.T) {
 func TestPickExpiringTieUsesExistingWeight(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
-	p.Add(&auth.Auth{UID: "small"})
-	p.Add(&auth.Auth{UID: "large"})
+	p.Add(WrapAuth(&auth.Auth{UID: "small"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "large"}))
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 
 	at := time.Now().Add(time.Hour)
@@ -1804,15 +1806,15 @@ func TestPickExpiringTieUsesExistingWeight(t *testing.T) {
 	p.SetCreditsDetailed("large", 50, 50, 50, at, 50)
 
 	got := p.Pick()
-	if got == nil || got.UID != "large" {
+	if got == nil || got.UID() != "large" {
 		t.Fatalf("pick=%v want large", got)
 	}
 }
 
 func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "a"})
-	p.Add(&auth.Auth{UID: "b"})
+	p.Add(WrapAuth(&auth.Auth{UID: "a"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "b"}))
 	now := time.Now()
 	p.SetCreditsDetailed("a", 100, 100, 50, now.Add(time.Hour), 50)
 	p.SetCreditsDetailed("b", 100, 100, 0, time.Time{}, 0)
@@ -1838,7 +1840,7 @@ func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 
 func TestCreditExpirySnapshotConsumptionAndClear(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	now := time.Now()
 	p.SetCreditsDetailed("u1", 100, 100, 50, now.Add(time.Hour), 40)
 
@@ -1873,7 +1875,7 @@ func TestCreditExpirySnapshotConsumptionAndClear(t *testing.T) {
 //  3. state.json / Redis 快照往返不丢批次，重启后首页快照仍与「检查」同口径。
 func TestExpiryBucketsFEFOAndPersistence(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	now := time.Now()
 	at1 := now.Add(24 * time.Hour)
 	at2 := now.Add(48 * time.Hour)
@@ -1929,7 +1931,7 @@ func TestExpiryBucketsFEFOAndPersistence(t *testing.T) {
 // TestPauseExitsRouting 暂停号退出选号（Pick 含全冷却兜底都不参与）。
 func TestPauseExitsRouting(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	if !p.Pause("u1") {
 		t.Fatal("Pause 对存在的账号应返回 true")
 	}
@@ -1948,7 +1950,7 @@ func TestPauseExitsRouting(t *testing.T) {
 // TestPauseExcludesFromFallback 全冷却兜底同样不捞回暂停号（与 disabled 同口径）。
 func TestPauseExcludesFromFallback(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Pause("u1")
 	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limited") // 迫使命中兜底路径
 	if got := p.Pick(); got != nil {
@@ -1959,7 +1961,7 @@ func TestPauseExcludesFromFallback(t *testing.T) {
 // TestResumeRestoresRouting 解除暂停后立刻回到池子（无需重登或解冻）。
 func TestResumeRestoresRouting(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Pause("u1")
 	if !p.Resume("u1") {
 		t.Fatal("Resume 对存在的账号应返回 true")
@@ -1967,7 +1969,7 @@ func TestResumeRestoresRouting(t *testing.T) {
 	if st, _ := p.Status("u1"); st.Paused {
 		t.Errorf("Resume 后 Paused 应为 false: %+v", st)
 	}
-	if got := p.Pick(); got == nil || got.UID != "u1" {
+	if got := p.Pick(); got == nil || got.UID() != "u1" {
 		t.Errorf("Resume 后应可选, got %+v", got)
 	}
 }
@@ -1976,7 +1978,7 @@ func TestResumeRestoresRouting(t *testing.T) {
 // disable 是终态故清冷却，pause 是临时态故保留观测（恢复后仍有效）。
 func TestPauseDoesNotTouchCoolingDomain(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limited")
 	p.Pause("u1")
 	st, _ := p.Status("u1")
@@ -1988,7 +1990,7 @@ func TestPauseDoesNotTouchCoolingDomain(t *testing.T) {
 // TestDisableClearsPaused 禁用是比暂停更强的终态：二者不叠加。
 func TestDisableClearsPaused(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Pause("u1")
 	p.Disable("u1", "12153 session dead")
 	st, _ := p.Status("u1")
@@ -2003,7 +2005,7 @@ func TestDisableClearsPaused(t *testing.T) {
 // TestReviveClearsPaused 运维「解冻」是全清：paused 一并解除。
 func TestReviveClearsPaused(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Pause("u1")
 	if !p.Revive("u1") {
 		t.Fatal("Revive 应返回 true")
@@ -2011,7 +2013,7 @@ func TestReviveClearsPaused(t *testing.T) {
 	if st, _ := p.Status("u1"); st.Paused {
 		t.Errorf("Revive 应清 paused: %+v", st)
 	}
-	if got := p.Pick(); got == nil || got.UID != "u1" {
+	if got := p.Pick(); got == nil || got.UID() != "u1" {
 		t.Errorf("Revive 后应可选, got %+v", got)
 	}
 }
@@ -2021,12 +2023,12 @@ func TestPausePersists(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.Pause("u1")
 	p.Flush()
 
 	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
+	p2.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	if st, _ := p2.Status("u1"); !st.Paused {
 		t.Errorf("重载后 Paused 应保持: %+v", st)
 	}
@@ -2049,7 +2051,7 @@ func TestPauseUnknownUIDReturnsFalse(t *testing.T) {
 // TestResumeIdempotent 对未暂停账号 Resume 是空操作（幂等，不改变状态）。
 func TestResumeIdempotent(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	if !p.Resume("u1") {
 		t.Fatal("Resume 幂等应返回 true")
 	}

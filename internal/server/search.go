@@ -19,6 +19,8 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 )
 
 // searchToolLabel 搜索流量在请求日志「模型」列里的标识。
@@ -61,9 +63,15 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 	var lastKind upstream.ErrKind
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		acct := h.cfg.Pool.PickExcluding(tried)
-		if acct == nil {
+		acc := h.cfg.Pool.PickExcluding(tried)
+		if acc == nil {
 			break
+		}
+		// 搜索是 CodeBuddy 专有能力：非该上游的账号直接跳过（换下一个）。
+		acct := pool.UnwrapAuth(acc)
+		if acct == nil {
+			tried[acc.UID()] = true
+			continue
 		}
 		tried[acct.UID] = true
 		// 在途租约：与 chat 共用同一名额池。搜索也是真实上游调用，不占名额会让

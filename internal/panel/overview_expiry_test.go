@@ -22,7 +22,7 @@ func TestOverviewIncludesExpiryBuckets(t *testing.T) {
 	sch.RunBalanceRefreshNow() // 空池 → 不打上游，只落完成时刻
 
 	p := New(Config{Version: "test", Pool: pl, Scheduler: sch})
-	pl.Add(&auth.Auth{UID: "u1", Nickname: "n1"})
+	pl.Add(pool.WrapAuth(&auth.Auth{UID: "u1", Nickname: "n1"}))
 	now := time.Now()
 	at1 := now.Add(24 * time.Hour)
 	at2 := now.Add(48 * time.Hour)
