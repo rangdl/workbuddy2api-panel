@@ -387,15 +387,28 @@ setTimeout(() => {
 }, 0);
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
+/* 表格重渲染的防抖：轮询每 5 秒拿一次 overview，绝大多数轮次的账号状态没有变化。
+   但 innerHTML 整体替换会让浏览器丢弃并重建整棵子树——移动端每行是 12 列 grid
+   卡片（mobile.css），重建一次就是整屏闪一下；桌面端也会丢失 hover / 焦点 / 文本选区。
+   故先比对渲染结果字符串，一致就完全不碰 DOM。 */
+const lastTableHTML = new Map();
+function setTableHTML(el, html) {
+  if (!el) return;
+  const key = el.id || el;
+  if (lastTableHTML.get(key) === html) return; // 内容没变 → 不重建，不闪
+  lastTableHTML.set(key, html);
+  el.innerHTML = html;
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    setTableHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>');
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
   const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
-  tb.innerHTML = list.map(s => {
+  const html = list.map(s => {
     const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
     const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
@@ -471,6 +484,7 @@ function renderAccounts(list) {
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
   }).join('');
+  setTableHTML(tb, html);
 }
 
 // renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。
@@ -480,7 +494,7 @@ function renderModelLocks(rows) {
   if (!tb) return;
   const note = $('mlNote');
   if (!rows || !rows.length) {
-    tb.innerHTML = '<tr><td colspan="8"><div class="empty">当前没有模型级限流 —— 所有模型均可选</div></td></tr>';
+    setTableHTML(tb, '<tr><td colspan="8"><div class="empty">当前没有模型级限流 —— 所有模型均可选</div></td></tr>');
     if (note) note.textContent = '';
     return;
   }
@@ -489,7 +503,7 @@ function renderModelLocks(rows) {
     const ms = parseAPITime(iso);
     return ms ? dur(Math.max(0, Math.round((ms - Date.now()) / 1000))) : '—';
   };
-  tb.innerHTML = rows.map(r => {
+  setTableHTML(tb, rows.map(r => {
     const st = STATE[r.state] || ['mute', r.state || '—'];
     const realm = r.realm === 'global' ? '国际版' : '国内版';
     return '<tr>' +
@@ -502,7 +516,7 @@ function renderModelLocks(rows) {
       '<td class="num">' + left(r.fully_unlock_at) + '</td>' +
       '<td>' + (r.reason ? '<div class="note">' + esc(r.reason) + '</div>' : '—') + '</td>' +
       '</tr>';
-  }).join('');
+  }).join(''));
   if (note) {
     const bad = rows.filter(r => r.state === 'locked' || r.state === 'starved').length;
     note.textContent = bad ? bad + ' 个模型整池不可用' : rows.length + ' 个模型部分限流';
@@ -941,17 +955,98 @@ $('mdReset').onclick = resetModelFilter;
 $('btnModels').onclick = loadModels;
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
+/* 日志分页模型：
+   - 默认只拉最新 LOG_PAGE_SIZE 条（不再一次渲染 500 行，移动端尤其吃不住）；
+   - 轮询只刷新「最新一页」，已往回翻的历史页保持不动；
+   - 点「更早」用 next_cursor 游标往前翻，追加到列表顶部；
+   - 频道与关键词筛选下推到服务端，避免「本地筛已拉取的几十条」导致漏结果。 */
+const LOG_PAGE_SIZE = 50;
 let logCh = 'all';
+let logQ = '';
+let logCursor = 0;        // 0 = 最新一页；非 0 = 正在看历史页
+let logNextCursor = 0;    // 服务端返回的「更早」游标，0 = 没有更多
+let logEntries = [];      // 当前已加载的日志（时间升序）
+let logQTimer = null;
+
+// logQuery 组装日志接口参数（筛选与分页都下推到服务端）。
+function logQuery(pageLimit) {
+  const p = new URLSearchParams();
+  p.set('limit', String(pageLimit || LOG_PAGE_SIZE));
+  if (logCh !== 'all') p.set('ch', logCh);
+  if (logQ.trim()) p.set('q', logQ.trim());
+  if (logCursor) p.set('cursor', String(logCursor));
+  return p.toString();
+}
+
+// logRowHtml 单行日志。频道标签在「全部」视图下显示，单频道视图下省略。
+function logRowHtml(e) {
+  const lvl = /error|失败|错误/.test(e.text) ? ' e' : /warn|冷却|熔断/.test(e.text) ? ' w' : '';
+  const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+  const ch = logCh === 'all'
+    ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || esc(e.ch)) + '</i>'
+    : '';
+  return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
+}
+
+// renderLogBox 渲染日志区。
+// mode='append' 表示「更早」翻页：保持当前视口位置不动，新内容出现在上方。
+function renderLogBox(mode) {
+  const box = $('logBox');
+  if (!box) return;
+  // 刷新前记录锚点：只有「本来就在底部 + 看的是最新页」才自动跟随到底。
+  // 无条件滚到底会让用户翻历史或向上滚动查看时，被每 5 秒一次的轮询拽走。
+  const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
+  const before = box.scrollHeight;
+  box.innerHTML = logEntries.length
+    ? logEntries.map(logRowHtml).join('')
+    : '<span style="color:var(--ink-3)">' + (logQ || logCh !== 'all' ? '没有匹配的日志' : '暂无日志') + '</span>';
+  if (mode === 'append') {
+    // 内容往上长了多少，就把视口往下推多少 —— 用户正在看的那一行原地不动。
+    box.scrollTop += box.scrollHeight - before;
+  } else if (logPin && atEnd && !logCursor) {
+    box.scrollTop = box.scrollHeight;
+  }
+  const older = $('btnLogOlder');
+  if (older) { older.disabled = !logNextCursor; older.hidden = !logNextCursor; }
+}
+
+// renderLogNote 底部状态：命中总数 + 已加载条数。
+function renderLogNote(total) {
+  const el = $('logNote');
+  if (!el) return;
+  const loaded = logEntries.length;
+  const cond = [];
+  if (logCh !== 'all') cond.push({ task: '任务', chat: '对话', sys: '系统' }[logCh] || logCh);
+  if (logQ) cond.push('“' + logQ + '”');
+  const scope = cond.length ? cond.join(' · ') : '全部';
+  el.textContent = total == null
+    ? scope + ' · 已加载 ' + loaded + ' 条'
+    : scope + ' · 命中 ' + total + ' 条 · 已加载 ' + loaded + ' 条';
+}
+
 $('logChips').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-ch]');
   if (!b) return;
   logCh = b.dataset.ch;
   document.querySelectorAll('#logChips .chip').forEach(c => c.classList.toggle('on', c === b));
+  logCursor = 0;
   loadLogs();
 });
-async function loadLogs() {
-  const box = $('logBox');
-  const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
+if ($('logQ')) $('logQ').oninput = () => {
+  clearTimeout(logQTimer);
+  logQTimer = setTimeout(() => { logQ = $('logQ').value.trim(); logCursor = 0; loadLogs(); }, 200);
+};
+if ($('btnLogOlder')) $('btnLogOlder').onclick = () => {
+  if (!logNextCursor) return;
+  logCursor = logNextCursor;
+  loadLogs(true);
+};
+if ($('btnLogLatest')) $('btnLogLatest').onclick = () => {
+  logCursor = 0;
+  loadLogs();
+};
+
+async function loadLogs(append) {
   const limit = ($('reqLimit') && $('reqLimit').value) || 100;
   // 时间范围由归档侧过滤（不是前端筛已拉取的条目）：区间落在更早的时间段时，
   // 「最近 N 条」里根本不会有那些记录，必须让服务端按时间取。
@@ -959,7 +1054,7 @@ async function loadLogs() {
   rq.set('limit', limit);
   try {
     const [d, metrics, requestRows, credit] = await Promise.all([
-      api('logs'),
+      api('logs?' + logQuery()),
       api('request_metrics').catch(() => ({})),
       api('request_logs?' + rq.toString()).catch(() => ({ entries: [] })),
       api('credit_history?limit=' + creditLimitValue()).catch(() => null),
@@ -970,21 +1065,13 @@ async function loadLogs() {
     const archiveOn = !!(metrics && metrics.archive && metrics.archive.enabled);
     const recent = archiveOn ? (requestRows.entries || []) : (metrics.recent || []);
     renderRequestMetrics(metrics, recent);
-    const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
-    box.innerHTML = entries.length
-      ? entries.map(e => {
-        const lvl = /error|失败|错误/.test(e.text) ? ' e' : /warn|冷却|熔断/.test(e.text) ? ' w' : '';
-        const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
-        const ch = logCh === 'all' ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
-        return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
-      }).join('')
-      : '<span style="color:var(--ink-3)">暂无日志</span>';
-    if (logPin && atEnd) box.scrollTop = box.scrollHeight;
-    const counts = {};
-    for (const e of (d.entries || [])) counts[e.ch] = (counts[e.ch] || 0) + 1;
-    $('logNote').textContent = logCh === 'all'
-      ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
-      : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
+
+    const page = d.entries || [];
+    // 翻历史页：拼到已加载列表前面。轮询刷新最新页：整体替换。
+    logEntries = append ? page.concat(logEntries) : page;
+    logNextCursor = d.next_cursor || 0;
+    renderLogBox(append ? 'append' : 'replace');
+    renderLogNote(d.total);
     renderCreditHistory(credit);
   } catch (e) { /* 概览已提示 */ }
 }
@@ -1121,7 +1208,7 @@ function renderRequestTable() {
   const list = reqEntries.filter(e => reqMatch(e));
   const tb = $('reqBody');
   if (!tb) return;
-  tb.innerHTML = list.map(e => {
+  setTableHTML(tb, list.map(e => {
     const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
     const ip = e && e.client_ip ? e.client_ip : '';
     const ua = e && e.user_agent ? e.user_agent : '';
@@ -1139,7 +1226,7 @@ function renderRequestTable() {
       '<td>' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '</tr>';
   }).join('') || '<tr><td colspan="10" class="empty">' +
-      (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
+      (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>');
 
   const filtered = list.length !== reqEntries.length;
   // 归档里的旧条目没有来源字段（该功能上线前写入）：这时提示开关/历史原因，
@@ -2120,7 +2207,18 @@ if ($('btnCompClaimAll')) $('btnCompClaimAll').onclick = async () => {
 };
 
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
+/* 轮询节奏：桌面 5 秒，移动端 15 秒。
+   手机上每轮都要重新布局整屏（卡片模式下所有表格都是 block/grid），加上移动浏览器
+   的地址栏收放和合成层重绘，5 秒一次会让人眼看着页面在"抖"。数据本身没有这么强的
+   实时性要求，15 秒足够；用户下拉刷新或点「刷新」仍会立刻拉取。
+   两处都读同一个常量，避免以后改一处漏一处。 */
+const POLL_MS_DESKTOP = 5000;
+const POLL_MS_MOBILE = 15000;
+const POLL_MS = (window.matchMedia && matchMedia('(max-width: 760px)').matches) ? POLL_MS_MOBILE : POLL_MS_DESKTOP;
+
 function refreshVisible() {
+  // 页面在后台时不轮询：移动端切走再切回来会一次性补一堆渲染，白闪一下。
+  if (document.hidden) return;
   if (view === 'accounts') { loadOverview(true); renderCachedCompensation(); }
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') reattachQueueView();
@@ -2129,7 +2227,9 @@ function start() {
   loadOverview(true);
   loadCompensation();                       // 补偿状态：首次进页面查一次（之后靠新鲜窗口）
   if (refTimer) clearInterval(refTimer);
-  refTimer = setInterval(refreshVisible, 5000);
+  refTimer = setInterval(refreshVisible, POLL_MS);
+  // 从后台切回前台立刻补一次（上面在后台时是跳过的），不必等满一个周期。
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshVisible(); });
   checkAuthGate();
 }
 async function checkAuthGate() {

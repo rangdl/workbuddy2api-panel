@@ -355,9 +355,33 @@ func (p *Panel) balanceRefreshedAt() time.Time {
 	return p.cfg.Scheduler.BalanceRefreshedAt()
 }
 
-// logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
+// logsHandler 返回日志环形缓冲。
+//
+// 无参数时保持旧行为（全量快照，时间升序）——面板之外的脚本可能依赖它。
+// 带 limit/cursor/ch/q 时走分页查询，返回 {entries, next_cursor, total}：
+//   - limit 默认由前端传；不带 limit 的请求仍返回全量
+//   - cursor 是上一页返回的 next_cursor，用于往回翻历史
+//   - ch 筛频道（task/chat/sys），q 为关键词（空格分词 AND）
 func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.Snapshot()})
+	q := r.URL.Query()
+	limitRaw, cursorRaw := q.Get("limit"), q.Get("cursor")
+	// 兼容路径：没有任何分页/筛选参数 → 全量快照。
+	if limitRaw == "" && cursorRaw == "" && q.Get("ch") == "" && q.Get("q") == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.Snapshot()})
+		return
+	}
+	var cur uint64
+	if cursorRaw != "" {
+		cur, _ = strconv.ParseUint(cursorRaw, 10, 64)
+	}
+	limit, _ := strconv.Atoi(limitRaw)
+	page := p.logs.Query(LogQuery{
+		Ch:     q.Get("ch"),
+		Q:      q.Get("q"),
+		Limit:  limit,
+		Cursor: cur,
+	})
+	writeJSON(w, http.StatusOK, page)
 }
 
 // requestMetrics 返回进程内请求指标、最近 100 条与归档状态。

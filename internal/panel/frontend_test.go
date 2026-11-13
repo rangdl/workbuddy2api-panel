@@ -1518,3 +1518,62 @@ process.stdout.write(JSON.stringify({
 			strings.TrimSpace(string(out)), want)
 	}
 }
+
+// 日志分页与筛选：参数必须正确下推到服务端，否则「只拉了 50 条再本地筛」
+// 会让人以为更早的日志不存在。
+func TestAppJSLogQuery(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; log query test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const LOG_PAGE_SIZE');
+const end = src.indexOf("$('logChips')");
+if (start < 0 || end < 0 || end < start) throw new Error('log helpers not found');
+const ctx = {
+  URLSearchParams, String, Number, Date, Array, Object, Math, Set,
+  document: { getElementById: () => null, querySelectorAll: () => [] },
+  $: () => null,
+  esc: s => String(s == null ? '' : s),
+  clearTimeout, setTimeout,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.logQuery=logQuery; this.setLog=s=>{logCh=s.ch||"all";logQ=s.q||"";logCursor=s.cursor||0;};' +
+  '\nthis.getState=()=>({entries:logEntries,next:logNextCursor});', ctx);
+const q = s => {
+  ctx.setLog(s || {});
+  return Object.fromEntries(new URLSearchParams(ctx.logQuery(s && s.limit)));
+};
+const eq = (name, got, want) => {
+  if (JSON.stringify(got) !== JSON.stringify(want))
+    throw new Error(name + ': got ' + JSON.stringify(got) + ' want ' + JSON.stringify(want));
+};
+// 默认只取一页，不带 ch/q/cursor
+eq('默认', q({}), { limit: '50' });
+// 单频道 + 关键词一起下推
+eq('筛选', q({ ch: 'task', q: ' 签到 失败 ' }), { limit: '50', ch: 'task', q: '签到 失败' });
+// 翻历史页带游标
+eq('翻页', q({ cursor: 123 }), { limit: '50', cursor: '123' });
+// 自定义页大小
+eq('页大小', q({ limit: 200 }), { limit: '200' });
+console.log('OK');
+`
+	f, err := os.CreateTemp(t.TempDir(), "log-query-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("log query test failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "OK") {
+		t.Fatalf("unexpected output: %s", out)
+	}
+}

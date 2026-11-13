@@ -305,6 +305,8 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 #logBox .ln { display: block; }
 #logBox .ln.e { color: var(--bad); }
 #logBox .ln.w { color: var(--warn); }
+/* 日志关键词筛选框：收窄成内容宽，避免把 header 里的 chips / 按钮挤到换行。 */
+.log-q { width: 150px; flex: none; padding: 4px 9px; font-size: 12.5px; }
 #view-logs .box > header { flex-wrap: wrap; }
 #reqSummary, #reqNote { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #reqSummary { flex: 1 1 320px; }
@@ -1350,13 +1352,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <header>
           <h3>运行日志</h3>
           <span class="grow"></span>
+          <input id="logQ" type="search" class="log-q" placeholder="筛选关键词" aria-label="筛选日志关键词">
           <span class="chips" id="logChips">
             <button class="xs chip on" data-ch="all">全部</button>
             <button class="xs chip" data-ch="task">任务</button>
             <button class="xs chip" data-ch="chat">对话</button>
             <button class="xs chip" data-ch="sys">系统</button>
           </span>
-          <span class="note" id="logNote">最近 500 行</span>
+          <span class="note" id="logNote">—</span>
+          <button class="xs" id="btnLogOlder" hidden>更早</button>
+          <button class="xs" id="btnLogLatest">最新</button>
           <button class="xs" id="btnLogPin">自动滚动：开</button>
         </header>
         <pre id="logBox"></pre>
