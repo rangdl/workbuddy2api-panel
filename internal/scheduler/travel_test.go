@@ -715,6 +715,79 @@ func TestRunBlindboxNowDryRunDoesNotOpen(t *testing.T) {
 	}
 }
 
+// TestRunBlindboxNowReturnsPerAccountResults 面板要直接展示逐账号结果，
+// 不能只返回「已触发」——用户需要看到谁、能量多少、为什么不能开。
+func TestRunBlindboxNowReturnsPerAccountResults(t *testing.T) {
+	fastTravel(t)
+	stub := &travelStub{buddy: `{"id":7}`, state: `{"state":"idle","daily_limit_reached":true}`}
+	srv := stub.server()
+	defer srv.Close()
+
+	s, _ := newTravelScheduler(t, srv, "u1")
+	results := s.RunBlindboxNow(false, 5)
+
+	if len(results) != 1 {
+		t.Fatalf("results=%d want 1", len(results))
+	}
+	r := results[0]
+	if r.UID != "u1" {
+		t.Errorf("uid=%q want u1", r.UID)
+	}
+	if r.TravelState != "idle" {
+		t.Errorf("travel_state=%q want idle", r.TravelState)
+	}
+	// stub 的 quota 返回 balance=125 affordable=5 cost=10 max=5
+	if r.Energy != 125 || r.Affordable != 5 {
+		t.Errorf("energy=%d affordable=%d want 125/5", r.Energy, r.Affordable)
+	}
+	if r.WillOpen != 5 {
+		t.Errorf("will_open=%d want 5", r.WillOpen)
+	}
+	if r.Decision == "" {
+		t.Error("decision 不能为空（面板要展示不能开的原因）")
+	}
+	if r.Opened {
+		t.Error("dry-run 不应标记 opened")
+	}
+
+	// apply 后应带回奖品名与 opened 标记
+	results = s.RunBlindboxNow(true, 5)
+	if len(results) != 1 || !results[0].Opened {
+		t.Fatalf("apply 后 opened 应为 true: %+v", results)
+	}
+	if results[0].Prize == "" {
+		t.Error("apply 后应带回奖品名")
+	}
+}
+
+// TestRunBlindboxNowReportsBlockReason 不能开时要给出可读理由，而不是静默跳过。
+func TestRunBlindboxNowReportsBlockReason(t *testing.T) {
+	fastTravel(t)
+
+	t.Run("旅行中", func(t *testing.T) {
+		stub := &travelStub{buddy: `{"id":7}`, state: `{"state":"traveling","record_id":9,"arrive_at":9999999999}`}
+		srv := stub.server()
+		defer srv.Close()
+		s, _ := newTravelScheduler(t, srv, "u1")
+		r := s.RunBlindboxNow(false, 5)[0]
+		if r.WillOpen != 0 || !strings.Contains(r.Decision, "空闲") {
+			t.Errorf("traveling 应拒绝并说明原因: %+v", r)
+		}
+	})
+
+	t.Run("能量不足", func(t *testing.T) {
+		stub := &travelStub{buddy: `{"id":7}`, state: `{"state":"idle"}`}
+		stub.quota = `{"affordable":0,"balance":3,"cost_per_open":10,"max_open_count":5}`
+		srv := stub.server()
+		defer srv.Close()
+		s, _ := newTravelScheduler(t, srv, "u1")
+		r := s.RunBlindboxNow(false, 5)[0]
+		if r.WillOpen != 0 || !strings.Contains(r.Decision, "能量不足") {
+			t.Errorf("能量不足应拒绝并说明: %+v", r)
+		}
+	})
+}
+
 // TestTravelDueTime 待唤醒时刻换算：traveling 以「ArriveAt-ServerNow」为准（免疫本机
 // 时钟偏差）；arrived 立即触发（启动补跑）。
 func TestTravelDueTime(t *testing.T) {

@@ -137,44 +137,142 @@ func (s *Scheduler) travelOne(a *auth.Auth) {
 	}
 }
 
+// BlindboxResult 单账号盲盒处理结果（面板直接渲染，不让用户翻日志）。
+type BlindboxResult struct {
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname"`
+	// 当前状态
+	TravelState string `json:"travel_state"` // idle / traveling / arrived / unknown
+	Energy      int64  `json:"energy"`       // 能量余额
+	Affordable  int    `json:"affordable"`   // 上游算出的可开次数
+	CostPerOpen int64  `json:"cost_per_open"`
+	MaxOpen     int    `json:"max_open_count"`
+	// 决策
+	WillOpen int    `json:"will_open"` // 本次计划开几次（1..n；0 = 不开）
+	Decision string `json:"decision"`  // 给用户看的一句话理由
+	// 执行结果（apply 时）
+	Opened bool   `json:"opened"`
+	Prize  string `json:"prize,omitempty"`
+	Err    string `json:"error,omitempty"`
+}
+
 // RunBlindboxNow 手动触发一轮能量盲盒（面板按钮）。
 //
-// apply=false 为 dry-run：只查旅行状态 + quota 并打日志，不消耗任何能量——
-// 开盒不可逆，面板默认必须是 dry-run。apply=true 时才真正开盒（受 maxPerRun 约束）。
+// 同步执行并返回逐账号结果——面板要直接展示「谁、为什么能开/不能开、开了几次」，
+// 而不是让用户去日志里翻。账号间仍按 travelAccountDelay 限速，账号多时会慢，
+// 但这是用户在面板上主动点的操作，等几秒比拿不到结果好。
 //
-// 与自动链路的门控完全一致（走同一个 travelBlindBox）：旅行非 idle 跳过、
-// 能量不足跳过。区别只在于不派出、不受 travel_blindbox_enabled 开关限制
-// （手工触发是用户的明确意图）。
-func (s *Scheduler) RunBlindboxNow(apply bool, maxPerRun int) {
+// apply=false 为 dry-run：只查状态 + quota 并给出决策，不消耗任何能量。
+func (s *Scheduler) RunBlindboxNow(apply bool, maxPerRun int) []BlindboxResult {
 	if maxPerRun <= 0 {
 		maxPerRun = blindboxDefaultMaxPerRun
 	}
 	s.travelMu.Lock()
 	defer s.travelMu.Unlock()
-	first := true
-	for _, a := range s.travelAccounts() {
-		if !first {
+
+	accounts := s.travelAccounts()
+	results := make([]BlindboxResult, 0, len(accounts))
+	for i, a := range accounts {
+		if i > 0 {
 			time.Sleep(travelAccountDelay)
 		}
-		first = false
 		label := logfmt.Label(a.UID, a.NicknameValue())
+		r := BlindboxResult{UID: a.UID, Nickname: a.NicknameValue()}
+
 		ts, err := s.cfg.Upstream.TravelStatus(a)
 		if err != nil {
+			r.TravelState = "unknown"
+			r.Decision = "查询旅行状态失败"
+			r.Err = err.Error()
 			log.Printf("blindbox %s: status: %v", label, err)
+			results = append(results, r)
 			continue
 		}
-		if !apply {
-			q, err := s.cfg.Upstream.BuddyQuota(a)
-			if err != nil {
-				log.Printf("blindbox %s: quota: %v", label, err)
-				continue
+		r.TravelState = ts.State
+
+		q, err := s.cfg.Upstream.BuddyQuota(a)
+		if err != nil {
+			r.Decision = "查询能量配额失败"
+			r.Err = err.Error()
+			log.Printf("blindbox %s: quota: %v", label, err)
+			results = append(results, r)
+			continue
+		}
+		r.Energy, r.Affordable = q.Balance, q.Affordable
+		r.CostPerOpen, r.MaxOpen = q.CostPerOpen, q.MaxOpenCount
+
+		// 决策（与 travelBlindBox 同一套门控，这里展开成可展示的理由）
+		switch {
+		case ts.State != travelStateIdle:
+			r.Decision = "猫不在空闲状态（" + ts.State + "），需先领奖并结束旅行"
+		case q.Affordable <= 0:
+			r.Decision = "能量不足（需要 " + itoa(int(q.CostPerOpen)) + " 能量/次）"
+		default:
+			n := q.Affordable
+			if q.MaxOpenCount > 0 && n > q.MaxOpenCount {
+				n = q.MaxOpenCount
 			}
-			log.Printf("blindbox %s: [dry-run] travel=%s balance=%d affordable=%d cost=%d max=%d",
-				label, ts.State, q.Balance, q.Affordable, q.CostPerOpen, q.MaxOpenCount)
+			if n > maxPerRun {
+				n = maxPerRun
+			}
+			r.WillOpen = n
+			r.Decision = "可开 " + itoa(n) + " 次"
+			if q.Affordable > n {
+				r.Decision += "（受单趟上限钳制，剩余可下次再开）"
+			}
+		}
+
+		log.Printf("blindbox %s: travel=%s balance=%d affordable=%d cost=%d max=%d → %s",
+			label, r.TravelState, r.Energy, r.Affordable, r.CostPerOpen, r.MaxOpen, r.Decision)
+
+		if !apply || r.WillOpen <= 0 {
+			results = append(results, r)
 			continue
 		}
-		s.travelBlindBox(a, ts, maxPerRun)
+
+		raw, err := s.cfg.Upstream.BuddyOpen(a, r.WillOpen)
+		if err != nil {
+			r.Err = err.Error()
+			r.Decision += "；开盒失败"
+			log.Printf("blindbox %s: open failed: %v", label, err)
+			results = append(results, r)
+			continue
+		}
+		r.Opened = true
+		r.Prize = blindboxPrizeName(raw)
+		if r.Prize == "" {
+			r.Prize = "（未返回奖品名）"
+		}
+		if blindboxNeedsAddress(raw) {
+			r.Prize += "（实物奖，需到成长中心填写收件地址）"
+		}
+		log.Printf("blindbox %s: opened %d time(s) → %s", label, r.WillOpen, r.Prize)
+		results = append(results, r)
 	}
+	return results
+}
+
+// itoa 小工具（避免为几处拼接引入 strconv 依赖到本文件）。
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
 }
 
 // travelIdlePhase 空闲阶段：先开能量盲盒（服务端要求 idle），再派出。

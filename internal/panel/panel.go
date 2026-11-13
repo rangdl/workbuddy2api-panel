@@ -794,10 +794,14 @@ func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
-// blindboxAll 手动触发能量盲盒（异步执行）。
+// blindboxAll 手动触发能量盲盒（同步执行并返回逐账号结果）。
 //
 // 默认 dry-run（query `apply=1` 才真正开盒）：开盒消耗能量且不可逆，按钮的
-// 第一下必须是「只看 quota」，由用户确认能量与可开次数后再显式确认开盒。
+// 第一下必须是「只看配额」，由用户确认能量与可开次数后再显式确认开盒。
+//
+// 同步而非异步：面板要直接展示「哪个账号、能量多少、为什么不给开、开了几次」，
+// 让用户去日志里翻是推卸责任。账号数有限（个位数），限速 800ms/号，
+// 最坏几秒返回，可以接受。
 func (p *Panel) blindboxAll(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
@@ -810,13 +814,27 @@ func (p *Panel) blindboxAll(w http.ResponseWriter, r *http.Request) {
 			maxPerRun = n
 		}
 	}
-	go p.cfg.Scheduler.RunBlindboxNow(apply, maxPerRun)
+	results := p.cfg.Scheduler.RunBlindboxNow(apply, maxPerRun)
 	if apply {
-		log.Printf("panel: 手动开能量盲盒已触发（真实开盒）")
+		log.Printf("panel: 手动开能量盲盒完成（真实开盒，%d 个账号）", len(results))
 	} else {
-		log.Printf("panel: 手动能量盲盒已触发（dry-run，只查配额）")
+		log.Printf("panel: 手动能量盲盒完成（dry-run，%d 个账号）", len(results))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "apply": apply})
+	// 汇总供前端直接展示，不用它自己再算一遍。
+	var canOpen, opened int
+	for _, x := range results {
+		if x.WillOpen > 0 {
+			canOpen++
+		}
+		if x.Opened {
+			opened++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "apply": apply,
+		"total": len(results), "can_open": canOpen, "opened": opened,
+		"results": results,
+	})
 }
 
 // activityAll 手动触发全量活跃上报（异步执行；点亮连登 + 解锁领养前置）。

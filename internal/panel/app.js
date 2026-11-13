@@ -590,19 +590,88 @@ $('btnTravelAll').onclick = async () => {
   try { await api('travel_all', { method: 'POST' }); toast('旅行巡检已开始（含领养链路），结果见日志', 'ok'); }
   catch (e) { toast(e.message, 'err'); }
 };
-/* 能量盲盒：第一下只 dry-run（查配额打日志，不消耗能量），确认后再问一次才真正开盒。
-   dry-run 在服务端是异步跑的（账号多时限速约 800ms/号），等一小会儿再弹确认框，
-   让用户有机会先看到「运行日志 → 任务」里的 balance / affordable。 */
+/* 能量盲盒：两步确认。第一下 dry-run 同步返回逐账号结果（能量 / 可开次数 / 不能开的原因），
+   直接弹表格给用户看；确认后才真正开盒，开完再弹一次结果（含开出的奖品）。
+   结果不落日志——用户点按钮就该当场看到，而不是自己去翻「运行日志」。 */
 $('btnBlindboxAll').onclick = async () => {
+  const btn = $('btnBlindboxAll');
+  btn.disabled = true;
+  const restore = () => { btn.disabled = false; };
   try {
-    await api('blindbox_all', { method: 'POST' });
-    toast('盲盒配额查询已开始（dry-run，未消耗能量），结果见日志', 'ok');
-    await new Promise(r => setTimeout(r, 3000));
-    if (!confirm('dry-run 已触发：请先到「运行日志 → 任务」确认各账号的 blindbox ... quota 行。\n\n确认现在真正开盒？每次开盒消耗 energy 且不可逆。')) return;
-    await api('blindbox_all?apply=1', { method: 'POST' });
-    toast('能量盲盒开盒已开始，结果见日志', 'ok');
-  } catch (e) { toast(e.message, 'err'); }
+    toast('正在查询各账号能量配额…', 'ok');
+    const d = await api('blindbox_all', { method: 'POST' });
+    restore();
+    showBlindboxDialog(d, false);
+  } catch (e) { restore(); toast(e.message, 'err'); }
 };
+
+/* renderBlindboxRows 逐账号一行：昵称 / 状态 / 能量 / 可开次数 / 结论 */
+function renderBlindboxRows(d) {
+  const rows = d.results || [];
+  if (!rows.length) return '<div class="state">没有可用账号</div>';
+  return '<div class="tbl-wrap"><table class="acc md"><thead><tr>' +
+    '<th>账号</th><th>旅行状态</th><th>能量</th>' +
+    '<th>可开</th><th>结论</th></tr></thead><tbody>' +
+    rows.map(r => {
+      const stateMap = { idle: '空闲', traveling: '旅行中', arrived: '已到站', unknown: '未知' };
+      const st = stateMap[r.travel_state] || r.travel_state || '—';
+      const canOpen = r.will_open > 0;
+      const cls = r.error ? 'c-err' : canOpen ? 'c-ok' : '';
+      const tail = r.error ? esc(r.error)
+        : r.opened ? '已开 ' + r.will_open + ' 次 → ' + esc(r.prize || '')
+        : esc(r.decision || '');
+      return '<tr>' +
+        '<td>' + esc(r.nickname || r.uid.slice(0, 8)) + '</td>' +
+        '<td>' + esc(st) + '</td>' +
+        '<td>' + (r.energy || 0) + '</td>' +
+        '<td>' + (r.will_open || 0) + '</td>' +
+        '<td class="' + cls + '">' + tail + '</td>' +
+        '</tr>';
+    }).join('') + '</tbody></table></div>';
+}
+
+/* showBlindboxDialog 弹出盲盒结果；dry-run 时附带「确认开盒」按钮 */
+function showBlindboxDialog(d, applied) {
+  const canOpen = d.can_open || 0;
+  const title = applied
+    ? '已开盒 — ' + (d.opened || 0) + ' / ' + (d.total || 0) + ' 个账号成功'
+    : '能量盲盒配额 — ' + canOpen + ' / ' + (d.total || 0) + ' 个账号可开';
+  const veil = document.createElement('div');
+  veil.className = 'veil';
+  veil.style.display = 'flex';
+  veil.innerHTML = '<div class="dlg" style="width:820px">' +
+    '<header><h3>' + esc(title) + '</h3>' +
+    '<div class="hint">' + (applied
+      ? '开盒结果见下表。实物奖需自行到成长中心填写收件地址。'
+      : '这是 dry-run，未消耗任何能量。确认无误后再点「确认开盒」。') + '</div></header>' +
+    '<div class="body">' + renderBlindboxRows(d) + '</div>' +
+    '<footer><span class="grow"></span>' +
+    (applied || canOpen <= 0
+      ? '<button data-act="close">关闭</button>'
+      : '<button data-act="close">取消</button><button class="primary" data-act="apply">确认开盒（消耗能量，不可逆）</button>') +
+    '</footer></div>';
+  document.body.appendChild(veil);
+  const close = () => veil.remove();
+  veil.addEventListener('click', async (ev) => {
+    const t = ev.target.closest('[data-act]');
+    if (!t) { if (ev.target === veil) close(); return; }
+    if (t.dataset.act === 'close') return close();
+    if (t.dataset.act === 'apply') {
+      t.disabled = true;
+      t.textContent = '开盒中…';
+      try {
+        const r = await api('blindbox_all?apply=1', { method: 'POST' });
+        close();
+        showBlindboxDialog(r, true);
+        toast('开盒完成：' + (r.opened || 0) + ' 个账号成功', 'ok');
+      } catch (e) {
+        t.disabled = false;
+        t.textContent = '确认开盒（消耗能量，不可逆）';
+        toast(e.message, 'err');
+      }
+    }
+  });
+}
 $('btnActivityAll').onclick = async () => {
   try { await api('activity_all', { method: 'POST' }); toast('活跃上报已开始，结果见日志', 'ok'); }
   catch (e) { toast(e.message, 'err'); }
