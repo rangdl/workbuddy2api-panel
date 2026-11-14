@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	backendtrae "github.com/linguo2625469/workbuddy2api-panel/internal/backend/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -217,16 +218,19 @@ func (p *Panel) traeCheckinStatus(w http.ResponseWriter, r *http.Request) {
 // 的账号仍会被打上游请求。
 //
 // 过滤规则与调度器一致：Disabled 的跳过（暂停选号不影响，保号任务照常）。
+// 账号对象取自 Pool.AccountsByBackend（与上游无关的池 API），凭证经
+// backendtrae.Unwrap 取回——不再用 cfg.AccountByUID 绕道配置文件。
 func (p *Panel) poolTraeAccounts(cfg *trae.Config) []*trae.Account {
 	if p.cfg.Pool == nil || cfg == nil {
 		return nil
 	}
-	out := make([]*trae.Account, 0, len(cfg.Accounts))
-	for _, st := range p.cfg.Pool.List() {
-		if st.Backend != pool.BackendTrae || st.Disabled {
+	accs := p.cfg.Pool.AccountsByBackend(pool.BackendTrae)
+	out := make([]*trae.Account, 0, len(accs))
+	for _, acc := range accs {
+		if st, ok := p.cfg.Pool.Status(acc.UID()); ok && st.Disabled {
 			continue
 		}
-		if a := cfg.AccountByUID(st.UID); a != nil && a.AccessToken != "" {
+		if a := backendtrae.Unwrap(acc); a != nil && a.AccessToken != "" {
 			out = append(out, a)
 		}
 	}

@@ -47,12 +47,20 @@ func (x Account) Credential() any {
 }
 
 // Unwrap 取出原始账号。
+//
+// 与 codebuddy.Unwrap 同口径：除本包 Account 外，也认 gateway.CredentialUnwrapper
+// （占位/测试路径上的账号走这条），避免「只认具体类型」导致的静默 nil。
 func Unwrap(acc gateway.Account) *traepkg.Account {
-	if a, ok := acc.(Account); ok {
+	switch a := acc.(type) {
+	case Account:
+		return a.A
+	case *Account:
 		return a.A
 	}
-	if a, ok := acc.(*Account); ok {
-		return a.A
+	if u, ok := acc.(gateway.CredentialUnwrapper); ok {
+		if a, ok := u.Credential().(*traepkg.Account); ok {
+			return a
+		}
 	}
 	return nil
 }

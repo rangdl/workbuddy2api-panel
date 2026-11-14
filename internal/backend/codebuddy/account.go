@@ -107,12 +107,23 @@ func (x Account) Credential() any {
 }
 
 // Unwrap 取出原始凭证（非本 backend 的账号返回 nil）。
+//
+// 两条路径都要认：
+//   - 生产路径的账号是本包的 Account（backend 换装后入池）；
+//   - 测试/占位路径的账号是 pool.authAdapter，它通过 gateway.CredentialUnwrapper
+//     暴露凭证。只认第一种的话，把 CodeBuddy 切到 Backend.Chat 后所有测试账号
+//     会集体解不出凭证（nil）——表现为「测试全挂但生产正常」这种最难查的形态。
 func Unwrap(acc gateway.Account) *auth.Auth {
-	if a, ok := acc.(Account); ok {
+	switch a := acc.(type) {
+	case Account:
+		return a.A
+	case *Account:
 		return a.A
 	}
-	if a, ok := acc.(*Account); ok {
-		return a.A
+	if u, ok := acc.(gateway.CredentialUnwrapper); ok {
+		if a, ok := u.Credential().(*auth.Auth); ok {
+			return a
+		}
 	}
 	return nil
 }
