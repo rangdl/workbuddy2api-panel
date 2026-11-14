@@ -66,6 +66,12 @@ func WrapAuths(list []*auth.Auth) []gateway.Account {
 // BackendCodeBuddy CodeBuddy 上游标识。
 const BackendCodeBuddy = "codebuddy"
 
+// BackendTrae Trae 上游标识。
+//
+// 与 backend/trae.Name 同值。这里重复定义一份是为了让 pool/scheduler 不必
+// import 具体 backend 包（依赖方向：pool 只认 gateway，不认某个上游）。
+const BackendTrae = "trae"
+
 // placeholderAccount 构造一个「只有身份、没有凭证」的占位账号。
 //
 // 用途：applyAccountsLocked 恢复持久化状态时，需要先建 entry 承载

@@ -66,6 +66,10 @@ type Config struct {
 	// 的任务奖励领掉，不跑任何行为链路）。与 GrowthHook 同款延迟挂载；nil 时
 	// ticker 到点跳过。见 issue #174：成长队列与「一键完成」都不负责这条补领链路。
 	TaskSweepHook func()
+
+	// Trae Trae 签到与余额适配（main 注入；nil = 无 Trae 上游）。
+	// 见 trae.go：Trae 账号在同一个池里，签到也走同一套排程与冷却。
+	Trae TraeCheckiner
 }
 
 // Scheduler 调度器。
@@ -527,6 +531,12 @@ func (s *Scheduler) RunCheckinNow() {
 		if st.Disabled && !includeDisabled {
 			continue
 		}
+		// Trae 账号与 CodeBuddy 在同一个池里：它们走 gateway 选号/转发，但凭证
+		// 形态与协议完全不同（AuthByUID 对非 CodeBuddy 返回 nil）。Trae 的签到
+		// 由 RunTraeCheckinNow 在下方统一处理，这里跳过以免被"无凭证"静默吞掉。
+		if st.Backend == pool.BackendTrae {
+			continue
+		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
@@ -575,6 +585,8 @@ func (s *Scheduler) RunCheckinNow() {
 			ExpiryBuckets:     poolExpiryBuckets(buckets),
 		})
 	}
+	// Trae 账号走同一套签到排程（同一时点、同一份池状态），只是协议链路不同。
+	s.RunTraeCheckinNow(context.Background())
 	s.RunStreakBonusNow()
 }
 

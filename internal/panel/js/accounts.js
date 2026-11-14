@@ -381,17 +381,49 @@ function openAdd() {
   $('importDone').hidden = true; $('importErr').hidden = true;
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
   $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
+  // 每次打开都回到 CodeBuddy 默认，避免上次选的 Trae 让用户以为加错了上游。
+  const cb = document.querySelector('input[name="addUpstream"][value="codebuddy"]');
+  if (cb) cb.checked = true;
+  if ($('addTraeCallback')) $('addTraeCallback').value = '';
+  if ($('addTraeFinish')) $('addTraeFinish').hidden = true;
+  syncAddUpstreamUi();
   stopPoll();
 }
+function addUpstream() {
+  return (document.querySelector('input[name="addUpstream"]:checked') || {}).value || 'codebuddy';
+}
+// 按上游切换登录区：Trae 用「粘贴回调 URL」完成兑换，CodeBuddy 用轮询自动检测。
+// 两种账号进的是同一个池，只有登录链路不同，所以收在同一个弹窗里。
+function syncAddUpstreamUi() {
+  const trae = addUpstream() === 'trae';
+  if ($('addPick')) $('addPick').hidden = trae;        // Trae 无 cn/global 选择
+  if ($('addPoll')) $('addPoll').hidden = trae;        // Trae 不会自动轮询到结果
+  if ($('addTraeFinish')) $('addTraeFinish').hidden = !trae;
+  if ($('btnCopyUrl')) $('btnCopyUrl').hidden = true;
+  if ($('btnOpenUrl')) $('btnOpenUrl').hidden = true;
+  if ($('btnStartLogin')) {
+    $('btnStartLogin').hidden = false;
+    $('btnStartLogin').disabled = false;
+    $('btnStartLogin').textContent = trae ? '获取 Trae 授权链接' : '获取授权链接';
+  }
+  if ($('addDone')) $('addDone').hidden = true;
+  if ($('addErr')) $('addErr').hidden = true;
+}
+document.querySelectorAll('input[name="addUpstream"]').forEach(b => {
+  b.onchange = syncAddUpstreamUi;
+});
 function switchAddTab(tab) {
   document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
   $('addTabLogin').hidden = tab !== 'login';
   $('addTabImport').hidden = tab !== 'import';
+  // 导入 JSON 只支持 CodeBuddy 的 cockpit 格式。
+  if ($('addUpstream')) $('addUpstream').hidden = tab !== 'login';
 }
 document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
 });
 function startAddLogin() {
+  if (addUpstream() === 'trae') { startAddTraeLogin(); return; }
   const realm = (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
   $('btnStartLogin').disabled = true;
   $('addLoad').hidden = false; $('addErr').hidden = true;
@@ -403,6 +435,32 @@ function startAddLogin() {
     $('btnStartLogin').hidden = true;
     $('btnCopyUrl').hidden = false; $('btnOpenUrl').hidden = false;
     loginTimer = setInterval(pollLogin, 3000);
+  }).catch(e => {
+    $('addLoad').hidden = true;
+    $('btnStartLogin').disabled = false;
+    $('addErr').hidden = false;
+    $('addErr').textContent = e.message;
+  });
+}
+// startAddTraeLogin Trae 授权：生成链接后由用户粘贴回调 URL 完成兑换。
+function startAddTraeLogin() {
+  $('btnStartLogin').disabled = true;
+  $('addLoad').hidden = false; $('addErr').hidden = true;
+  api('trae/login/start', { method: 'POST', body: '{}' }).then(d => {
+    $('addUrl').textContent = d.url;
+    $('addLoad').hidden = true; $('addReady').hidden = false;
+    $('btnStartLogin').hidden = true;
+    $('btnCopyUrl').hidden = false;
+    $('addTraeFinish').hidden = false;
+    const src = {
+      storage: '来自 storage.json',
+      explicit: '手动指定',
+      imported: '沿用已导入设备',
+      shared: '与已有账号共用，一天只有一个能签成',
+      generated: '自动生成，登录会被拒（20405）',
+    }[d.device_source] || d.device_source;
+    if (d.warning) toast(d.warning, 'warn');
+    else toast('授权链接已生成（设备 ' + (d.device_id || '') + ' · ' + src + '）', 'ok');
   }).catch(e => {
     $('addLoad').hidden = true;
     $('btnStartLogin').disabled = false;
@@ -432,6 +490,25 @@ async function pollLogin() {
 function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
+// Trae 第二阶段：用回调 URL 完成 token 兑换，成功后新账号已在池中。
+$('btnAddTraeFinish').onclick = async () => {
+  const cb = ($('addTraeCallback').value || '').trim();
+  if (!cb) { toast('请先粘贴浏览器地址栏的完整回调 URL', 'err'); return; }
+  const btn = $('btnAddTraeFinish');
+  btn.disabled = true; btn.textContent = '登录中…';
+  try {
+    const d = await api('trae/login/finish', { method: 'POST', body: JSON.stringify({ callback_url: cb }) });
+    $('addReady').hidden = true;
+    $('addDone').hidden = false;
+    $('addDone').textContent = '已添加 Trae 账号 ' + (d.uid || '') +
+      (d.has_device_key ? '' : '（无设备密钥，token 续期可能受限）') + '，账号已载入池中';
+    $('addTraeCallback').value = '';
+    setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
+  } catch (e) {
+    $('addErr').hidden = false;
+    $('addErr').textContent = '登录失败：' + e.message;
+  } finally { btn.disabled = false; btn.textContent = '完成登录'; }
+};
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));

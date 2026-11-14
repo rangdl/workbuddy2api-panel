@@ -1492,6 +1492,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
     </header>
     <div class="body">
+      <!-- 上游选择：两种账号进同一个池，只是登录链路不同 -->
+      <div id="addUpstream">
+        <div class="realm-row">
+          <span class="hint" style="font-size:12px">上游：</span>
+          <label class="realm-opt"><input type="radio" name="addUpstream" value="codebuddy" checked> CodeBuddy</label>
+          <label class="realm-opt"><input type="radio" name="addUpstream" value="trae"> Trae</label>
+        </div>
+      </div>
       <!-- 浏览器登录 -->
       <div id="addTabLogin" class="tab-panel">
         <div id="addPick">
@@ -1507,6 +1515,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="state">在浏览器打开以下链接并登录：</div>
           <div class="url" id="addUrl"></div>
           <div class="state" id="addPoll"><span class="dots">等待授权完成，自动检测中</span></div>
+          <!-- Trae 的回调不会自动回到网关，需要粘贴地址栏 URL 完成兑换 -->
+          <div id="addTraeFinish" hidden style="margin-top:8px">
+            <div class="hint" style="font-size:12px;margin-bottom:4px">授权完成后，浏览器会跳转到回调地址——把地址栏完整 URL 粘贴到这里：</div>
+            <input type="text" id="addTraeCallback" placeholder="http://localhost:5173/...?code=...&state=..." style="width:100%;margin-bottom:6px">
+            <button id="btnAddTraeFinish" class="primary">完成登录</button>
+          </div>
         </div>
         <div id="addDone" class="state ok" hidden></div>
         <div id="addErr" class="state err" hidden></div>

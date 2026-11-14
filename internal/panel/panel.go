@@ -705,10 +705,31 @@ func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// isTraeUID 该 uid 是否属于池里的 Trae 账号。
+//
+// 用池状态的 Backend 字段判断，而不是"AuthByUID 返回 nil 就当 Trae"：
+// 账号可能尚未装载凭证（此时 AuthByUID 也为 nil），误判会把 CodeBuddy 账号
+// 送进 Trae 链路。
+func (p *Panel) isTraeUID(uid string) bool {
+	if p.cfg.Pool == nil {
+		return false
+	}
+	st, ok := p.cfg.Pool.Status(uid)
+	return ok && st.Backend == pool.BackendTrae
+}
+
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
 // 与 scheduler.RunCheckinNow 的单号语义一致。
+//
+// Trae 账号与 CodeBuddy 在同一个池里，但凭证形态不同（AuthByUID 对 Trae 返回
+// nil）。这里按 backend 分流到 Trae 链路，让「签到」这个操作对两种账号是同一个
+// 入口——前端不必再按 backend 选不同接口。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
+	if p.isTraeUID(uid) {
+		p.traeAccountCheckin(w, r)
+		return
+	}
 	a := p.cfg.Pool.AuthByUID(uid)
 	if a == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
@@ -833,7 +854,7 @@ func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	go p.cfg.Scheduler.RunCheckinNow()
-	log.Printf("panel: 手动全量签到已触发（含猫猫旅行）")
+	log.Printf("panel: 手动全量签到已触发（CodeBuddy + Trae，旅行已独立为单独排程）")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 

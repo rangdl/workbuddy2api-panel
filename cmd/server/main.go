@@ -355,6 +355,16 @@ func main() {
 			p.NoteCheckinDone(uid)
 		}
 	}
+	// 统一签到链路：同一份池、同一个排程时点，Trae 只是协议链路不同。
+	// 适配器每次调用重新读配置（运行期可能登录新账号或换设备号）。
+	sch.SetTraeCheckiner(newTraeCheckiner(func() *trae.Config {
+		tcfg, err := trae.Load(trae.ConfigPath(*cfgPath), cfg.AuthDir)
+		if err != nil || tcfg == nil {
+			return nil
+		}
+		tcfg.SaveAccount = saveTraeAccountFunc(tcfg.AuthDir)
+		return tcfg
+	}, traeClient))
 
 	// handlerRef 供面板热重载闭包引用（panel 先于 handler 构造，闭包在保存时才调用）。
 	var handlerRef *server.Handler
