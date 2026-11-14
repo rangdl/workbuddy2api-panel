@@ -220,4 +220,13 @@ type CheckinResult struct {
 	// 与 ErrUnsupported 的区别：Skipped 是「这个账号正常，只是这类账号不参与」，
 	// 池按正常流程记账；ErrUnsupported 是「这个上游没实现」，池直接跳过。
 	Skipped bool
+	// DeviceAlready 该**设备**今日已签（Trae 的 9095/9004）。
+	//
+	// 限额按设备算：多账号共用同一设备号时只有第一个能签成。**本账号未必签过**，
+	// 因此池不能把它标成「今日已签」，否则按钮会谎报、次日也不会重试。
+	DeviceAlready bool
+	// Unverified claim 返回成功但回查未确认（可能是「假成功」）。
+	//
+	// 与 DeviceAlready 同理：不标记已签，留待下一轮重试。
+	Unverified bool
 }

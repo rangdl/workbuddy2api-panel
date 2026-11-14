@@ -190,13 +190,25 @@ func (p *Pool) checkinAll(ctx context.Context, opts opOptions) {
 			if res == nil || res.Skipped {
 				return
 			}
-			// 已签（含上游幂等拒绝）与本次签成都算「今日已签」，按钮据此显示。
-			p.NoteCheckinDone(a.UID())
-			if res.Already {
-				log.Printf("checkin %s: 今日已签到（幂等）", logfmt.Label(a.UID(), a.Nickname()))
-				return
+			// 只有「本账号确实签成」才标记今日已签。三种情形要排除：
+			//   - DeviceAlready：设备维度限额（多账号共用设备号时只有第一个能签），
+			//     本账号未必签过；
+			//   - Unverified：claim 说成功但回查未翻转，可能是假成功。
+			// 把它们标成已签会让按钮谎报「已签」，且次日也不会重试。
+			if !res.Unverified && !(res.Already && res.DeviceAlready) {
+				p.NoteCheckinDone(a.UID())
 			}
-			log.Printf("checkin %s: 签到成功 +%d", logfmt.Label(a.UID(), a.Nickname()), res.Reward)
+			switch {
+			case res.DeviceAlready:
+				log.Printf("checkin %s: 设备今日已签，本账号未签到", logfmt.Label(a.UID(), a.Nickname()))
+			case res.Unverified:
+				// 回查未确认：不标已签，交下轮重试。
+				log.Printf("checkin %s: %s", logfmt.Label(a.UID(), a.Nickname()), res.Message)
+			case res.Already:
+				log.Printf("checkin %s: 今日已签到（幂等）", logfmt.Label(a.UID(), a.Nickname()))
+			default:
+				log.Printf("checkin %s: 签到成功 +%d", logfmt.Label(a.UID(), a.Nickname()), res.Reward)
+			}
 		}(acc)
 	}
 	wg.Wait()
@@ -251,7 +263,8 @@ func (p *Pool) Account(uid string) gateway.Account {
 
 // CheckinOne 对单个账号执行签到（面板「签到」按钮）。
 //
-// 与 CheckinAll 共用同一套记账逻辑，只是范围限定为一个账号。
+// 与 CheckinAll 共用同一套记账逻辑，只是范围限定为一个账号——包括
+// DeviceAlready / Unverified 不标「今日已签」的语义（见 checkinAll 的注释）。
 func (p *Pool) CheckinOne(ctx context.Context, uid string) (*gateway.CheckinResult, error) {
 	acc := p.Account(uid)
 	if acc == nil {
@@ -261,10 +274,8 @@ func (p *Pool) CheckinOne(ctx context.Context, uid string) (*gateway.CheckinResu
 	if err != nil {
 		return nil, err
 	}
-	if res != nil && !res.Skipped {
-		if res.Already || res.Message != "" {
-			p.NoteCheckinDone(uid)
-		}
+	if res != nil && !res.Skipped && !res.Unverified && !(res.Already && res.DeviceAlready) {
+		p.NoteCheckinDone(uid)
 	}
 	return res, nil
 }

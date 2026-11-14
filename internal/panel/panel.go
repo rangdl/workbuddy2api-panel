@@ -11,7 +11,9 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -671,104 +673,71 @@ func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// isTraeUID 该 uid 是否属于池里的 Trae 账号。
-//
-// 用池状态的 Backend 字段判断，而不是"AuthByUID 返回 nil 就当 Trae"：
-// 账号可能尚未装载凭证（此时 AuthByUID 也为 nil），误判会把 CodeBuddy 账号
-// 送进 Trae 链路。
-func (p *Panel) isTraeUID(uid string) bool {
-	if p.cfg.Pool == nil {
-		return false
-	}
-	st, ok := p.cfg.Pool.Status(uid)
-	return ok && st.Backend == pool.BackendTrae
-}
-
-// accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
+// accountCheckin 单号签到：签到 + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
 // 与 scheduler.RunCheckinNow 的单号语义一致。
 //
-// Trae 账号与 CodeBuddy 在同一个池里，但凭证形态不同（AuthByUID 对 Trae 返回
-// nil）。这里按 backend 分流到 Trae 链路，让「签到」这个操作对两种账号是同一个
-// 入口——前端不必再按 backend 选不同接口。
+// 走池的统一单号入口（CheckinOne / RefreshCreditsOne）：账号自己实现 Checkin/Credits，
+// 池负责记账与快照写回。CodeBuddy 与 Trae 因此是同一段代码——不再按 backend 分流
+// 到两条不同的实现。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	if p.isTraeUID(uid) {
-		p.traeAccountCheckin(w, r)
-		return
-	}
-	a := p.cfg.Pool.AuthByUID(uid)
-	if a == nil {
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	res, err := p.cfg.Pool.CheckinOne(ctx, uid)
+	resp := map[string]any{"ok": true}
+	checkinMsg := ""
+	switch {
+	case errors.Is(err, pool.ErrNoSuchAccount):
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
-	}
-	checkinMsg := ""
-	checkinDone := false
-	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
-	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
-	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
-	if a.IsEnterprise() {
-		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
-	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
-		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
-		if upstream.IsAlreadyCheckin(err) {
-			p.cfg.Pool.NoteCheckinDone(uid)
-			checkinDone = true
+	case err != nil:
+		checkinMsg = err.Error() // 业务错误照常查余额
+	default:
+		// res.Already / Message 非空都已在 CheckinOne 内部标记「今日已签」。
+		resp["checkin_done"] = res != nil && !res.Skipped
+		if res != nil && res.Skipped {
+			checkinMsg = res.Message // 企业版等「不参与」的说明
+			resp["enterprise"] = true
 		}
-	} else {
-		p.cfg.Pool.NoteCheckinDone(uid)
-		checkinDone = true
-	}
-	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
-	if a.IsEnterprise() {
-		resp["enterprise"] = true
 	}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}
-	remain, total, expiring, earliestAt, earliestRemaining, buckets, err := p.cfg.Upstream.UserResourceSnapshot(a, p.expiringSoonWindow())
-	if err != nil {
-		resp["balance_error"] = err.Error()
+
+	credits, cerr := p.cfg.Pool.RefreshCreditsOne(ctx, uid)
+	if cerr != nil {
+		resp["balance_error"] = cerr.Error()
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
-	p.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{
-		Remain:            remain,
-		Total:             total,
-		Expiring:          expiring,
-		EarliestAt:        earliestAt,
-		EarliestRemaining: earliestRemaining,
-		ExpiryBuckets:     poolExpiryBuckets(buckets),
-	})
-	resp["credits"] = remain
-	resp["credits_total"] = total
-	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
+	if credits != nil {
+		resp["credits"] = int64(credits.Available)
+		resp["credits_total"] = int64(credits.Limit)
+		log.Printf("panel: checkin uid=%s msg=%q credits=%v/%v", uid, checkinMsg,
+			int64(credits.Available), int64(credits.Limit))
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // accountBalance 单号余额刷新：更新余额与到期快照，不触碰冷却状态。
 func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.cfg.Pool.AuthByUID(uid)
-	if a == nil {
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	credits, err := p.cfg.Pool.RefreshCreditsOne(ctx, uid)
+	if errors.Is(err, pool.ErrNoSuchAccount) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	remain, total, expiring, earliestAt, earliestRemaining, buckets, err := p.cfg.Upstream.UserResourceSnapshot(a, p.expiringSoonWindow())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
-	p.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{
-		Remain:            remain,
-		Total:             total,
-		Expiring:          expiring,
-		EarliestAt:        earliestAt,
-		EarliestRemaining: earliestRemaining,
-		ExpiryBuckets:     poolExpiryBuckets(buckets),
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "uid": uid,
+		"credits": int64(credits.Available), "credits_total": int64(credits.Limit),
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
 }
 
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。

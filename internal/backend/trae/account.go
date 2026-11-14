@@ -212,15 +212,24 @@ func (x Account) Checkin(ctx context.Context) (*gateway.CheckinResult, error) {
 		// 9004/9095 是「设备/账号今日已签」的幂等拒绝，按成功处理。
 		if apiErr, ok := err.(*traepkg.APIError); ok {
 			if cls := apiErr.Classification(); cls.Already {
-				return &gateway.CheckinResult{Already: true, Message: cls.Message}, nil
+				// 9004 / 9095 都是**设备维度**的拒绝：本账号未必签过。
+				// 池据此不标记「今日已签」（否则按钮谎报、次日不重试）。
+				deviceAlready := cls.Code == "9095" || cls.Code == "9004"
+				return &gateway.CheckinResult{
+					Already:       true,
+					DeviceAlready: deviceAlready,
+					Message:       cls.Message,
+				}, nil
 			}
 		}
 		return nil, err
 	}
 	return &gateway.CheckinResult{
-		Already: res.Already,
-		Reward:  res.Reward,
-		Message: res.Message,
+		Already:       res.Already,
+		Reward:        res.Reward,
+		Message:       res.Message,
+		DeviceAlready: res.DeviceAlready,
+		Unverified:    res.Unverified,
 	}, nil
 }
 

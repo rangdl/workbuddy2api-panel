@@ -5,6 +5,7 @@ package panel
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"sort"
@@ -55,52 +56,32 @@ func (p *Panel) noteTraeCheckinDone(uid string) {
 	p.cfg.Pool.NoteCheckinDone(uid)
 }
 
-// traeAccountCheckin 单账号签到。
+// traeAccountCheckin 单账号签到（面板 Trae 页按钮）。
+//
+// 走池的统一单号入口：账号自己实现 Checkin（含签到前续期、9004/9095 识别、
+// 回查确认），池负责记账。本函数只把结果翻译成面板需要的展示形状。
+//
+// 与 accountCheckin 的差别仅在响应体：Trae 页面需要 device_already/unverified
+// 这类设备维度信息，通用入口不展示它们。
 func (p *Panel) traeAccountCheckin(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.TraeClient == nil || p.cfg.TraePath == "" {
-		writeErr(w, http.StatusNotImplemented, "trae client not available")
-		return
-	}
-	cfg, err := trae.Load(p.cfg.TraePath, p.cfg.AuthDir)
-	if err != nil || cfg == nil {
-		writeErr(w, http.StatusBadRequest, "trae.json 不存在或无法读取")
+	if p.cfg.Pool == nil {
+		writeErr(w, http.StatusNotImplemented, "pool not available")
 		return
 	}
 	uid := r.PathValue("uid")
-	acc := cfg.AccountByUID(uid)
-	if acc == nil {
+	ctx, cancel := context.WithTimeout(r.Context(), traeOpTimeout)
+	defer cancel()
+
+	res, err := p.cfg.Pool.CheckinOne(ctx, uid)
+	if errors.Is(err, pool.ErrNoSuchAccount) {
 		writeErr(w, http.StatusNotFound, "账号不存在: "+uid)
 		return
 	}
-	// 与调度器走同一条链路：先按需续期，再签到（含 9004/9095 识别与回查确认）。
-	ctx, cancel := context.WithTimeout(r.Context(), traeOpTimeout)
-	defer cancel()
-	if cfg.RefreshBeforeCheckinEnabled() {
-		if _, rerr := p.cfg.TraeClient.EnsureTokenFresh(ctx, cfg, acc, 2*time.Hour); rerr != nil {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"ok": false, "uid": uid, "error_type": "session_dead",
-				"message": "签到前续期失败: " + rerr.Error(),
-			})
-			return
-		}
-	}
-	res, err := p.cfg.TraeClient.Checkin(ctx, cfg, acc)
+	p.invalidateCheckinCache()
 	if err != nil {
 		// 错误分类后一并回传，便于面板给出可操作提示。
 		if apiErr, ok := err.(*trae.APIError); ok {
 			cls := apiErr.Classification()
-			if cls.Already {
-				// 9004 / 9095 不是失败：按「今日已签」回传。
-				// 9004 缺设备头 / 9095 该设备今日已签，都是**设备维度**的拒绝，
-				// 本账号未必签过，故不标记账号已签（否则首页按钮会谎报「已签」）。
-				p.invalidateCheckinCache()
-				writeJSON(w, http.StatusOK, map[string]any{
-					"ok": true, "uid": uid, "already": true,
-					"device_already": cls.Code == "9095" || cls.Code == "9004",
-					"message":        cls.Message,
-				})
-				return
-			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"ok": false, "uid": uid, "error_type": string(cls.Kind),
 				"message": cls.Message, "disable": cls.Disable,
@@ -110,15 +91,13 @@ func (p *Panel) traeAccountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "uid": uid, "message": err.Error()})
 		return
 	}
+	if res == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "uid": uid, "message": "empty result"})
+		return
+	}
 	if p.cfg.TraeCooldowns != nil && !res.Already {
 		p.cfg.TraeCooldowns.Clear(uid) // 签到成功即清冷却
 	}
-	// 账号池的「签到/已签」按钮只看 last_checkin_day，不写回则永远显示「签到」。
-	// 设备维度已签（DeviceAlready 但非 Already）与回查未确认都不算本账号签成。
-	if !res.Unverified && !(res.Already && res.DeviceAlready) {
-		p.noteTraeCheckinDone(uid)
-	}
-	p.invalidateCheckinCache()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "uid": uid, "already": res.Already,
 		"device_already": res.DeviceAlready, "unverified": res.Unverified,

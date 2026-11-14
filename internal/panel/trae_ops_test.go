@@ -91,7 +91,8 @@ func newTraeOpsUpstream(t *testing.T) *httptest.Server {
 // TestTraeAccountCheckin 单账号签到：成功返回奖励。
 func TestTraeAccountCheckin(t *testing.T) {
 	srv := newTraeOpsUpstream(t)
-	p, _ := newTraeOpsPanel(t, srv.URL)
+	// 走池的单号入口，因此需要账号真正入池（与生产同款 backend/trae.Wrap）。
+	p, _ := newTraeOpsPanelWithPool(t, srv.URL)
 
 	rec := traeDo(p, http.MethodPost, "/panel/api/trae/accounts/u-1/checkin", "")
 	if rec.Code != http.StatusOK {
@@ -114,7 +115,7 @@ func TestTraeAccountCheckin(t *testing.T) {
 // TestTraeAccountCheckinUnknownUID 未知 uid → 404。
 func TestTraeAccountCheckinUnknownUID(t *testing.T) {
 	srv := newTraeOpsUpstream(t)
-	p, _ := newTraeOpsPanel(t, srv.URL)
+	p, _ := newTraeOpsPanelWithPool(t, srv.URL)
 	if rec := traeDo(p, http.MethodPost, "/panel/api/trae/accounts/nope/checkin", ""); rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
