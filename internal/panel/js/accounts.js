@@ -385,7 +385,10 @@ function openAdd() {
   const cb = document.querySelector('input[name="addUpstream"][value="codebuddy"]');
   if (cb) cb.checked = true;
   if ($('addTraeCallback')) $('addTraeCallback').value = '';
+  if ($('addTraeStorage')) $('addTraeStorage').value = '';
+  if ($('addTraeDeviceId')) $('addTraeDeviceId').value = '';
   if ($('addTraeFinish')) $('addTraeFinish').hidden = true;
+  if ($('addTraeDevice')) $('addTraeDevice').hidden = true;
   syncAddUpstreamUi();
   stopPoll();
 }
@@ -398,7 +401,10 @@ function syncAddUpstreamUi() {
   const trae = addUpstream() === 'trae';
   if ($('addPick')) $('addPick').hidden = trae;        // Trae 无 cn/global 选择
   if ($('addPoll')) $('addPoll').hidden = trae;        // Trae 不会自动轮询到结果
-  if ($('addTraeFinish')) $('addTraeFinish').hidden = !trae;
+  // 设备身份在**生成链接前**就要填（storage.json 参与 AuthCode 兑换）。
+  if ($('addTraeDevice')) $('addTraeDevice').hidden = !trae;
+  // 回调输入框只在链接生成后出现（见 startAddTraeLogin）。
+  if ($('addTraeFinish')) $('addTraeFinish').hidden = true;
   if ($('btnCopyUrl')) $('btnCopyUrl').hidden = true;
   if ($('btnOpenUrl')) $('btnOpenUrl').hidden = true;
   if ($('btnStartLogin')) {
@@ -442,11 +448,18 @@ function startAddLogin() {
     $('addErr').textContent = e.message;
   });
 }
-// startAddTraeLogin Trae 授权：生成链接后由用户粘贴回调 URL 完成兑换。
+// startAddTraeLogin Trae 授权：带上设备身份生成链接，之后由用户粘贴回调 URL 兑换。
 function startAddTraeLogin() {
   $('btnStartLogin').disabled = true;
   $('addLoad').hidden = false; $('addErr').hidden = true;
-  api('trae/login/start', { method: 'POST', body: '{}' }).then(d => {
+  // storage.json 必须在生成链接时就提交：AuthCode 兑换需要 DeviceInfo，
+  // 事后再补是来不及的（state 已绑定）。
+  const body = {};
+  const storage = ($('addTraeStorage') ? $('addTraeStorage').value || '' : '').trim();
+  const devId = ($('addTraeDeviceId') ? $('addTraeDeviceId').value || '' : '').trim();
+  if (storage) body.storage_json = storage;
+  if (devId) body.device_id = devId;
+  api('trae/login/start', { method: 'POST', body: JSON.stringify(body) }).then(d => {
     $('addUrl').textContent = d.url;
     $('addLoad').hidden = true; $('addReady').hidden = false;
     $('btnStartLogin').hidden = true;
@@ -497,12 +510,16 @@ $('btnAddTraeFinish').onclick = async () => {
   const btn = $('btnAddTraeFinish');
   btn.disabled = true; btn.textContent = '登录中…';
   try {
-    const d = await api('trae/login/finish', { method: 'POST', body: JSON.stringify({ callback_url: cb }) });
+    const body = { callback_url: cb };
+    const devId = ($('addTraeDeviceId') ? $('addTraeDeviceId').value || '' : '').trim();
+    if (devId) body.device_id = devId;
+    const d = await api('trae/login/finish', { method: 'POST', body: JSON.stringify(body) });
     $('addReady').hidden = true;
     $('addDone').hidden = false;
     $('addDone').textContent = '已添加 Trae 账号 ' + (d.uid || '') +
       (d.has_device_key ? '' : '（无设备密钥，token 续期可能受限）') + '，账号已载入池中';
     $('addTraeCallback').value = '';
+    if ($('addTraeStorage')) $('addTraeStorage').value = '';
     setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
   } catch (e) {
     $('addErr').hidden = false;

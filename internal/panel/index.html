@@ -303,7 +303,6 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .trae-acc-tbl td:nth-child(3) { min-width: 190px; }
 .trae-tags { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
 .trae-acc-tbl .who .nm { display: flex; align-items: center; }
-.trae-acc-tbl .who .nm input { accent-color: var(--accent); }
 
 .empty { padding: 40px 20px; text-align: center; color: var(--ink-3); }
 .empty .big { font-size: 14px; color: var(--ink-2); margin-bottom: 6px; }
@@ -653,7 +652,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         模型与档位</a></li>
       <li><a href="#upstream" data-view="upstream">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="m5.6 7 1.5 1.5L10.4 5.9"/></svg>
-        Trae 签到</a></li>
+        Trae 上游</a></li>
       <li><a href="#clients" data-view="clients">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M6 2.5 3.5 5 6 7.5M10 8.5 12.5 11 10 13.5"/><path d="M9 2.5 7 13.5"/></svg>
         协议接入</a></li>
@@ -740,6 +739,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnBlindboxAll">能量盲盒</button>
           <button class="xs" id="btnActivityAll">活跃上报</button>
           <button class="xs" id="btnKeepaliveAll">全部保活</button>
+          <button class="xs" id="btnTraeCheckinStatus" title="最近一次 Trae 批量签到结果（自动排程或手动触发）">Trae 签到结果</button>
+          <button class="xs" id="btnTraeSyncProfiles" title="从上游 GetUserInfo 拉取 Trae 账号昵称（JWT 里没有用户名字段）">Trae 昵称</button>
         </header>
         <div class="tbl-wrap">
         <table class="acc">
@@ -1195,10 +1196,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </form>
     </section>
 
-    <!-- Trae 签到：Trae 上游的账号 / 签到 / 凭证管理 -->
+    <!-- Trae 上游：配置与凭证管理（账号本身在账号池页统一管理） -->
     <section class="view" id="view-upstream" hidden>
       <div class="box">
-        <header><h3>Trae 签到</h3><span class="grow"></span><span class="note" id="traePath"></span></header>
+        <header><h3>Trae 上游</h3><span class="grow"></span><span class="note" id="traePath"></span></header>
         <div class="pad">
           <div class="switch"><span class="lb">启用 /trae/v1/*</span>
             <input type="checkbox" id="traeEnabled"></div>
@@ -1213,10 +1214,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </div>
           <div class="hr"></div>
           <div class="fld"><span class="lb">账号</span>
+            <div class="hint" style="margin-bottom:6px">Trae 账号与 CodeBuddy 在同一个账号池里——
+              增删、签到、余额、昵称、暂停/禁用都在<a href="#accounts">账号池</a>页操作，
+              这里只管 Trae 上游的配置与凭证。</div>
             <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
-              <button type="button" class="xs" id="btnTraeCheckinAll">全部签到</button>
-              <button type="button" class="xs" id="btnTraeCheckinStatus">上次签到结果</button>
-              <button type="button" class="xs" id="btnTraeSyncProfiles" title="从上游 GetUserInfo 拉取昵称（JWT 里没有用户名字段）">同步昵称</button>
+              <button type="button" class="xs" id="btnTraeCheckinStatus2">上次签到结果</button>
+              <button type="button" class="xs" id="btnTraeSyncProfiles2" title="从上游 GetUserInfo 拉取昵称（JWT 里没有用户名字段）">同步昵称</button>
               <span class="hint" id="traeCheckinNote"></span>
             </div>
             <div class="tbl-wrap">
@@ -1239,23 +1242,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <span class="hint">到点对全部可用账号签到一轮（账号间限速 800ms）</span></label>
           </div>
           <div class="hr"></div>
-          <div class="fld"><span class="lb">添加账号（OAuth 登录）</span>
-            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-              <button type="button" class="xs" id="btnTraeLogin">1. 生成授权链接</button>
-              <input id="traeCallback" placeholder="2. 浏览器完成授权后，粘贴地址栏完整 URL" style="flex:1;min-width:240px">
-              <button type="button" class="xs" id="btnTraeFinish">完成登录</button>
-            </div>
-            <textarea id="traeLoginStorage" rows="3" placeholder="可选，但强烈建议：粘贴 Trae 客户端的 storage.json 全文（或只粘贴含 iCubeAuthInfo://icube-dc: 的那几行）&#10;留空的话登录会被上游拒成 20405 Device proof required" style="width:100%;margin-top:6px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px"></textarea>
-            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px">
-              <input id="traeLoginDeviceId" placeholder="设备号（留空则从 storage.json 自动读取）" style="width:280px">
-            </div>
-            <span class="hint" id="traeLoginHint">Trae 用授权码 + PKCE 流程：填 storage.json → 生成链接 → 浏览器授权 → 复制地址栏 URL 粘贴回来。</span>
-            <span class="hint"><b>storage.json 是登录成功的关键</b>：AuthCode 兑换要求带 <code>DeviceInfo</code>（设备号 + 公钥），
-              没有它上游会拒成 <code>20405 Device proof required</code>。
-              文件位置（Windows）：<code>%APPDATA%\Trae CN\User\globalStorage\storage.json</code>。
-              只读取 <code>iCubeAuthInfo://icube-dc:</code> 条目与 <code>telemetry.machineId</code>，不会上传其它内容。</span>
-            <span class="hint"><b>签到限额按设备算</b>：一个设备号一天只有第一个账号能签成。
-              设备号 = 上面 <code>storage.json</code> 里 <code>iCubeAuthInfo://icube-dc:&lt;数字&gt;</code> 键名中的数字（12~20 位，15/16 位都见过）。</span></div>
+          <div class="fld"><span class="lb">添加账号</span>
+            <span class="hint">统一走右上角<a href="#accounts" onclick="document.getElementById('btnAdd').click()">添加账号</a>，
+              在弹窗里把「上游」选成 Trae 即可（支持粘贴 storage.json）。</span></div>
           <div class="fld"><span class="lb">给已有账号补设备凭证（可选）</span>
             <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
               <input id="traeStorage" placeholder="粘贴 Trae 客户端 storage.json 内容，或单条 icube 密文" style="flex:1;min-width:240px">
@@ -1264,7 +1253,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <span class="hint">uid 是<b>已存在账号</b>的标识，在上方账号列表每行最左边（等宽字体）。新账号请用上面的登录流程，那里可以直接带 storage.json。</span>
             <span class="hint">设备私钥用于 token 续期签名（DeviceProof）。未导入时续期走无签名兜底变体，可能被上游拒绝。</span></div>
-          <div class="hint" style="margin-top:10px">保存后立即生效（启用开关 / base / 账号列表热重载，无需重启）。</div>
+          <div class="hint" style="margin-top:10px">保存后立即生效（启用开关 / 对话 base / 签到排程热重载，无需重启）。保存不会改动账号列表。</div>
         </div>
         <div class="savebar">
           <span class="grow"></span>
@@ -1521,6 +1510,19 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <input type="text" id="addTraeCallback" placeholder="http://localhost:5173/...?code=...&state=..." style="width:100%;margin-bottom:6px">
             <button id="btnAddTraeFinish" class="primary">完成登录</button>
           </div>
+        </div>
+        <!-- Trae 登录前必须提供的设备身份（决定能否通过 DeviceProof 校验）。
+             必须放在 #addReady 之外：storage.json 参与生成授权链接，填的时候
+             链接还没生成。 -->
+        <div id="addTraeDevice" hidden style="margin-top:8px">
+          <div class="hint" style="font-size:12px"><b>storage.json 决定登录能否成功</b>：AuthCode 兑换要带
+            <code>DeviceInfo</code>（设备号 + 公钥），没有它上游会拒成 <code>20405 Device proof required</code>。
+            位置（Windows）：<code>%APPDATA%\Trae CN\User\globalStorage\storage.json</code>。
+            只读取 <code>iCubeAuthInfo://icube-dc:</code> 条目与 <code>telemetry.machineId</code>。</div>
+          <textarea id="addTraeStorage" rows="3" placeholder="粘贴 storage.json 全文（或只含 iCubeAuthInfo://icube-dc: 的那几行）" style="width:100%;margin-top:6px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px"></textarea>
+          <input id="addTraeDeviceId" placeholder="设备号（留空则从 storage.json 自动读取）" style="width:100%;margin-top:6px">
+          <div class="hint" style="font-size:12px;margin-top:4px"><b>签到限额按设备算</b>：一个设备号一天只有第一个账号能签成。
+            设备号 = storage.json 里 <code>iCubeAuthInfo://icube-dc:&lt;数字&gt;</code> 键名中的数字（12~20 位）。</div>
         </div>
         <div id="addDone" class="state ok" hidden></div>
         <div id="addErr" class="state err" hidden></div>

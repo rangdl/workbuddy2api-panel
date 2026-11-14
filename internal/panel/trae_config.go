@@ -162,9 +162,17 @@ type traeSaveRequest struct {
 	ChatBase       string           `json:"chat_base"`
 	IDEVersion     string           `json:"ide_version"`
 	TimeoutSeconds int              `json:"timeout_seconds"`
-	Accounts       []string         `json:"accounts"` // 保留的 uid 列表（顺序即轮转顺序）
-	Disabled       []string         `json:"disabled"` // 其中被禁用的 uid
-	Schedule       traeScheduleView `json:"schedule"`
+	// Accounts 保留的 uid 列表（顺序即轮转顺序）。
+	//
+	// 注意区分「缺省」与「空数组」：
+	//   - nil（请求里没有这个字段）→ 保留全部现有账号，只更新配置项。账号池页
+	//     保存配置时就走这条路径——账号增删在池里做，不该由这里顺手删文件。
+	//   - []（显式空数组）→ 删除全部账号。这是旧版「按表格提交」的语义，保留
+	//     兼容，但任何「只想改配置」的调用都必须传 nil。
+	Accounts []string `json:"accounts"`
+	// Disabled 其中被禁用的 uid（仅对 Accounts 里出现的生效）。
+	Disabled []string         `json:"disabled"`
+	Schedule traeScheduleView `json:"schedule"`
 }
 
 // saveTraeConfig 保存非敏感字段：读-改-写，**保留已有账号的凭证字段**。
@@ -230,7 +238,18 @@ func (p *Panel) saveTraeConfig(w http.ResponseWriter, r *http.Request) {
 	// 按提交的 uid 顺序重建账号列表，凭证从旧配置带入。
 	// 账号本身**不写回 trae.json**（json:"-"）：这里只把「保留哪些、是否禁用」
 	// 落到各自的账号文件上，删掉的账号还要移除其文件。
-	for _, uid := range req.Accounts {
+	//
+	// req.Accounts 为 nil（请求未带该字段）= 账号列表不由本接口管理：原样保留
+	// 全部账号，仅更新配置项。账号池页保存配置走这条路径——账号增删在池里做，
+	// 这里若按"未提交即删除"处理，一次保存就会删光所有 Trae 账号的凭证文件。
+	keepUIDs := req.Accounts
+	if keepUIDs == nil {
+		keepUIDs = make([]string, 0, len(old.Accounts))
+		for i := range old.Accounts {
+			keepUIDs = append(keepUIDs, old.Accounts[i].UID)
+		}
+	}
+	for _, uid := range keepUIDs {
 		a := old.AccountByUID(uid)
 		if a == nil {
 			continue // 未知 uid：忽略（不凭空造账号）

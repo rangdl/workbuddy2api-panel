@@ -327,6 +327,50 @@ func TestTraeConfigViewIncludesSchedule(t *testing.T) {
 	}
 }
 
+// TestTraeConfigSaveWithoutAccountsKeepsAll 请求不带 accounts 字段时保留全部账号。
+//
+// 这是第二步的破坏性防护：账号池页保存 Trae 配置不再提交账号列表（账号增删
+// 在池里做）。若后端仍按"未提交即删除"处理，一次保存就会删光所有 Trae 账号
+// 的凭证文件——账号在下次扫描时永久消失。
+func TestTraeConfigSaveWithoutAccountsKeepsAll(t *testing.T) {
+	srv := newTraeOpsUpstream(t)
+	p, path := newTraeOpsPanel(t, srv.URL)
+
+	// 字段完全省略（不是空数组）。
+	body := `{"enabled":true,"chat_base":"` + srv.URL + `",
+		"schedule":{"checkin_enabled":false,"checkin_hours":[]}}`
+	rec := traeDo(p, http.MethodPost, "/panel/api/trae_config", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
+	}
+	saved, err := trae.Load(path, "")
+	if err != nil || saved == nil {
+		t.Fatalf("重新加载失败: %v", err)
+	}
+	if len(saved.Accounts) != 1 || saved.Accounts[0].UID != "u-1" {
+		t.Fatalf("账号应全部保留，实际 %+v", saved.Accounts)
+	}
+	if saved.Accounts[0].AccessToken != "tok-1" {
+		t.Errorf("凭证应保留，得到 %q", saved.Accounts[0].AccessToken)
+	}
+}
+
+// TestTraeConfigSaveExplicitEmptyDeletesAll 显式传空数组仍删除全部账号（兼容旧语义）。
+func TestTraeConfigSaveExplicitEmptyDeletesAll(t *testing.T) {
+	srv := newTraeOpsUpstream(t)
+	p, path := newTraeOpsPanel(t, srv.URL)
+
+	body := `{"enabled":true,"chat_base":"` + srv.URL + `","accounts":[],
+		"schedule":{"checkin_enabled":false,"checkin_hours":[]}}`
+	if rec := traeDo(p, http.MethodPost, "/panel/api/trae_config", body); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
+	}
+	saved, _ := trae.Load(path, "")
+	if len(saved.Accounts) != 0 {
+		t.Fatalf("显式空数组应删除全部账号，实际 %+v", saved.Accounts)
+	}
+}
+
 // TestTraeConfigSaveSchedule 保存排程字段。
 func TestTraeConfigSaveSchedule(t *testing.T) {
 	srv := newTraeOpsUpstream(t)

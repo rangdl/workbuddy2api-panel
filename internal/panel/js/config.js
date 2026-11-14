@@ -457,17 +457,18 @@ function traeAccountRow(a, cool) {
   const bar = document.createElement('i');
   tdMark.append(bar);
 
-  // 2. 账号列：勾选框（= 是否参与轮转）+ uid + 名称。
+  // 2. 账号列：轮转状态（只读）+ uid + 名称。
+  // 启用/禁用统一在账号池页操作——这里只读展示，避免两个入口各自改状态。
   const tdWho = document.createElement('td');
   tdWho.className = 'who';
   const nm = document.createElement('div');
   nm.className = 'nm';
-  const on = document.createElement('input');
-  on.type = 'checkbox';
+  const on = document.createElement('span');
   on.className = 'trae-acc-on';
-  on.checked = !a.disabled;
-  on.title = '取消勾选 = 该账号不参与轮转（保存后生效）';
-  on.style.cssText = 'margin-right:6px;vertical-align:middle';
+  on.textContent = a.disabled ? '○' : '●';
+  on.title = a.disabled ? '未参与轮转（在账号池页启用）' : '参与轮转';
+  on.style.cssText = 'margin-right:6px;vertical-align:middle;color:' +
+    (a.disabled ? 'var(--ink-3)' : 'var(--ok, #22a06b)');
   const nmText = document.createElement('span');
   nmText.className = 'mid';
   nmText.textContent = a.name || '未命名';
@@ -513,27 +514,24 @@ function traeAccountRow(a, cool) {
   const tdActs = document.createElement('td');
   tdActs.className = 'acts';
 
+  // 这里只保留「看」的能力（签到状态与积分是只读查询）；签到/删除等写操作
+  // 统一在账号池页——一个账号只在池里被改一次，避免两个入口状态漂移。
   const ck = document.createElement('button');
   ck.type = 'button';
   ck.className = 'xs ghost';
   const done = a.checkin_done === true;
   const devDone = a.checkin_device_already === true;
-  ck.textContent = done ? '已签' : (devDone ? '设备已签' : '签到');
-  if (done) ck.title = '今日已签到；点一下可重新查询并刷新状态';
-  else if (devDone) ck.title = '该设备今日已签（签到限额按设备算，本账号今日无法再签）；点一下可重新查询';
+  ck.textContent = done ? '已签' : (devDone ? '设备已签' : '查询签到');
+  if (done) ck.title = '今日已签到（只读查询，不会发起签到）';
+  else if (devDone) ck.title = '该设备今日已签（签到限额按设备算，本账号今日无法再签）';
   else if (a.checkin_error) ck.title = '签到状态查询失败：' + a.checkin_error;
   ck.onclick = async () => {
     ck.disabled = true;
-    ck.textContent = '签到中…';
     try {
-      const d = await api('trae/accounts/' + encodeURIComponent(a.uid) + '/checkin', { method: 'POST' });
-      if (d.ok && d.device_already) toast(a.uid + ' 该设备今日已签到（签到限额按设备算，不是按账号）', 'warn');
-      else if (d.ok && d.unverified) toast(a.uid + ' 领取返回成功但回查未确认，下轮自动重试', 'warn');
-      else if (d.ok) toast(a.uid + (d.already ? ' 今日已签到' : ' 签到成功' + (d.reward > 0 ? ' +' + d.reward : '')), 'ok');
-      else toast('签到失败：' + (d.message || '未知错误'), 'err');
+      await api('trae_config');            // 重新查上游刷新本表
       loadTraeConfig();
-    } catch (e) { toast('签到失败：' + e.message, 'err'); }
-    finally { ck.disabled = false; ck.textContent = done ? '已签' : '签到'; }
+    } catch (e) { toast('查询失败：' + e.message, 'err'); }
+    finally { ck.disabled = false; }
   };
 
   const cr = document.createElement('button');
@@ -560,18 +558,13 @@ function traeAccountRow(a, cool) {
     finally { cr.disabled = false; cr.textContent = '积分'; }
   };
 
+  // 删除是写操作，统一在账号池页（那里同时删池条目与凭证文件）。
   const del = document.createElement('button');
   del.type = 'button';
-  del.className = 'xs ghost danger';
-  del.textContent = '删除';
-  del.onclick = async () => {
-    if (!confirm('删除 Trae 账号 ' + a.uid + '？其凭证（token / 设备私钥）一并删除，不可恢复。')) return;
-    try {
-      await api('trae/accounts/' + encodeURIComponent(a.uid) + '/remove', { method: 'POST' });
-      toast('已删除', 'ok');
-      loadTraeConfig();
-    } catch (e) { toast('删除失败：' + e.message, 'err'); }
-  };
+  del.className = 'xs ghost';
+  del.textContent = '在池中管理';
+  del.title = '增删与启停统一在账号池页操作';
+  del.onclick = () => { location.hash = '#accounts'; };
 
   tdActs.append(ck, cr, del);
   tr.append(tdMark, tdWho, tdStatus, tdCred, tdOk, tdFlight, tdUsage, tdLast, tdActs);
@@ -593,22 +586,14 @@ function renderTraeAccounts(list, cooldowns) {
   tb.replaceChildren(frag);
 }
 function collectTraeConfig() {
-  const accounts = [];
-  const disabled = [];
-  for (const row of $('traeAccBody').children) {
-    const uid = row.dataset.uid;
-    if (!uid) continue;
-    accounts.push(uid);
-    const on = row.querySelector('.trae-acc-on');
-    if (on && !on.checked) disabled.push(uid);
-  }
+  // 账号列表**不在这里提交**：Trae 账号与 CodeBuddy 同在账号池，增删/启停由池
+  // 管理。省略 accounts 字段（而非传空数组）才会走后端的「保留全部账号」分支；
+  // 传 [] 会删除全部账号的文件。
   return {
     enabled: $('traeEnabled').checked,
     chat_base: $('traeChatBase').value.trim(),
     ide_version: $('traeIdeVersion').value.trim(),
     timeout_seconds: 120,
-    accounts: accounts,
-    disabled: disabled,
     schedule: {
       checkin_enabled: $('traeCheckinEnabled').checked,
       checkin_hours: parseHours($('traeCheckinHours').value),
@@ -636,17 +621,32 @@ async function loadTraeConfig() {
     $('traeNote').textContent = '';
   } catch (e) { /* 后端未提供该接口时静默 */ }
 }
-$('btnTraeSyncProfiles').onclick = async () => {
-  const btn = $('btnTraeSyncProfiles');
-  btn.disabled = true; btn.textContent = '同步中…';
+/* syncTraeNicknames 从上游 GetUserInfo 拉昵称（账号池页与 Trae 页共用）。 */
+async function syncTraeNicknames(btn, idleText) {
+  if (btn) { btn.disabled = true; btn.textContent = '同步中…'; }
   try {
     const d = await api('trae/sync_profiles', { method: 'POST' });
     toast('昵称同步完成：更新 ' + (d.updated || 0) + ' 个' +
       (d.failed ? '，失败 ' + d.failed + ' 个' : ''), d.failed ? 'warn' : 'ok');
     loadTraeConfig();
+    if (typeof loadOverview === 'function') loadOverview(true);
   } catch (e) { toast('同步失败：' + e.message, 'err'); }
-  finally { btn.disabled = false; btn.textContent = '同步昵称'; }
-};
+  finally { if (btn) { btn.disabled = false; btn.textContent = idleText; } }
+}
+/* showTraeCheckinStatus 展示最近一次 Trae 批量签到结果（两处入口共用）。 */
+async function showTraeCheckinStatus() {
+  try {
+    const d = await api('trae/checkin_status');
+    const rs = d.results || [];
+    if (!rs.length) { toast('还没有签到记录', ''); return; }
+    renderTraeCheckinNote(rs, d.last_run);
+  } catch (e) { toast('查询失败：' + e.message, 'err'); }
+}
+if ($('btnTraeSyncProfiles')) $('btnTraeSyncProfiles').onclick = () =>
+  syncTraeNicknames($('btnTraeSyncProfiles'), 'Trae 昵称');
+if ($('btnTraeSyncProfiles2')) $('btnTraeSyncProfiles2').onclick = () =>
+  syncTraeNicknames($('btnTraeSyncProfiles2'), '同步昵称');
+if ($('btnTraeCheckinStatus')) $('btnTraeCheckinStatus').onclick = showTraeCheckinStatus;
 $('btnTraeReload').onclick = loadTraeConfig;
 $('btnTraeSave').onclick = async () => {
   const btn = $('btnTraeSave');
@@ -659,54 +659,16 @@ $('btnTraeSave').onclick = async () => {
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '保存 Trae 配置'; }
 };
-/* traeLoginBody 收集登录发起参数：storage.json 优先（它自带设备号）。 */
+/* traeLoginBody 收集登录发起参数：storage.json 优先（它自带设备号）。
+   Trae 登录入口已并入「添加账号」弹窗，这里读的是弹窗里的字段。 */
 function traeLoginBody() {
   const body = {};
-  const storage = ($('traeLoginStorage').value || '').trim();
-  const devId = ($('traeLoginDeviceId').value || '').trim();
+  const storage = ($('addTraeStorage') ? $('addTraeStorage').value || '' : '').trim();
+  const devId = ($('addTraeDeviceId') ? $('addTraeDeviceId').value || '' : '').trim();
   if (storage) body.storage_json = storage;
   if (devId) body.device_id = devId;
   return body;
 }
-$('btnTraeLogin').onclick = async () => {
-  const btn = $('btnTraeLogin');
-  btn.disabled = true;
-  try {
-    const d = await api('trae/login/start', { method: 'POST', body: JSON.stringify(traeLoginBody()) });
-    const src = {
-      storage: '来自 storage.json',
-      explicit: '手动指定',
-      imported: '沿用已导入设备',
-      shared: '与已有账号共用，一天只有一个能签成',
-      generated: '自动生成，登录会被拒（20405）',
-    }[d.device_source] || d.device_source;
-    $('traeLoginHint').innerHTML = '授权链接已生成（设备 ' + esc(d.device_id || '') +
-      ' · ' + esc(src) + '）：' +
-      '<a href="' + esc(d.url) + '" target="_blank" rel="noopener">打开授权页</a>。' +
-      '完成授权后浏览器会跳转到回调地址，把**地址栏完整 URL** 复制到右侧输入框。';
-    window.open(d.url, '_blank', 'noopener');
-    toast(d.warning || '授权链接已生成，请在浏览器完成授权', d.warning ? 'warn' : 'ok');
-  } catch (e) { toast('生成失败：' + e.message, 'err'); }
-  finally { btn.disabled = false; }
-};
-$('btnTraeFinish').onclick = async () => {
-  const cb = $('traeCallback').value.trim();
-  if (!cb) { toast('请先粘贴浏览器地址栏的完整回调 URL', 'err'); return; }
-  const btn = $('btnTraeFinish');
-  btn.disabled = true;
-  btn.textContent = '登录中…';
-  try {
-    const body = { callback_url: cb };
-    const devId = ($('traeLoginDeviceId').value || '').trim();
-    if (devId) body.device_id = devId;
-    const d = await api('trae/login/finish', { method: 'POST', body: JSON.stringify(body) });
-    toast('登录成功：' + d.uid + (d.has_device_key ? '（含设备签名能力）' : '（无设备密钥，续期可能受限）'), 'ok');
-    $('traeCallback').value = '';
-    $('traeLoginStorage').value = '';
-    loadTraeConfig();
-  } catch (e) { toast('登录失败：' + e.message, 'err'); }
-  finally { btn.disabled = false; btn.textContent = '完成登录'; }
-};
 $('btnTraeImport').onclick = async () => {
   const raw = $('traeStorage').value.trim();
   const uid = $('traeStorageUid').value.trim();
@@ -757,40 +719,7 @@ function renderTraeCheckinNote(results, lastRun) {
   }
   $('traeCheckinNote').textContent = (lastRun ? '[' + lastRun + '] ' : '') + parts.join('　');
 }
-$('btnTraeCheckinAll').onclick = async () => {
-  const btn = $('btnTraeCheckinAll');
-  if (!confirm('对全部可用 Trae 账号执行一轮签到？（账号间限速，账号多时耗时较长）')) return;
-  btn.disabled = true;
-  btn.textContent = '签到中…';
-  try {
-    const d = await api('trae/checkin_all', { method: 'POST' });
-    const rs = d.results || [];
-    let ok = 0, already = 0, devAlready = 0, unverified = 0, fail = 0;
-    for (const r of rs) {
-      if (r.status === 'success') ok++;
-      else if (r.status === 'already') already++;
-      else if (r.status === 'device_already') devAlready++;
-      else if (r.status === 'unverified') unverified++;
-      else if (r.status === 'fail') fail++;
-    }
-    let msg = '签到完成：成功 ' + ok + '，已签 ' + already;
-    if (devAlready) msg += '，设备今日已签 ' + devAlready;
-    if (unverified) msg += '，待确认 ' + unverified;
-    msg += '，失败 ' + fail;
-    toast(msg, (fail || unverified) ? 'err' : 'ok');
-    renderTraeCheckinNote(rs);
-    loadTraeConfig();
-  } catch (e) { toast('签到失败：' + e.message, 'err'); }
-  finally { btn.disabled = false; btn.textContent = '全部签到'; }
-};
-$('btnTraeCheckinStatus').onclick = async () => {
-  try {
-    const d = await api('trae/checkin_status');
-    const rs = d.results || [];
-    if (!rs.length) { toast('还没有签到记录', ''); return; }
-    renderTraeCheckinNote(rs, d.last_run);
-  } catch (e) { toast('查询失败：' + e.message, 'err'); }
-};
+$('btnTraeCheckinStatus2').onclick = showTraeCheckinStatus;
 
 /* ── Anthropic / Claude Code 接入（独立 anthropic.json，模式同 Responses 配置） ── */
 async function loadAnthropicConfig() {
