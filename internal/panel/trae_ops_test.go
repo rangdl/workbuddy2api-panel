@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	backendtrae "github.com/linguo2625469/workbuddy2api-panel/internal/backend/trae"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 )
 
@@ -41,6 +43,23 @@ func newTraeOpsPanel(t *testing.T, upstreamURL string) (*Panel, string) {
 		TraeScheduler: sched,
 	})
 	return p, path
+}
+
+// newTraeOpsPanelWithPool 与 newTraeOpsPanel 相同，但把 Trae 账号按真实启动
+// 路径（backend/trae.Wrap）放进账号池，用于验证「签到后首页按钮变已签」。
+func newTraeOpsPanelWithPool(t *testing.T, upstreamURL string) (*Panel, *pool.Pool) {
+	t.Helper()
+	p, path := newTraeOpsPanel(t, upstreamURL)
+	cfg, err := trae.Load(path, "")
+	if err != nil || cfg == nil {
+		t.Fatalf("加载 trae.json: %v", err)
+	}
+	pl := pool.New("")
+	for _, a := range backendtrae.Wrap(cfg) {
+		pl.Add(a)
+	}
+	p.cfg.Pool = pl
+	return p, pl
 }
 
 // newTraeOpsUpstream 假上游：签到成功 + 积分包响应。
@@ -165,6 +184,106 @@ func TestTraeCheckinAllAndStatus(t *testing.T) {
 	if !st.OK || st.LastRun == "" || len(st.Results) != 1 {
 		t.Fatalf("签到结果查询不符: %s", rec.Body)
 	}
+}
+
+// TestTraeCheckinMarksPoolCheckinDone 签到后首页账号表格的「签到」按钮必须变「已签」。
+//
+// 回归：Trae 签到链路此前从不写 pool 的 last_checkin_day，于是签过之后按钮
+// 永远显示「签到」（Trae 配置页走实时查询，两处口径不一致）。
+func TestTraeCheckinMarksPoolCheckinDone(t *testing.T) {
+	srv := newTraeOpsUpstream(t)
+	p, pl := newTraeOpsPanelWithPool(t, srv.URL)
+
+	if st := statusByUID(t, pl, "u-1"); st.CheckinDone {
+		t.Fatalf("签到前不应是已签: %+v", st)
+	}
+	if rec := traeDo(p, http.MethodPost, "/panel/api/trae/accounts/u-1/checkin", ""); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
+	}
+	if st := statusByUID(t, pl, "u-1"); !st.CheckinDone {
+		t.Fatalf("单号签到后账号池应显示已签: %+v", st)
+	}
+}
+
+// TestTraeCheckinAllMarksPoolCheckinDone 批量签到同样回写（面板未注入
+// OnOutcomes 时就地补写，保证两条路径都覆盖）。
+func TestTraeCheckinAllMarksPoolCheckinDone(t *testing.T) {
+	srv := newTraeOpsUpstream(t)
+	p, pl := newTraeOpsPanelWithPool(t, srv.URL)
+
+	if rec := traeDo(p, http.MethodPost, "/panel/api/trae/checkin_all", ""); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
+	}
+	if st := statusByUID(t, pl, "u-1"); !st.CheckinDone {
+		t.Fatalf("批量签到后账号池应显示已签: %+v", st)
+	}
+}
+
+// TestCheckinUnverifiedDoesNotMarkDone 只认「本账号已签」：unverified / fail /
+// skipped / device_already 都不标记已签（device_already 是设备维度，本账号没签）。
+func TestCheckinUnverifiedDoesNotMarkDone(t *testing.T) {
+	if got := trae.CheckinDoneUIDs([]trae.CheckinOutcome{
+		{UID: "a", Status: "unverified"},
+		{UID: "b", Status: "fail"},
+		{UID: "c", Status: "skipped"},
+		{UID: "d", Status: "success"},
+		{UID: "e", Status: "already"},
+		{UID: "f", Status: "device_already"},
+		{UID: "d", Status: "already"}, // 重复 uid 只出一次
+	}); len(got) != 2 || got[0] != "d" || got[1] != "e" {
+		t.Fatalf("CheckinDoneUIDs = %v, want [d e]", got)
+	}
+}
+
+// TestTraeCheckinDeviceAlreadyDoesNotMarkDone 设备维度已签（9095）不标记账号已签。
+//
+// 限额按设备算：多账号共用同一设备号时只有第一个能签成，其余账号会拿到
+// 9095。若把这些号也标成「已签」，首页按钮会谎报，运维会以为每个号都签了。
+func TestTraeCheckinDeviceAlreadyDoesNotMarkDone(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case trae.EndpointCheckinStatus:
+			_, _ = w.Write([]byte(`{"code":0,"checked_in":false}`))
+		case trae.EndpointCheckinClaim:
+			_, _ = w.Write([]byte(`{"code":9095,"message":"该设备今日已签到"}`))
+		default:
+			_, _ = w.Write([]byte(`{"code":0}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	p, pl := newTraeOpsPanelWithPool(t, srv.URL)
+	rec := traeDo(p, http.MethodPost, "/panel/api/trae/accounts/u-1/checkin", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
+	}
+	var got struct {
+		OK            bool `json:"ok"`
+		Already       bool `json:"already"`
+		DeviceAlready bool `json:"device_already"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.OK || !got.Already || !got.DeviceAlready {
+		t.Fatalf("9095 应按设备已签回传: %s", rec.Body)
+	}
+	if st := statusByUID(t, pl, "u-1"); st.CheckinDone {
+		t.Fatalf("设备维度已签不应标记账号已签: %+v", st)
+	}
+}
+
+// statusByUID 按裸 uid 取池状态（Trae 的池键是 "trae:uid"，List 输出裸 uid）。
+func statusByUID(t *testing.T, pl *pool.Pool, uid string) pool.Status {
+	t.Helper()
+	for _, st := range pl.List() {
+		if st.UID == uid {
+			return st
+		}
+	}
+	t.Fatalf("池中找不到账号 %s", uid)
+	return pool.Status{}
 }
 
 // TestTraeOpsUnavailable 未注入 scheduler / client 时返回 501。

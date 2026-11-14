@@ -960,6 +960,14 @@ func (p *Panel) fillTraeCheckinStatus(ctx context.Context, cfg *trae.Config, vie
 			} else {
 				snap.done = st.CheckedIn
 				snap.deviceAlready = st.DeviceAlready
+				// 上游已确认本账号今日已签时回填账号池：首页按钮读的是
+				// pool.last_checkin_day，而用户可能在官方 App / 别的机器 /
+				// 修复前就签过了——只靠"本进程签成功才写"的话，这些账号
+				// 在首页永远显示「签到」。仅账号维度（CheckedIn）回填，
+				// 设备维度已签（DeviceAlready）不代表本账号签过。
+				if st.CheckedIn != nil && *st.CheckedIn && p.cfg.Pool != nil {
+					p.cfg.Pool.NoteCheckinDone(views[i].UID)
+				}
 			}
 			mu.Lock()
 			results[views[i].UID] = snap

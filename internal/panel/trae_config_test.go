@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 
+	backendtrae "github.com/linguo2625469/workbuddy2api-panel/internal/backend/trae"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 )
 
@@ -479,6 +481,47 @@ func TestTraeConfigCheckinStatusErrorIsReported(t *testing.T) {
 	}
 	if a.CheckinError == "" {
 		t.Error("应记录查询失败原因")
+	}
+}
+
+// TestTraeConfigCheckinStatusBackfillsPool 上游已签时回填账号池。
+//
+// 回归：首页「签到/已签」按钮只读 pool.last_checkin_day。用户可能在官方 App、
+// 别的机器或修复前就签过了，只按"本进程签成功才写"的话，这些账号在首页
+// 永远显示「签到」。配置页本来就会实时查上游，顺手把结果回填池即可。
+func TestTraeConfigCheckinStatusBackfillsPool(t *testing.T) {
+	dir := t.TempDir()
+	p, path := newTraePanel(t, dir)
+	pl := pool.New("")
+	p.cfg.Pool = pl
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"checked_in":true}`))
+	}))
+	defer srv.Close()
+
+	cfg := &trae.Config{
+		Enabled: true, ChatBase: trae.DefaultChatBase, APITraeBase: srv.URL,
+		Accounts: []trae.Account{{UID: "u-1", AccessToken: "t1", DeviceID: "1234567890123456"}},
+	}
+	writeTraeTestConfig(t, path, cfg)
+	loaded, err := trae.Load(path, "")
+	if err != nil || loaded == nil {
+		t.Fatalf("加载 trae.json: %v", err)
+	}
+	for _, a := range backendtrae.Wrap(loaded) {
+		pl.Add(a)
+	}
+	if st := statusByUID(t, pl, "u-1"); st.CheckinDone {
+		t.Fatalf("回填前不应是已签: %+v", st)
+	}
+
+	if rec := traeDo(p, http.MethodGet, "/panel/api/trae_config", ""); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
+	}
+	if st := statusByUID(t, pl, "u-1"); !st.CheckinDone {
+		t.Fatalf("上游已签应回填到账号池: %+v", st)
 	}
 }
 

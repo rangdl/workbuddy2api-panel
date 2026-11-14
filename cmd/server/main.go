@@ -347,6 +347,14 @@ func main() {
 		tcfg.SaveAccount = saveTraeAccountFunc(tcfg.AuthDir)
 		return tcfg
 	}, traeClient, traeCool)
+	// 签到结果回写账号池：面板首页的「签到/已签」按钮读 pool 的 last_checkin_day，
+	// 而 Trae 签到走 internal/trae（不能反向 import pool）。自动排程与面板批量
+	// 都经由 RunOnce，挂在这里两条路径一并覆盖。
+	traeSched.OnOutcomes = func(outcomes []trae.CheckinOutcome) {
+		for _, uid := range trae.CheckinDoneUIDs(outcomes) {
+			p.NoteCheckinDone(uid)
+		}
+	}
 
 	// handlerRef 供面板热重载闭包引用（panel 先于 handler 构造，闭包在保存时才调用）。
 	var handlerRef *server.Handler

@@ -32,8 +32,38 @@ func (p *Panel) traeCheckinAll(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), traeCheckinAllTimeout)
 	defer cancel()
 	outcomes := p.cfg.TraeScheduler.RunOnce(ctx)
+	// 池的签到标记由 Scheduler.OnOutcomes 回写（main 注入），面板批量路径
+	// 若无注入（如测试构造的面板）则就地补一次，保证两条路径都有回写。
+	if p.cfg.TraeScheduler.OnOutcomes == nil {
+		p.noteTraeCheckinOutcomes(outcomes)
+	}
 	p.invalidateCheckinCache() // 签到后状态已变，下次拉配置必须重新查
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": outcomes})
+}
+
+// noteTraeCheckinDone 把 Trae 账号的「今日已签」写回账号池。
+//
+// 为什么必须做：首页账号表格的「签到/已签」按钮只读 pool.Status.CheckinDone
+// （源自 entry.lastCheckinDay），而 Trae 的签到链路（面板单号 / 批量 / 自动排程）
+// 走的是 internal/trae，此前从不写这个字段——于是签过之后按钮仍是「签到」。
+// Trae 配置页的签到标记走实时查询上游，两处口径因此长期不一致。
+//
+// uid 传裸 uid：lookupLocked 会按 uidIndex 反查复合键（"trae:xxx"）。
+func (p *Panel) noteTraeCheckinDone(uid string) {
+	if p.cfg.Pool == nil || uid == "" {
+		return
+	}
+	p.cfg.Pool.NoteCheckinDone(uid)
+}
+
+// noteTraeCheckinOutcomes 按批量签到结果回写账号池的签到标记。
+//
+// 判定口径集中在 trae.CheckinDoneUIDs（与 main 注入给 Scheduler.OnOutcomes
+// 的回调同源），避免面板与自动排程两条路径各写一份规则而漂移。
+func (p *Panel) noteTraeCheckinOutcomes(outcomes []trae.CheckinOutcome) {
+	for _, uid := range trae.CheckinDoneUIDs(outcomes) {
+		p.noteTraeCheckinDone(uid)
+	}
 }
 
 // traeAccountCheckin 单账号签到。
@@ -72,6 +102,8 @@ func (p *Panel) traeAccountCheckin(w http.ResponseWriter, r *http.Request) {
 			cls := apiErr.Classification()
 			if cls.Already {
 				// 9004 / 9095 不是失败：按「今日已签」回传。
+				// 9004 缺设备头 / 9095 该设备今日已签，都是**设备维度**的拒绝，
+				// 本账号未必签过，故不标记账号已签（否则首页按钮会谎报「已签」）。
 				p.invalidateCheckinCache()
 				writeJSON(w, http.StatusOK, map[string]any{
 					"ok": true, "uid": uid, "already": true,
@@ -91,6 +123,11 @@ func (p *Panel) traeAccountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.cfg.TraeCooldowns != nil && !res.Already {
 		p.cfg.TraeCooldowns.Clear(uid) // 签到成功即清冷却
+	}
+	// 账号池的「签到/已签」按钮只看 last_checkin_day，不写回则永远显示「签到」。
+	// 设备维度已签（DeviceAlready 但非 Already）与回查未确认都不算本账号签成。
+	if !res.Unverified && !(res.Already && res.DeviceAlready) {
+		p.noteTraeCheckinDone(uid)
 	}
 	p.invalidateCheckinCache()
 	writeJSON(w, http.StatusOK, map[string]any{

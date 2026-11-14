@@ -54,6 +54,12 @@ type Scheduler struct {
 	Client   *Client
 	// Cooldowns 账号冷却表（跳过冷却中账号；签到失败也写回）。
 	Cooldowns *Cooldowns
+	// OnOutcomes 一轮签到结束后的回调（可空）。
+	//
+	// 存在的理由：账号池的「签到/已签」按钮读的是 pool 的 last_checkin_day，
+	// 而本包不能反向 import pool（依赖方向单向）。由 main 注入写回逻辑，
+	// 自动排程与面板触发（都经由 RunOnce）共用同一条回写路径。
+	OnOutcomes func([]CheckinOutcome)
 
 	mu sync.Mutex
 	// lastRunDay 上次执行日期（本地时区 "2006-01-02"），防同日重复执行。
@@ -183,6 +189,10 @@ func (s *Scheduler) RunOnce(ctx context.Context) []CheckinOutcome {
 	s.lastOutcomes = outcomes
 	s.lastRunAt = time.Now()
 	s.mu.Unlock()
+	// 回写账号池的签到标记（自动排程与面板批量/单号共用，见 OnOutcomes）。
+	if s.OnOutcomes != nil {
+		s.OnOutcomes(outcomes)
+	}
 	return outcomes
 }
 
@@ -282,6 +292,31 @@ func (s *Scheduler) LastOutcomes() ([]CheckinOutcome, time.Time) {
 	out := make([]CheckinOutcome, len(s.lastOutcomes))
 	copy(out, s.lastOutcomes)
 	return out, s.lastRunAt
+}
+
+// CheckinDoneUIDs 从一轮结果里挑出「本账号今日已签」的 uid（去重）。
+//
+// 口径：
+//   - success  本次签成；
+//   - already  上游确认该账号今日已签；
+//   - device_already **不算**——它表示"这个设备今日已签"，是设备维度而非账号维度
+//     （多账号共用设备号时，只有第一个账号真签过）。标成已签会让运维以为
+//     本账号也签了，而实际上它今天一次都没签成。
+//   - unverified 也不算：claim 说成功但回查未翻转，可能没到账，要保留重试信号。
+func CheckinDoneUIDs(outcomes []CheckinOutcome) []string {
+	seen := make(map[string]bool, len(outcomes))
+	out := make([]string, 0, len(outcomes))
+	for _, o := range outcomes {
+		switch o.Status {
+		case "success", "already":
+			if o.UID == "" || seen[o.UID] {
+				continue
+			}
+			seen[o.UID] = true
+			out = append(out, o.UID)
+		}
+	}
+	return out
 }
 
 // hourMatches hours 是否包含 h（空列表视为未配置 → 不匹配）。
