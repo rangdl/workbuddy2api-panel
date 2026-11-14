@@ -76,8 +76,7 @@ func QualifiedUID(a Account) string {
 	return a.Backend() + ":" + a.UID()
 }
 
-// CredentialUnwrapper 可选能力：从账号对象取回该上游的原始凭证。
-//
+// CredentialUnwrapper 可选能力：从账号对象取回该上游的原始凭证。//
 // 为什么需要：少数既有调用方（面板的任务/导入接口、handler 的探测）仍然
 // 直接操作某家上游的凭证类型。它们无法通过 Account 接口拿到，因为那会让
 // gateway 依赖具体上游。

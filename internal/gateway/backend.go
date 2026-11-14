@@ -90,6 +90,26 @@ type Inbound struct {
 	// 为什么放在 Inbound 而不是让 backend 自己生成：同一次客户端请求可能换号
 	// 重试，各次尝试必须产出**同一个** id，否则客户端会把重试结果当成新消息。
 	ChatID string
+
+	// ── 以下字段供需要协议特化的 backend 使用（CodeBuddy 用，Trae 忽略）──
+
+	// ConversationRequestID 轮级聚合键（出站 X-Conversation-Request-ID）。
+	//
+	// 上游按这个键做前缀缓存聚合：同轮的所有上游调用共享一个键，
+	// 换 user 消息才换键。空 = 不带该头。
+	ConversationRequestID string
+	// TraceID 调用方透传的追踪 id（出站 X-Trace-ID）。
+	TraceID string
+	// DeclaredTools 本请求声明过的工具名白名单。
+	//
+	// 上游在没有 tools 时会把工具调用吐成原生标记文本，回程需要按名单判定
+	// 是否还原成结构化 tool_calls。nil = 用弱判定。
+	DeclaredTools map[string]bool
+	// FrameHint 把流内 error 帧映射成 gateway_hint 文本（nil = 不加）。
+	//
+	// 文案策略属于网关配置（server 层知识），协议判定属于 backend——
+	// 所以 backend 负责识别帧、由调用方提供文案。
+	FrameHint func(kind, payload string) string
 }
 
 // Outbound 规范化的上游回程。
@@ -123,6 +143,10 @@ type StreamStats struct {
 	ErrorMsg  string
 	// FinishReason 结束原因。
 	FinishReason string
+	// Repaired 本次流中还原成功的工具调用数（原生标记文本 → tool_calls）。
+	Repaired int
+	// RepairSeen 识别到工具调用标记的块数（含还原失败的）。
+	RepairSeen int
 	// Usage token 用量（可能为 nil）。
 	Usage *Usage
 	// Remain 上游流内上报的剩余额度（Trae 的 notify_usage 独有）。

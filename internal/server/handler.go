@@ -164,6 +164,9 @@ func NewHandler(cfg Config) *Handler {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	// 兼容垫片：未注入注册表但给了 Upstream 时补一个 CodeBuddy backend，
+	// 让「CodeBuddy 走统一 Backend.Chat」对老部署与既有测试同样可达。
+	h.ensureCodeBuddyBackend()
 	// 冷却表可由外部注入（面板需读同一实例展示冷却状态）；未注入时自建。
 	h.traeCool = cfg.TraeCooldowns
 	if h.traeCool == nil {

@@ -6,10 +6,13 @@ package codebuddy
 
 import (
 	"context"
+	"errors"
+	"log"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -96,6 +99,33 @@ func (x Account) Keepalive(ctx context.Context) error {
 		return gateway.ErrUnsupported
 	}
 	return x.client.RefreshToken(x.A)
+}
+
+// NeedsRefresh 实现 gateway.Freshener：token 是否已进入需要提前刷新的窗口。
+func (x Account) NeedsRefresh(within time.Duration) bool {
+	if x.A == nil {
+		return false
+	}
+	return x.A.NeedsRefresh(within)
+}
+
+// Freshen 刷新 token 并落盘。
+//
+// 落盘失败只记日志不报错：刷新本身已成功，本次请求可以继续；下次启动会用旧
+// token，但那时会再刷一次。把落盘失败升级成请求失败会让一次磁盘故障演变成
+// 全量请求 5xx。
+func (x Account) Freshen(ctx context.Context) error {
+	if x.client == nil || x.A == nil {
+		return errors.New("codebuddy: account has no client")
+	}
+	if err := x.client.RefreshToken(x.A); err != nil {
+		return err
+	}
+	if err := x.A.SaveAtomic(); err != nil {
+		log.Printf("ERR: [codebuddy] freshen acct=%s: save auth failed: %v",
+			logfmt.Label(x.A.UID, x.A.NicknameValue()), err)
+	}
+	return nil
 }
 
 // Credential 实现 gateway.CredentialUnwrapper。

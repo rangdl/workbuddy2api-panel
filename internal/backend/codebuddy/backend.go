@@ -78,12 +78,21 @@ func (b *Backend) Supports(acc gateway.Account, bareModel string) bool {
 func (b *Backend) WireModel(acc gateway.Account, bareModel string) string { return bareModel }
 
 // Chat 发一次请求并返回规范化回程。
+//
+// 本方法承载 CodeBuddy 的全部协议特化：会话头族（ConversationID /
+// ConversationRequestID / TraceID）、出站请求体预处理、回程 SSE 规范化与
+// DSML 工具调用标记修复、流内 error 帧识别。调度（选号/租约/换号/记账）
+// 仍由 server 层负责——那是请求级职责，不属于单个上游。
 func (b *Backend) Chat(ctx context.Context, acc gateway.Account, in *gateway.Inbound) (*gateway.Outbound, error) {
 	a := Unwrap(acc)
 	if a == nil {
 		return nil, errors.New("codebuddy: account is not a CodeBuddy auth")
 	}
-	meta := upstream.ChatMeta{ConversationID: in.ConversationID}
+	meta := upstream.ChatMeta{
+		ConversationID:        in.ConversationID,
+		ConversationRequestID: in.ConversationRequestID,
+		TraceID:               in.TraceID,
+	}
 	rc, status, body, err := b.Client.ChatStreamContext(ctx, a, in.Raw, in.ClientIP, meta)
 	if err != nil {
 		// 传输层错误：不是上游业务拒绝，交给调用方决定是否换号。
@@ -102,6 +111,10 @@ func (b *Backend) Chat(ctx context.Context, acc gateway.Account, in *gateway.Inb
 		}
 		return nil, &gateway.Failure{Decision: d, HTTPStatus: status, Body: body}
 	}
+	// 工具名名单：上游在没有 tools 的请求里会把工具调用吐成原生标记文本，
+	// 修复层用它做严格判定。名单来自「本请求声明的 tools」与「会话历史里
+	// 出现过的工具名」两个来源——实测 tools 声明会在中转环节丢失。
+	declaredTools := in.DeclaredTools
 	return &gateway.Outbound{
 		Status: status,
 		Stream: rc,
@@ -110,21 +123,28 @@ func (b *Backend) Chat(ctx context.Context, acc gateway.Account, in *gateway.Inb
 			// errFrame 保存上游 error 帧原文（6004 限流 / 内容拦截 / 审核），
 			// 流结束后据此判定账号处置。
 			var errFrame string
-			err := upstream.StreamTo(emit, rc,
-				func(payload string) string { return "" }, // hint 由 handler 层决定，这里不加
+			// 标记修复：第二个参数 true = 名单为空时启用弱判定——tools 声明在
+			// 链路上丢失是实测最常见的泄漏成因，只做严格判定等于对主场景不设防。
+			repair := upstream.NewMarkupRepair(declaredTools, true)
+			// hintFn 惰性求值：正常流零开销，只有真撞到 error 帧才组装文案。
+			hintFn := func(payload string) string {
+				if in.FrameHint == nil {
+					return ""
+				}
+				return in.FrameHint(upstream.FrameKind(payload).String(), payload)
+			}
+			err := upstream.StreamTo(emit, rc, hintFn,
 				upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
-				upstream.WithMarkupRepair(nil),
+				upstream.WithMarkupRepair(repair),
 			)
+			stats.Repaired = repair.Converted()
+			stats.RepairSeen = repair.Seen()
 			if errFrame != "" {
 				stats.SentAny = true // 已下发内容后才发现错误帧，不能再改状态码
 				stats.ErrorMsg = errFrame
 				stats.ErrorCode = -1 // 非业务码：由 ErrorMsg 携带原文
 			}
 			if err != nil {
-				// 空流（200 但无有效帧）不是写失败，交给调用方按上游故障处置。
-				if upstream.IsEmptyStreamError(err) {
-					return stats, err
-				}
 				return stats, err
 			}
 			stats.SentAny = true

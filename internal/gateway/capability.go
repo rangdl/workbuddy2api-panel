@@ -15,7 +15,10 @@
 // 池按跳过处理：不是失败、不记错误、不进冷却。
 package gateway
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // TravelOutcome 一次旅行巡检的结果。
 type TravelOutcome struct {
@@ -187,4 +190,18 @@ type ActivityOutcome struct {
 // ActivityReporter 账号支持「活跃上报」玩法（点亮连登天数 / 解锁领养）。
 type ActivityReporter interface {
 	ReportActivity(ctx context.Context) (ActivityOutcome, error)
+}
+
+// Freshener 账号能在发起请求前自检并续期凭证。
+//
+// 为什么是可选能力而不是渠道循环里的固定步骤：不同上游的续期时机不同。
+// CodeBuddy 的 accessToken 会临近过期，需要提前刷新并落盘；Trae 的 token
+// 由 ChatStream 自己保证新鲜，不需要预刷新。
+//
+// 未实现 = 不需要预刷新。
+type Freshener interface {
+	// NeedsRefresh 报告是否已进入需要刷新凭证的时间窗。
+	NeedsRefresh(within time.Duration) bool
+	// Freshen 刷新凭证并落盘。失败时返回分类后的错误，由调用方决定换号与否。
+	Freshen(ctx context.Context) error
 }
