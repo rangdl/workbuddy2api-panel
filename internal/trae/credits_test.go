@@ -539,3 +539,46 @@ func TestCreditsSummaryJSONKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestAsStringTolerant 上游时间字段可能是字符串或数字。
+//
+// 回归：旧的 str() 只做 v.(string) 断言，数字直接返回空串，
+// 于是面板上 Trae 的发放/到期日期全是空白（实测确认 base.start_time
+// 与 base.end_time 在某些账号下是数字时间戳）。
+func TestAsStringTolerant(t *testing.T) {
+	cases := []struct {
+		in   any
+		want string
+	}{
+		{"2026-09-14 15:52:38", "2026-09-14 15:52:38"},
+		{"  1866", "1866"},                  // 去空白
+		{float64(1790000000), "1790000000"}, // Unix 秒
+		{float64(1790000000.5), "1790000000.5"},
+		{int64(42), "42"},
+		{42, "42"},
+		{nil, ""},
+		{map[string]any{}, ""},
+	}
+	for _, c := range cases {
+		if got := asString(c.in); got != c.want {
+			t.Errorf("asString(%v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestParseCreditPackNumericTime 数字类型的 start_time/end_time 也要解析出来。
+func TestParseCreditPackNumericTime(t *testing.T) {
+	pack := map[string]any{
+		"entitlement_base_info": map[string]any{
+			"product_id": float64(208),
+			"quota":      map[string]any{"credits_limit": float64(500)},
+			"usage":      map[string]any{"credits_amount": float64(100)},
+			"start_time": float64(1790000000),
+			"end_time":   float64(1792592000),
+		},
+	}
+	p := parseCreditPack(pack)
+	if p.StartTime != "1790000000" || p.EndTime != "1792592000" {
+		t.Errorf("数字时间戳未解析: start=%q end=%q", p.StartTime, p.EndTime)
+	}
+}

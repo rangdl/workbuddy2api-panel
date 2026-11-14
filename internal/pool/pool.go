@@ -383,25 +383,39 @@ func (p *Pool) Add(a gateway.Account) {
 
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
 // 剔除结果持久化回 state.json，避免已删账号在下次启动时被 load() 复活。
+//
+// **作用域限定在同一批 backend**：Trae 账号不经 SyncToDir 装载（它由
+// syncTraeAccountsToPool → Add 单独注入），如果把「不在本次扫描列表里」
+// 一律当作已删除，Trae 账号会在启动时被清掉——连带它的 paused/disabled
+// 等状态一起丢。用户报的「暂停后重启变回未暂停」正是这条路径。
 func (p *Pool) SyncToDir(auths []gateway.Account) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	// seen 用复合键：SyncToDir 的语义是「本次扫描到的账号集合」，
 	// 用裸 uid 会让两个上游的同名 uid 互相视为「已存在」而漏删。
 	seen := make(map[string]bool, len(auths))
+	// scoped 记录本次扫描涉及的 backend：只有这些 backend 的账号才参与剔除。
+	scoped := make(map[string]bool, 2)
 	for _, a := range auths {
 		if a == nil {
 			continue
 		}
 		seen[gateway.QualifiedUID(a)] = true
+		scoped[a.Backend()] = true
 		p.upsertLocked(a)
 	}
 	changed := false
-	for key := range p.byUID {
-		if !seen[key] {
-			p.removeIndexedLocked(key)
-			changed = true
+	for key, e := range p.byUID {
+		if seen[key] {
+			continue
 		}
+		// 未出现在扫描列表里，且该 backend 本次被扫描过 → 判定为已删除。
+		// backend 未被扫描时（如 Trae）保持原状，不由本方法负责。
+		if e.acc != nil && !scoped[e.acc.Backend()] {
+			continue
+		}
+		p.removeIndexedLocked(key)
+		changed = true
 	}
 	if changed {
 		p.saveLocked()

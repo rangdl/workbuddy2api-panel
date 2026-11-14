@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -397,8 +398,11 @@ func parseCreditPack(pack map[string]any) CreditPack {
 		p.CreditsUsed = floatOf(usage["credits_amount"])
 	}
 	p.StartTime = str(base["start_time"])
+	// EndTime 候选顺序：base 的 end_time → base 的 expire_time →
+	// pack 的 expire_time → pack 的 yearly_expire_time。
+	// 最后一项是年包专用（诊断实测 pack 顶层有这个键）。
 	p.EndTime = firstNonEmpty(str(base["end_time"]), str(base["expire_time"]),
-		str(pack["expire_time"]))
+		str(pack["expire_time"]), str(pack["yearly_expire_time"]))
 	p.GroupName = firstNonEmpty(str(pack["display_desc"]), str(base["group_name"]))
 	p.NextBillingTime = intOf(base["next_billing_time"])
 	return p
@@ -684,5 +688,32 @@ func floatOf(v any) float64 {
 		return 0
 	default:
 		return 0
+	}
+}
+
+// asString 宽容取字符串：上游字段可能是 string / 数字 / json.Number。
+//
+// 为什么需要：积分接口的 start_time / end_time 在不同账号上类型不一致
+// （有的是 "2026-09-14 15:52:38"，有的是 Unix 时间戳数字）。旧的 str()
+// 只做 `v.(string)` 断言，数字类型直接返回空串——于是面板上 Trae 的
+// 发放日期与到期日期全是空白。
+func asString(v any) string {
+	switch x := v.(type) {
+	case string:
+		return strings.TrimSpace(x)
+	case float64:
+		// JSON 数字一律 float64；整数时间戳按整数输出，避免 "1.79e+09"。
+		if x == float64(int64(x)) {
+			return strconv.FormatInt(int64(x), 10)
+		}
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case int:
+		return strconv.Itoa(x)
+	case json.Number:
+		return x.String()
+	default:
+		return ""
 	}
 }

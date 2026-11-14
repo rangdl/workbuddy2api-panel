@@ -340,8 +340,7 @@ func maxTokensOf(obj map[string]any) int64 {
 
 // str 取字符串值（非字符串返回空串）。
 func str(v any) string {
-	s, _ := v.(string)
-	return s
+	return asString(v)
 }
 
 // genUUIDLike 生成 uuid-like 十六进制串（8-4-4-4-12），
