@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -138,8 +139,31 @@ func TestTraeConfigNeverLeaksCredentials(t *testing.T) {
 	}
 }
 
-// TestTraeConfigSavePreservesCredentials 保存非敏感字段时必须保留凭证（面板不回显，也就无法回传）。
-func TestTraeConfigSavePreservesCredentials(t *testing.T) {
+// traeAuthFiles 列出目录下的文件名（排序，便于比较）。目录不存在返回 nil。
+func traeAuthFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatalf("读取目录 %s: %v", dir, err)
+	}
+	out := make([]string, 0, len(ents))
+	for _, e := range ents {
+		if !e.IsDir() {
+			out = append(out, e.Name())
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestTraeConfigSaveOnlyTouchesConfig 保存配置只改配置项，**不动账号**。
+//
+// 账号的新增/移除/启停只走账号池接口。请求里即便带了 accounts/disabled，
+// 服务端也完全忽略——历史上这些字段能删除凭证文件，那不该由"保存配置"触发。
+func TestTraeConfigSaveOnlyTouchesConfig(t *testing.T) {
 	dir := t.TempDir()
 	p, path := newTraePanel(t, dir)
 	cfg := trae.Config{
@@ -150,9 +174,11 @@ func TestTraeConfigSavePreservesCredentials(t *testing.T) {
 		},
 	}
 	writeTraeTestConfig(t, path, &cfg)
+	// 保存前先记下 authDir 里的文件集合，保存后必须完全一致。
+	before := traeAuthFiles(t, dir)
 
-	// 启用 + 只保留 u-2 + 调整顺序
-	body := `{"enabled":true,"chat_base":"https://custom.example","ide_version":"9.9.9","accounts":["u-2"],"disabled":[]}`
+	// 故意带上 accounts（只含 u-2）与 disabled：都应被忽略。
+	body := `{"enabled":true,"chat_base":"https://custom.example","ide_version":"9.9.9","accounts":["u-2"],"disabled":["u-2"]}`
 	rec := traeDo(p, http.MethodPost, "/panel/api/trae_config", body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
@@ -164,32 +190,17 @@ func TestTraeConfigSavePreservesCredentials(t *testing.T) {
 	if !saved.Enabled || saved.ChatBase != "https://custom.example" || saved.IDEVersion != "9.9.9" {
 		t.Fatalf("非敏感字段未生效: %+v", saved)
 	}
-	if len(saved.Accounts) != 1 || saved.Accounts[0].UID != "u-2" {
-		t.Fatalf("账号列表未按提交重建: %+v", saved.Accounts)
+	// 账号必须原样保留（含被排除的 u-1），且启用状态不受 disabled 影响。
+	if len(saved.Accounts) != 2 {
+		t.Fatalf("保存配置不应改动账号列表，实际 %+v", saved.Accounts)
 	}
-	if saved.Accounts[0].AccessToken != "tok-2" {
-		t.Errorf("凭证应被保留，得到 %q", saved.Accounts[0].AccessToken)
+	for _, a := range saved.Accounts {
+		if a.Disabled {
+			t.Errorf("保存配置不应改动账号启用状态: %+v", a)
+		}
 	}
-}
-
-// TestTraeConfigSaveDisableAccount disabled 列表生效。
-func TestTraeConfigSaveDisableAccount(t *testing.T) {
-	dir := t.TempDir()
-	p, path := newTraePanel(t, dir)
-	cfg := trae.Config{
-		Enabled: true, ChatBase: trae.DefaultChatBase,
-		Accounts: []trae.Account{{UID: "u-1", AccessToken: "t1"}},
-	}
-	writeTraeTestConfig(t, path, &cfg)
-
-	rec := traeDo(p, http.MethodPost, "/panel/api/trae_config",
-		`{"enabled":true,"chat_base":"`+trae.DefaultChatBase+`","accounts":["u-1"],"disabled":["u-1"]}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
-	}
-	saved, _ := trae.Load(path, "")
-	if saved == nil || len(saved.Accounts) != 1 || !saved.Accounts[0].Disabled {
-		t.Fatalf("禁用未生效: %+v", saved)
+	if after := traeAuthFiles(t, dir); !equalStrings(before, after) {
+		t.Fatalf("保存配置不应增删账号文件: before=%v after=%v", before, after)
 	}
 }
 

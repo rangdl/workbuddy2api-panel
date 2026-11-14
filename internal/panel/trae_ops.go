@@ -200,6 +200,29 @@ func (p *Panel) traeCheckinStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// poolTraeAccounts 返回「池里未被禁用」的 Trae 账号凭证对象。
+//
+// 账号范围一律以池为准：池是权威列表（增删、禁用、暂停都在池里），trae.json
+// 只是凭证的存放处。直接遍历 cfg.Accounts 会绕过池的状态——例如已在池里禁用
+// 的账号仍会被打上游请求。
+//
+// 过滤规则与调度器一致：Disabled 的跳过（暂停选号不影响，保号任务照常）。
+func (p *Panel) poolTraeAccounts(cfg *trae.Config) []*trae.Account {
+	if p.cfg.Pool == nil || cfg == nil {
+		return nil
+	}
+	out := make([]*trae.Account, 0, len(cfg.Accounts))
+	for _, st := range p.cfg.Pool.List() {
+		if st.Backend != pool.BackendTrae || st.Disabled {
+			continue
+		}
+		if a := cfg.AccountByUID(st.UID); a != nil && a.AccessToken != "" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 // traeSyncProfiles 批量从上游拉取昵称并落盘。
 //
 // 为什么需要：Trae 的 JWT 里没有用户名字段，昵称只能来自 GetUserInfo。
@@ -208,6 +231,9 @@ func (p *Panel) traeCheckinStatus(w http.ResponseWriter, r *http.Request) {
 //   - 用户在上游改了昵称（与 CodeBuddy 的「昵称同步」同语义）。
 //
 // 与 CodeBuddy 的实现对齐：并发受限、失败不影响其它账号、只在变化时写盘。
+//
+// 账号范围取自**账号池**（不是 trae.json）：池才是账号的权威列表，人工在池里
+// 禁用/暂停的账号不该被这里绕过。trae.json 只用来查凭证对象。
 func (p *Panel) traeSyncProfiles(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.TraeClient == nil || p.cfg.TraePath == "" {
 		writeErr(w, http.StatusNotImplemented, "trae client not available")
@@ -228,11 +254,7 @@ func (p *Panel) traeSyncProfiles(w http.ResponseWriter, r *http.Request) {
 		failed  int
 	)
 	sem := make(chan struct{}, 4)
-	for i := range cfg.Accounts {
-		acc := &cfg.Accounts[i]
-		if acc.Disabled || acc.AccessToken == "" {
-			continue
-		}
+	for _, acc := range p.poolTraeAccounts(cfg) {
 		wg.Add(1)
 		go func(a *trae.Account) {
 			defer wg.Done()
@@ -321,11 +343,8 @@ func (p *Panel) refreshTraeCredits() {
 		p.traeCredit.at = make(map[string]time.Time)
 	}
 	var due []*trae.Account
-	for i := range cfg.Accounts {
-		a := &cfg.Accounts[i]
-		if a.Disabled || a.AccessToken == "" {
-			continue
-		}
+	// 账号范围取自池（见 poolTraeAccounts）：池里已禁用/已移除的账号不再打上游。
+	for _, a := range p.poolTraeAccounts(cfg) {
 		if now.Sub(p.traeCredit.at[a.UID]) < traeCreditTTL {
 			continue
 		}

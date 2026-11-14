@@ -115,12 +115,27 @@ func (p *Panel) getTraeConfig(w http.ResponseWriter, r *http.Request) {
 			view.OAuthCallback = cfg.OAuthCallbackURL
 		}
 		for _, a := range cfg.Accounts {
+			// 只展示池里的账号：池是权威列表。凭证文件残留（例如手工塞进
+			// auths/ 但未进池）不该出现在这里，否则用户会以为它在参与调度。
+			// 池里禁用状态优先——人工在池里禁用后，这里应立刻反映。
+			poolDisabled, inPool := false, true
+			if p.cfg.Pool != nil {
+				st, ok := p.cfg.Pool.Status(a.UID)
+				if !ok {
+					inPool = false
+				} else {
+					poolDisabled = st.Disabled
+				}
+			}
+			if !inPool {
+				continue
+			}
 			view.Accounts = append(view.Accounts, traeAccountView{
 				UID:          a.UID,
 				Name:         a.Name,
 				DeviceID:     a.DeviceID,
 				MachineID:    a.MachineID,
-				Disabled:     a.Disabled,
+				Disabled:     a.Disabled || poolDisabled,
 				AppVersion:   a.AppVersion,
 				HasToken:     a.AccessToken != "",
 				HasRefresh:   a.RefreshToken != "",
@@ -156,29 +171,29 @@ func (p *Panel) getTraeConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": path, "config": view})
 }
 
-// traeSaveRequest 保存请求（只含非敏感字段；凭证不在本接口内传递）。
+// traeSaveRequest 保存请求：只含**纯配置**，不含任何账号维度。
+//
+// 账号的增删与启停一律走账号池接口（/panel/api/accounts/*）。这里保留
+// Accounts/Disabled 两个字段只为兼容旧前端请求，**服务端完全忽略**——
+// 它们曾经能删除账号文件，那是不该由"保存配置"触发的能力。
 type traeSaveRequest struct {
 	Enabled        bool             `json:"enabled"`
 	ChatBase       string           `json:"chat_base"`
 	IDEVersion     string           `json:"ide_version"`
 	TimeoutSeconds int              `json:"timeout_seconds"`
-	// Accounts 保留的 uid 列表（顺序即轮转顺序）。
-	//
-	// 注意区分「缺省」与「空数组」：
-	//   - nil（请求里没有这个字段）→ 保留全部现有账号，只更新配置项。账号池页
-	//     保存配置时就走这条路径——账号增删在池里做，不该由这里顺手删文件。
-	//   - []（显式空数组）→ 删除全部账号。这是旧版「按表格提交」的语义，保留
-	//     兼容，但任何「只想改配置」的调用都必须传 nil。
-	Accounts []string `json:"accounts"`
-	// Disabled 其中被禁用的 uid（仅对 Accounts 里出现的生效）。
-	Disabled []string         `json:"disabled"`
-	Schedule traeScheduleView `json:"schedule"`
+	Accounts       []string         `json:"accounts"` // 已废弃：忽略
+	Disabled       []string         `json:"disabled"` // 已废弃：忽略
+	Schedule       traeScheduleView `json:"schedule"`
 }
 
-// saveTraeConfig 保存非敏感字段：读-改-写，**保留已有账号的凭证字段**。
+// saveTraeConfig 保存**纯配置**：启用开关 / 对话 base / IDE 版本 / 签到排程。
 //
-// 之所以按 uid 列表而非完整账号对象提交：面板不回显凭证，也就无法原样回传；
-// 用 uid 列表表达"保留哪些账号、顺序、启用状态"，凭证由服务端从旧文件带过来。
+// 本接口**不碰任何账号文件**（不写、不删）。账号的一切变更——新增、移除、
+// 启用、禁用——都只走账号池那套接口，凭证文件的生命周期与池条目严格绑定。
+//
+// 历史包袱：早前这个接口按「提交的 accounts 列表即全集」处理，未出现的账号
+// 会被删除凭证文件。那等于让"保存配置"这个动作可以删号，一次误操作就不可
+// 恢复。现在账号列表完全不由本接口管理，请求里带不带 accounts 都不影响账号。
 func (p *Panel) saveTraeConfig(w http.ResponseWriter, r *http.Request) {
 	path := p.cfg.TraePath
 	if path == "" {
@@ -202,10 +217,6 @@ func (p *Panel) saveTraeConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if old == nil {
 		old = &trae.Config{}
-	}
-	disabled := make(map[string]bool, len(req.Disabled))
-	for _, uid := range req.Disabled {
-		disabled[uid] = true
 	}
 	next := &trae.Config{
 		Enabled:           req.Enabled,
@@ -231,34 +242,12 @@ func (p *Panel) saveTraeConfig(w http.ResponseWriter, r *http.Request) {
 			Hours:   req.Schedule.Hours,
 			GapMS:   old.Schedule.GapMS,
 		},
+		// 账号原样带过（凭证随对象一起），仅用于让 Load/Validate 与热重载看到
+		// 同一份列表——**不写回任何账号文件**（trae.json 里账号是 json:"-"）。
+		Accounts: append([]trae.Account(nil), old.Accounts...),
 	}
 	if req.IDEVersion != "" {
 		next.IDEVersion = req.IDEVersion
-	}
-	// 按提交的 uid 顺序重建账号列表，凭证从旧配置带入。
-	// 账号本身**不写回 trae.json**（json:"-"）：这里只把「保留哪些、是否禁用」
-	// 落到各自的账号文件上，删掉的账号还要移除其文件。
-	//
-	// req.Accounts 为 nil（请求未带该字段）= 账号列表不由本接口管理：原样保留
-	// 全部账号，仅更新配置项。账号池页保存配置走这条路径——账号增删在池里做，
-	// 这里若按"未提交即删除"处理，一次保存就会删光所有 Trae 账号的凭证文件。
-	keepUIDs := req.Accounts
-	if keepUIDs == nil {
-		keepUIDs = make([]string, 0, len(old.Accounts))
-		for i := range old.Accounts {
-			keepUIDs = append(keepUIDs, old.Accounts[i].UID)
-		}
-	}
-	for _, uid := range keepUIDs {
-		a := old.AccountByUID(uid)
-		if a == nil {
-			continue // 未知 uid：忽略（不凭空造账号）
-		}
-		a.Disabled = disabled[uid]
-		if !a.Disabled {
-			a.DisabledReason = ""
-		}
-		next.Accounts = append(next.Accounts, *a)
 	}
 	if err := next.Validate(); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -267,23 +256,6 @@ func (p *Panel) saveTraeConfig(w http.ResponseWriter, r *http.Request) {
 	if err := writeTraeConfig(path, next); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
-	}
-	// 账号文件：保留的写回（启用状态可能变了），未保留的删除。
-	kept := make(map[string]bool, len(next.Accounts))
-	for i := range next.Accounts {
-		kept[next.Accounts[i].UID] = true
-		if err := trae.SaveAccount(next.AuthDir, &next.Accounts[i]); err != nil {
-			writeErr(w, http.StatusInternalServerError, "保存账号 "+next.Accounts[i].UID+" 失败: "+err.Error())
-			return
-		}
-	}
-	for _, a := range old.Accounts {
-		if kept[a.UID] {
-			continue
-		}
-		if err := trae.RemoveAccount(old.AuthDir, a.UID); err != nil {
-			log.Printf("panel: 删除 Trae 账号文件 %s 失败: %v", a.UID, err)
-		}
 	}
 	p.invalidateCheckinCache()
 	p.reloadTrae()
@@ -759,6 +731,10 @@ func (p *Panel) traeLoginFinish(w http.ResponseWriter, r *http.Request) {
 }
 
 // removeTraeAccount 移除账号（按 uid）。
+//
+// **必须同时出池**：只删凭证文件会留下一个"幽灵"池条目——它仍出现在账号池
+// 列表里、仍参与选号，直到下次热重载才发现凭证没了。池是账号的权威列表，
+// 文件与池条目要么都在，要么都不在。
 func (p *Panel) removeTraeAccount(w http.ResponseWriter, r *http.Request) {
 	path := p.cfg.TraePath
 	if path == "" {
@@ -774,6 +750,10 @@ func (p *Panel) removeTraeAccount(w http.ResponseWriter, r *http.Request) {
 	if cfg.AccountByUID(uid) == nil {
 		writeErr(w, http.StatusNotFound, "账号不存在: "+uid)
 		return
+	}
+	// 先出池（幂等：不在池里也继续删文件）。
+	if p.cfg.Pool != nil {
+		p.cfg.Pool.Remove(uid)
 	}
 	// 删除账号文件本身（trae.json 不含账号，无需改写）。
 	if err := trae.RemoveAccount(cfg.AuthDir, uid); err != nil {
