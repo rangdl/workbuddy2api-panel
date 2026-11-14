@@ -112,6 +112,13 @@ func (h *Handler) dispatchViaBackend(w http.ResponseWriter, r *http.Request,
 	}
 
 	started := time.Now()
+	// Trae 运行期计数（在途/成功/失败/用量）：面板「Trae 签到」区块读这张表。
+	// CodeBuddy 不走这里——它的统计由池的 tokenUsage 与 Status 提供。
+	// defer 保证任何 return 都结算一次，否则在途数永远不归零。
+	traeFinish := h.beginTraeStat(acc)
+	statOK := false
+	defer func() { traeFinish(statOK) }()
+
 	out, err := be.Chat(r.Context(), acc, in)
 	if err != nil {
 		// 同账号内重试（RetryHook）：内容拦截这类「换个提示词就能过」的失败，
@@ -138,7 +145,7 @@ func (h *Handler) dispatchViaBackend(w http.ResponseWriter, r *http.Request,
 	defer out.Stream.Close()
 
 	if at.Stream {
-		h.forwardBackendStream(w, acc, out, chatID, at.Ref.Bare, at.ModelRate, st, started, at.SessionKey)
+		statOK = h.forwardBackendStream(w, acc, out, chatID, at.Ref.Bare, at.ModelRate, st, started, at.SessionKey)
 		return backendHandled, nil
 	}
 
@@ -165,6 +172,7 @@ func (h *Handler) dispatchViaBackend(w http.ResponseWriter, r *http.Request,
 	// 与流式路径**完全同一套**记账：清冷却、清负缓存、粘性跟随、token/缓存/积分。
 	// 此前非流式只设了 toks，于是同步请求的 credit 恒为 "-"、缓存率不显示、
 	// 面板上的「成功/失败」与「用量·次数」也从不增加。
+	statOK = true
 	h.cfg.Pool.NoteSuccess(acc.UID())
 	h.cfg.Pool.BlockModelClear(acc.UID(), at.Ref.Bare)
 	h.bindSessionAfterSuccess(at.SessionKey, acc)
@@ -172,6 +180,24 @@ func (h *Handler) dispatchViaBackend(w http.ResponseWriter, r *http.Request,
 	h.recordBackendUsage(acc, at.Ref.Bare, at.ModelRate, stats, st)
 	writeJSON(w, http.StatusOK, agg)
 	return backendHandled, nil
+}
+
+// beginTraeStat 开启 Trae 账号的运行期计数；非 Trae 账号返回空操作。
+//
+// 为什么在 dispatch 而不是在 backend 内部：面板读的是 h.cfg.TraeStats 这个实例
+// （main 构造、面板与 handler 共用），backend 包不认识它。
+// 为什么必须用 defer：在途计数不归零会让面板永远显示「1 个在途」。
+func (h *Handler) beginTraeStat(acc gateway.Account) func(ok bool) {
+	stats := h.cfg.TraeStats
+	if stats == nil || acc == nil || acc.Backend() != "trae" {
+		return func(bool) {}
+	}
+	finish := stats.Begin(acc.UID())
+	return func(ok bool) {
+		// UsageDelta 的 token/延迟字段由 recordBackendUsage 另行落池，
+		// 这里只结算在途与成功/失败（面板的「成功/失败/在途」三列）。
+		finish(ok, trae.UsageDelta{})
+	}
 }
 
 // handleBackendFailure 按 Decision 处置账号，返回三态结果与失败原因。
@@ -191,6 +217,8 @@ func (h *Handler) handleBackendFailure(acc gateway.Account, model string, err er
 			st.status = http.StatusServiceUnavailable
 			log.Printf("WARN: [server] backend upstream timeout acct=%s: %v (rotation stopped, account not penalized)",
 				acc.UID(), err)
+			// 失败尝试也计请求数：否则超时在「用量」视图里等于没发生。
+			h.recordBackendAccounting(acc, model, "", gateway.StreamStats{}, st)
 			return backendStop, fmt.Errorf("%w: %v", errUpstreamTimeout, err)
 		}
 		// 网络抖动：只换号，不喂熔断（传输层错误对连败熔断过于严苛）。
@@ -199,6 +227,7 @@ func (h *Handler) handleBackendFailure(acc gateway.Account, model string, err er
 			h.cfg.Pool.NoteFailures(acc.UID())
 		}
 		st.status = http.StatusServiceUnavailable
+		h.recordBackendAccounting(acc, model, "", gateway.StreamStats{}, st)
 		return backendRetry, err
 	}
 	h.applyFailure(acc, model, f, st)
@@ -211,27 +240,14 @@ func (h *Handler) handleBackendFailure(acc gateway.Account, model string, err er
 	// 全算成成功（请求数不涨即视为没发生），重试放大也看不见。
 	// 与内联路径的 recordAttempt(空 delta) 同口径。
 	h.recordBackendAccounting(acc, model, "", gateway.StreamStats{}, st)
-	// Rotate 是 backend 对「换号是否有意义」的明确判断：请求体畸形、模型不可用
-	// 这类错误换到哪个号都得到同样结果，继续轮转只会把同一个错误烧 MaxRotate 遍。
-	//
-	// 例外：裸模型名 + 跨域回退开启时，ActionModelCooldown 仍然值得换号——
-	// 「这个号这个模型不可用」不代表「另一个域也没有这个模型」。handler 侧
-	// 会在这时继续轮转并切到另一域。
-	if !f.Decision.Rotate && !h.crossRealmRetryWorthwhile(f) {
+	// Rotate 是 backend 对「换号是否有意义」的明确判断：请求体畸形这类错误
+	// 换到哪个号都得到同样结果，继续轮转只会把同一个错误烧 MaxRotate 遍。
+	// （模型不可用也标 Rotate=true——换有权限的账号仍可能成功，见
+	// codebuddy.Decide 的 ErrModelBlocked 分支。）
+	if !f.Decision.Rotate {
 		return backendStop, f
 	}
 	return backendRetry, f
-}
-
-// crossRealmRetryWorthwhile 判断「模型级避让」是否仍值得换号重试。
-//
-// 跨域回退（pool.cross_domain_fallback）开启时，裸模型名可能在 cn 域全池
-// 被模型级冷却，但 global 域仍有可用账号。此时停手会让请求白失败一次。
-func (h *Handler) crossRealmRetryWorthwhile(f *gateway.Failure) bool {
-	if h.cfg.Pool == nil || !h.cfg.Pool.CrossDomainFallback() {
-		return false
-	}
-	return f.Decision.Action == gateway.ActionModelCooldown
 }
 
 // applyFailure 按账号所属上游选择精细错误策略。
@@ -241,11 +257,13 @@ func (h *Handler) crossRealmRetryWorthwhile(f *gateway.Failure) bool {
 // fail-fast 等精细化处置；applyDecision 只有固定时长（1m/5m/12h）。把 CodeBuddy
 // 的失败交给 applyDecision 就是**降级**。
 //
-// 判据用 Decision.Kind（backend 的 Decide 已原样保留 ErrKind 字符串），
-// 而不是判断账号后端类型——这样 Trae 的错误（Kind="plan_limit" 等）自然落到
-// applyDecision，无需维护一张「哪些 Kind 属于 CodeBuddy」的名单。
+// 判据用 Decision.Policy（由 backend 显式标注），**不用 Kind 字符串反查**：
+// Trae 的 soft_rate/session_dead/server/client 与 CodeBuddy 的 ErrKind 同名，
+// 按名字反查会把 Trae 失败送进 CodeBuddy 策略（冷却放大约 10 倍、
+// session_dead 的 reason 写成 12153、5xx 不再冷却）。
 func (h *Handler) applyFailure(acc gateway.Account, model string, f *gateway.Failure, st *chatStat) {
-	if kind, ok := codebuddyErrKind(f.Decision.Kind); ok {
+	if f.Decision.Policy == gateway.PolicyCodeBuddy {
+		kind := upstream.ErrKindOf(f.Decision.Kind)
 		body := string(f.Body)
 		if body == "" {
 			body = f.Message
@@ -256,29 +274,15 @@ func (h *Handler) applyFailure(acc gateway.Account, model string, f *gateway.Fai
 		if f.Decision.Cooldown > 0 {
 			uerr = &upstream.Error{Kind: kind, Status: f.HTTPStatus, RetryAfter: f.Decision.Cooldown}
 		}
+		if kind == upstream.ErrNone {
+			// Kind 不认识（防御）：回落到通用策略，别让一次分类失误吞掉处置。
+			h.applyDecision(acc, model, f)
+			return
+		}
 		h.applyErrorPolicy(acc.UID(), kind, body, model, uerr)
 		return
 	}
 	h.applyDecision(acc, model, f)
-}
-
-// codebuddyErrKind 把 Decision.Kind 还原成 CodeBuddy 的 ErrKind。
-//
-// 只认 upstream.ErrKind 的合法名字；Trae 的 Kind（plan_limit / device_proof /
-// model_unknown 等）不在其中，自然返回 false。
-//
-// 跳过 ErrNone：它是「成功」，不会作为失败 Kind 出现，且若真出现也不该按
-// CodeBuddy 策略处置（那是防御分支）。
-func codebuddyErrKind(name string) (upstream.ErrKind, bool) {
-	for k := upstream.ErrKind(0); k <= upstream.ErrClient; k++ {
-		if k == upstream.ErrNone {
-			continue
-		}
-		if k.String() == name {
-			return k, true
-		}
-	}
-	return 0, false
 }
 
 // applyDecision 按统一处置动作更新账号状态。
@@ -319,7 +323,7 @@ func (h *Handler) applyDecision(acc gateway.Account, modelForDecision string, f 
 
 // forwardBackendStream 把 backend 的规范化帧转发给客户端。
 func (h *Handler) forwardBackendStream(w http.ResponseWriter, acc gateway.Account,
-	out *gateway.Outbound, chatID, model, modelRate string, st *chatStat, started time.Time, sessKey string) {
+	out *gateway.Outbound, chatID, model, modelRate string, st *chatStat, started time.Time, sessKey string) (ok bool) {
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -329,22 +333,50 @@ func (h *Handler) forwardBackendStream(w http.ResponseWriter, acc gateway.Accoun
 	st.status = http.StatusOK
 
 	ctrl := http.NewResponseController(w)
+	// ttfb 在**首个真实帧**上打点，而不是 Convert 跑完之后取总耗时。
+	// 后者会让流水行的 TTFB 列 ≈ 端到端耗时，且 tokensPerSecond 扣 TTFB 的
+	// 那套口径（issue #34/#127）失效。
+	var firstFrameAt time.Time
 	res, err := out.Convert(func(frame []byte) error {
 		if len(frame) == 0 {
 			return nil
+		}
+		if firstFrameAt.IsZero() {
+			firstFrameAt = time.Now()
 		}
 		if _, werr := w.Write(frame); werr != nil {
 			return werr
 		}
 		return ctrl.Flush()
 	})
+	if !firstFrameAt.IsZero() {
+		st.ttfb = firstFrameAt.Sub(started)
+	}
 	if err != nil {
 		// 状态码已发出，只能记日志。
-		log.Printf("WARN: [server] backend stream acct=%s: %v", acc.UID(), err)
+		if upstream.IsEmptyStreamError(err) {
+			// 上游 200 但空流（0 有效帧）：Convert 已写 error 帧 + [DONE] 兜底
+			// （HTTP 头已发出只能 200），但这是上游缺陷不是成功——状态收敛到 502
+			// 观测，与非流式 Aggregate 空流 → 502 upstream_parse 同语义。
+			// 只认 IsEmptyStreamError：客户端断连的写失败不误标（人已走，
+			// 502 观测没有意义）。
+			st.status = http.StatusBadGateway
+			st.outcome = reqlog.OutcomeStreamError
+			log.Printf("WARN: [server] backend stream acct=%s model=%s: empty upstream stream (200+0 frames)",
+				acc.UID(), model)
+			h.recordBackendUsage(acc, model, modelRate, res, st)
+			return
+		}
+		// 客户端断连（写失败）：上游帧无恙，账号健康——照常记成功并让粘性跟上，
+		// 请求日志归为 Interrupted（人已走，未完成）。
+		// 不区分会把断连误记成 success，污染用量视图的成功率。
+		st.outcome = reqlog.OutcomeInterrupted
+		h.cfg.Pool.NoteSuccess(acc.UID())
+		h.cfg.Pool.BlockModelClear(acc.UID(), model)
+		h.bindSessionAfterSuccess(sessKey, acc)
+		log.Printf("WARN: [server] backend stream acct=%s: %v (client disconnected)", acc.UID(), err)
+		h.recordBackendUsage(acc, model, modelRate, res, st)
 		return
-	}
-	if res.SentAny {
-		st.ttfb = time.Since(started)
 	}
 	// 流内 error 帧（Trae 的自定义事件流 / CodeBuddy 的 6004 限流帧）：
 	// 已下发内容后无法改状态码，但仍要按错误分类处置账号——否则一个正在
@@ -370,6 +402,7 @@ func (h *Handler) forwardBackendStream(w http.ResponseWriter, acc gateway.Accoun
 	// 而不是选号时，避免把会话钉在一个正在限流的号上。
 	h.bindSessionAfterSuccess(sessKey, acc)
 	h.recordBackendUsage(acc, model, modelRate, res, st)
+	return true
 }
 
 // bindSessionAfterSuccess 成功一跳后把会话绑定到该账号（未启用粘性时为空操作）。
@@ -384,14 +417,37 @@ func (h *Handler) bindSessionAfterSuccess(sessKey string, acc gateway.Account) {
 //
 // 与内联路径的流尾处置同语义：不记成功、不清负缓存、不绑粘性。
 func (h *Handler) applyStreamError(acc gateway.Account, model string, res gateway.StreamStats, st *chatStat) {
+	// 按上游分流分类器：两家的流内错误码表完全不同。
+	//   - CodeBuddy：error 帧原文 → FrameKind（6004/11102/内容拦截等）
+	//   - Trae：业务码在 StreamStats.ErrorCode（1005/4008/4017/20405 等），
+	//     必须走 trae.Classify。把业务码当 HTTP status 传给 upstream.Classify
+	//     会让「额度用尽」被当成未知错误——账号不冷却，继续被轮转选中。
+	if acc.Backend() == "trae" {
+		h.applyTraeStreamError(acc, model, res)
+		return
+	}
 	kind := upstream.FrameKind(res.ErrorMsg)
 	if kind == upstream.ErrNone {
 		// 非业务码（backend 用 ErrorCode=-1 标记「原文在 ErrorMsg」）：按上游原文分类。
-		kind = upstream.Classify(int(res.ErrorCode), res.ErrorMsg)
+		// 传 0 而不是 int(ErrorCode)：-1 不是合法 HTTP status，会干扰分类。
+		kind = upstream.Classify(0, res.ErrorMsg)
 	}
 	log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 		acc.UID(), model, kind, logfmt.Truncate(res.ErrorMsg, 200))
 	h.applyErrorPolicy(acc.UID(), kind, res.ErrorMsg, model, nil)
+}
+
+// applyTraeStreamError 处置 Trae 流内错误（用自己的分类器与决策表）。
+func (h *Handler) applyTraeStreamError(acc gateway.Account, model string, res gateway.StreamStats) {
+	cls := trae.Classify(0, nil, res.ErrorCode, res.ErrorMsg)
+	d := backendtrae.Decide(cls)
+	log.Printf("WARN: [server] stream acct=%s model=%s: trae stream error kind=%s code=%s action=%s payload=%s",
+		acc.UID(), model, cls.Kind, cls.Code, d.Action, logfmt.Truncate(res.ErrorMsg, 200))
+	h.applyDecision(acc, model, &gateway.Failure{
+		Decision:   d,
+		HTTPStatus: cls.HTTPStatus(),
+		Body:       []byte(res.ErrorMsg),
+	})
 }
 
 // recordBackendUsage 记录一次 backend 调用的用量（流式与非流式共用）。

@@ -54,6 +54,10 @@ type Config struct {
 	// nil 时回退静态字段（测试与裸用场景）。
 	Live *livecfg.Holder
 
+	// DegradeGate 降级状态机（可选）。nil 时 Handler 自建。
+	// main 需与 backend RetryHook 共享同一实例，否则降级期判定不同步。
+	DegradeGate *DegradeGate
+
 	// PromptMode "custom"（网关用自有提示词替换 system）/ "passthrough"（透传）。
 	PromptMode string
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
@@ -133,19 +137,20 @@ const ServiceName = "workbuddy2api"
 
 // Handler 主路由。
 type Handler struct {
-	cfg     Config
-	mux     *http.ServeMux
-	degrade degradeGate
+	cfg Config
+	mux *http.ServeMux
+	// degrade 降级状态机。可由 Config.DegradeGate 注入（main 需要与 backend
+	// 的 RetryHook 共享同一实例——两者不同步会让「降级期直达 Degraded」失效）。
+	degrade *degradeGate
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
 	// traeCfg Trae 上游配置（运行期可原子替换，供 backend 读）。
 	traeCfg atomic.Pointer[trae.Config]
-	// traeCool Trae 账号级冷却表（进程内，重启清零）。nil 时不做冷却判定。
-	traeCool *trae.Cooldowns
-	// traeStats Trae 账号运行期计数（成功/失败/在途/用量，进程内）。
-	// 与 pool 分账：Trae 账号不进 CodeBuddy 账号池，但面板要按同口径展示。
-	traeStats *trae.Stats
+	// 说明：Trae 的冷却与运行期计数都不在 Handler 上持有。
+	//   - 冷却由账号池统一承担（applyDecision → Pool.Cooldown）；
+	//   - 统计直连 cfg.TraeStats（面板与 handler 共用同一实例，见 beginTraeStat）。
+	// 这里曾有两个只用不读的副本字段，随 Trae 独立端点删除后已无意义。
 }
 
 // NewHandler 构建 handler。
@@ -162,20 +167,22 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
+	// Pool 兜底：chatCompletions 与 dispatch 里有多处裸解引用（Acquire、
+	// NoteSuccess、SetCredits…）。生产装配一定会注入，但 NewHandler(Config{})
+	// 这种测试/占位形态一旦真的处理请求就会 panic。给个空池比 panic 好——
+	// 空池会让请求自然返回 503 无可用账号。
+	if cfg.Pool == nil {
+		cfg.Pool = pool.New("")
+	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	// 降级状态机：可注入（与 backend RetryHook 共享），否则自建。
+	h.degrade = cfg.DegradeGate
+	if h.degrade == nil {
+		h.degrade = &degradeGate{}
+	}
 	// 兼容垫片：未注入注册表但给了 Upstream 时补一个 CodeBuddy backend，
 	// 让「CodeBuddy 走统一 Backend.Chat」对老部署与既有测试同样可达。
 	h.ensureCodeBuddyBackend()
-	// 冷却表可由外部注入（面板需读同一实例展示冷却状态）；未注入时自建。
-	h.traeCool = cfg.TraeCooldowns
-	if h.traeCool == nil {
-		h.traeCool = trae.NewCooldowns()
-	}
-	// 运行期计数同理：面板要展示成功/失败/在途/用量，必须共用同一实例。
-	h.traeStats = cfg.TraeStats
-	if h.traeStats == nil {
-		h.traeStats = trae.NewStats()
-	}
 	h.traeCfg.Store(cfg.Trae)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	// 联网搜索（Anthropic Messages 兼容形态，见 messages.go）。
@@ -876,6 +883,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if stickyUID != "" && acc.UID() == stickyUID {
 					unbindSticky()
 				}
+				// WAF IP 级 fail-fast（优先于退避——IP 级拦截时退避无意义）：
+				// 该次 WAF 403 喂入 IP 级状态机，若激活（短窗多号命中，说明
+				// 被拦的是出口 IP 而非某个账号）立即终止轮转——继续换号只会
+				// 把请求放大 MaxRotate 倍打同一出口 IP，加重风控。
+				// 账号级软冷却已在 applyFailure 里照常记账。
+				if isWafFailure(derr) && h.wafIP.noteWaf(acc.UID()) {
+					break
+				}
 				if !rotateBackoff(i, r.Context()) {
 					break
 				}
@@ -994,6 +1009,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	st.outcome = reqlog.OutcomeHTTPError
 }
 
+// isWafFailure 判断一次 backend 失败是否属于 WAF 拦截（供 IP 级 fail-fast 计数）。
+//
+// 判据用 Decision.Kind 而不是错误类型：backend 已把上游分类归一成 Kind 字符串，
+// 与 applyFailure 的分流口径保持一致。
+func isWafFailure(err error) bool {
+	var f *gateway.Failure
+	if !errors.As(err, &f) {
+		return false
+	}
+	return f.Decision.Kind == upstream.ErrWafBlock.String() ||
+		upstream.ErrKindOf(f.Decision.Kind) == upstream.ErrWafBlock
+}
+
 // asUpstreamError 把 backend 回传的 *gateway.Failure 还原成 *upstream.Error。
 //
 // 为什么需要：末端错误透传（状态码映射、code 改写、gateway_hint 文案、上游原文
@@ -1011,17 +1039,77 @@ func asUpstreamError(err error) error {
 	if msg == "" {
 		msg = f.Message
 	}
+	// 先按 CodeBuddy 的 ErrKind 名字还原；不命中说明是别的上游的 Kind。
 	kind := upstream.ErrKindOf(f.Decision.Kind)
 	if kind == upstream.ErrNone {
-		// Kind 不是 CodeBuddy 的枚举名（Trae 的 plan_limit / model_unknown 等）：
-		// 用 HTTP 状态码做一轮通用分类，让透传至少能区分限流/服务端错误/请求错误。
-		kind = upstream.Classify(f.HTTPStatus, msg)
+		// 非 CodeBuddy 的 Kind（Trae 的 plan_limit / model_unknown / device_proof…）。
+		//
+		// **不能**用 Classify(status, msg) 兜底：那会拿 Trae 的业务语义去套
+		// CodeBuddy 的中文文案词表，产生误导性分类（额度用尽 → ErrHardCredit，
+		// 末端 hint 指向「等次日 04:00 签到」，而 Trae 的恢复方式不是那个；
+		// 模型不可用 → ErrClient → 末端 503，客户端会当成过载无限重试）。
+		//
+		// 正确做法：查 Trae 自己的分类表还原成 (Kind, HTTPStatus) 语义。
+		// 末端透传只依赖 Kind 做状态码/code 映射，这里保留 Trae 的口径。
+		if cls, ok := traeClassificationOf(f.Decision); ok {
+			return &upstream.Error{
+				Kind:       upstreamKindForTrae(cls),
+				Status:     cls.HTTPStatus(),
+				Msg:        msg,
+				RetryAfter: f.Decision.Cooldown,
+			}
+		}
+		// 完全未知的 Kind：保守保留原状态与 ErrClient（不编造分类）。
+		return &upstream.Error{Kind: upstream.ErrClient, Status: f.HTTPStatus, Msg: msg}
 	}
 	return &upstream.Error{
 		Kind:       kind,
 		Status:     f.HTTPStatus,
 		Msg:        msg,
 		RetryAfter: f.Decision.Cooldown,
+	}
+}
+
+// traeClassificationOf 把 Trae 的 Decision 还原成它的 Classification。
+//
+// 只用于末端透传映射：Decision.Kind 是 Trae 的 ErrKind 字符串，Code/Message 原样搬运。
+func traeClassificationOf(d gateway.Decision) (trae.Classification, bool) {
+	switch trae.ErrKind(d.Kind) {
+	case trae.ErrPlanLimit, trae.ErrSessionDead, trae.ErrDeviceProof, trae.ErrModelUnknown,
+		trae.ErrSoftRate, trae.ErrServer, trae.ErrClient, trae.ErrRiskControl,
+		trae.ErrCheckinAlready, trae.ErrCheckinBusy:
+		return trae.Classification{
+			Kind:     trae.ErrKind(d.Kind),
+			Code:     d.Code,
+			Message:  d.Message,
+			Cooldown: d.Cooldown,
+			Disable:  d.Action == gateway.ActionDisable,
+			Already:  trae.ErrKind(d.Kind) == trae.ErrCheckinAlready,
+		}, true
+	}
+	return trae.Classification{}, false
+}
+
+// upstreamKindForTrae 把 Trae 的分类映射到末端透传用的 CodeBuddy ErrKind。
+//
+// 只影响「状态码 + code 字符串 + gateway_hint 文案」这几件事，不影响账号处置
+// （处置已经由 applyDecision 完成）。
+func upstreamKindForTrae(c trae.Classification) upstream.ErrKind {
+	switch c.Kind {
+	case trae.ErrPlanLimit:
+		return upstream.ErrHardCredit
+	case trae.ErrSessionDead, trae.ErrDeviceProof:
+		return upstream.ErrSessionDead
+	case trae.ErrModelUnknown:
+		return upstream.ErrModelBlocked
+	case trae.ErrSoftRate:
+		return upstream.ErrSoftRate
+	case trae.ErrServer:
+		return upstream.ErrServer
+	case trae.ErrRiskControl:
+		return upstream.ErrWafBlock
+	default:
+		return upstream.ErrClient
 	}
 }
 
@@ -1066,30 +1154,6 @@ func tokensPerSecond(completionTokens int64, total, ttfb time.Duration) (float64
 // 真流式下首帧到末帧通常铺满剩余窗口，200ms 远低于正常生成时长，不影响真实
 // 快速输出（如缓存命中后的爆发）被如实报告。
 const minGenWindow = 200 * time.Millisecond
-
-// promptTooLongMessage 11115 透传 message：上游 body 原文（含真实 token 数/
-// 上限值/requestId，客户端自行排查）；空 body 兜底为可读分类短文案（不编造原文）。
-func promptTooLongMessage(body string) string {
-	if strings.TrimSpace(body) == "" {
-		return "prompt is too long"
-	}
-	return body
-}
-
-// usageCreditTotal 从聚合响应取 usage.credit 与 total_tokens（成本台账非流式入口）。
-// 任一字段缺失/非法 → ok=false（不记录）。
-func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) {
-	usage, _ := resp["usage"].(map[string]any)
-	if usage == nil {
-		return 0, 0, false
-	}
-	c, _ := usage["credit"].(float64)
-	t, _ := usage["total_tokens"].(float64)
-	if t <= 0 {
-		return 0, 0, false
-	}
-	return c, int(t), true
-}
 
 // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2）：第 i 次轮转失败
 // （continue 换号前）等待 backoffAfter(i)（500ms·2^i 封顶 8s，±25% 抖动），
@@ -1284,9 +1348,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_, _ = w.Write(raw)
 }
 
-// writeOpenAIError 写 OpenAI 形错误体。type 固定 "api_error"（OpenAI 形状；
-// Anthropic 侧的 error.type 由 anthropic.ErrorToMessages 按状态另行映射，
-// 不经此处——429 的 rate_limit_error 语义在转换层补齐）。
+// writeOpenAIError 写 OpenAI 形错误体。type 固定 "api_error"。
+// （Anthropic 协议转换层已随 /v1/messages 一并删除，此处只输出 OpenAI 形状。）
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, map[string]any{
 		"error": map[string]any{

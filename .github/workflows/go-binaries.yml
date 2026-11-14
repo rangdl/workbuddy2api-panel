@@ -41,7 +41,7 @@ jobs:
         run: go vet ./...
       - name: gofmt check
         run: |
-          UNFMT=$(gofmt -l . | grep -v -e '^third_party' -e '^vendor' || true)
+          UNFMT=$(gofmt -l . | grep -v '^vendor' || true)
           if [ -n "$UNFMT" ]; then
             echo "::error::gofmt drift in: $UNFMT"
             echo "$UNFMT" | while read -r f; do gofmt -d "$f"; done

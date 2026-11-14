@@ -41,6 +41,11 @@ func (s *Scheduler) runBlackcat(ctx context.Context) {
 		log.Printf("blackcat: 当前不在 23:00–08:00 计数窗口，跳过")
 		return
 	}
-	pool.SetCapabilityDelay(nightChatAccountDelay)
-	s.cfg.Pool.BlackcatAll(ctx)
+	// 把本调度器的时钟口径同步给池：池层也有一道守卫（保护其它调用方），
+	// 两处必须用同一个时钟，否则测试注入 nowForNightWindow 只对一半生效。
+	clock := nowForNightWindow
+	pool.SetBlackcatWindowCheck(func(time.Time) bool {
+		return upstream.InNightWindow(clock())
+	})
+	s.cfg.Pool.BlackcatAll(pool.WithCapabilityDelay(ctx, nightChatAccountDelay))
 }

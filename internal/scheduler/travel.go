@@ -31,11 +31,16 @@ var travelAccountDelay = 800 * time.Millisecond
 // paused 账号照常参与（旅行是纯 RPC，不发模型对话）；
 // 末尾 poke 到站定时器：本趟可能派出了新行程，定时器需要按新的 arrive_at 重算。
 func (s *Scheduler) RunTravelNow() {
+	s.RunTravelContext(context.Background())
+}
+
+// RunTravelContext 同 RunTravelNow，但随 ctx 取消立即退出（停机用）。
+func (s *Scheduler) RunTravelContext(ctx context.Context) {
 	s.travelMu.Lock()
 	defer s.travelMu.Unlock()
-	pool.SetCapabilityDelay(travelAccountDelay)
 	enabled, maxPerRun := s.travelBlindboxCfg()
-	s.cfg.Pool.TravelAllWith(context.Background(), gateway.TravelOptions{
+	ctx = pool.WithCapabilityDelay(ctx, travelAccountDelay)
+	s.cfg.Pool.TravelAllWith(ctx, gateway.TravelOptions{
 		BlindboxEnabled:   enabled,
 		BlindboxMaxPerRun: maxPerRun,
 	})
@@ -54,8 +59,8 @@ func (s *Scheduler) RunBlindboxNow(apply bool, maxPerRun int) []pool.BlindboxRes
 	}
 	s.travelMu.Lock()
 	defer s.travelMu.Unlock()
-	pool.SetCapabilityDelay(travelAccountDelay)
-	results := s.cfg.Pool.BlindboxAll(context.Background(), apply, maxPerRun)
+	ctx := pool.WithCapabilityDelay(context.Background(), travelAccountDelay)
+	results := s.cfg.Pool.BlindboxAll(ctx, apply, maxPerRun)
 	log.Printf("blindbox: 巡检 %d 个账号（apply=%v max=%d）", len(results), apply, maxPerRun)
 	return results
 }
@@ -75,7 +80,13 @@ func (s *Scheduler) travelOneByUID(uid string) {
 		return
 	}
 	log.Printf("travel-timer %s: 唤醒，执行巡检", logfmt.Label(uid, acc.Nickname()))
-	outcome, err := t.Travel(context.Background(), gateway.TravelOptions{})
+	// 盲盒开关是调度策略，必须一并传入：到站 → 领奖 → 回 idle 是最常命中
+	// 「idle 阶段」的路径。不传的话一旦启用盲盒，这条路径永远不开盒。
+	blindboxEnabled, blindboxMax := s.travelBlindboxCfg()
+	outcome, err := t.Travel(context.Background(), gateway.TravelOptions{
+		BlindboxEnabled:   blindboxEnabled,
+		BlindboxMaxPerRun: blindboxMax,
+	})
 	if err != nil {
 		log.Printf("travel-timer %s: %v", uid, err)
 		return

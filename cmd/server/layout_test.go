@@ -32,7 +32,7 @@ func TestMigrateLegacyLayout(t *testing.T) {
 		}
 	}
 	write("config.json", `{"api_key":"old"}`)
-	write("responses.json", `{"enabled":true}`)
+	write("trae.json", `{"enabled":true}`)
 	write("state.json", `{"accounts":{}}`)
 	write("unrelated.txt", "should not move")
 
@@ -46,13 +46,13 @@ func TestMigrateLegacyLayout(t *testing.T) {
 	}
 
 	// 复制到位
-	for _, p := range []string{"config/config.json", "config/responses.json", "data/state.json"} {
+	for _, p := range []string{"config/config.json", "config/trae.json", "data/state.json"} {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("%s 未迁移: %v", p, err)
 		}
 	}
 	// 旧文件必须保留（只复制不删除）
-	for _, p := range []string{"config.json", "responses.json", "state.json"} {
+	for _, p := range []string{"config.json", "trae.json", "state.json"} {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("旧文件 %s 被删除了: %v", p, err)
 		}

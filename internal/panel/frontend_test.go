@@ -1,8 +1,8 @@
 package panel
 
 import (
-	"encoding/json"
 	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"os/exec"

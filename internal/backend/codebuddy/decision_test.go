@@ -22,8 +22,9 @@ func TestDecideCodeBuddy(t *testing.T) {
 		{upstream.ErrServer, gateway.ActionCoolMedium, true},
 		{upstream.ErrWafBlock, gateway.ActionCoolShort, true},
 		{upstream.ErrNotFound, gateway.ActionCoolShort, true},
-		// 模型级：不换号
-		{upstream.ErrModelBlocked, gateway.ActionModelCooldown, false},
+		// 模型级：换号（11158 是账号类型级拒绝，换有权限的号仍可能成功；
+		// 11102 写负缓存的目的就是「跳过这个号、试下一个」）
+		{upstream.ErrModelBlocked, gateway.ActionModelCooldown, true},
 		// 请求级：不罚不换
 		{upstream.ErrContentBlocked, gateway.ActionNone, false},
 		{upstream.ErrBadParams, gateway.ActionNone, false},

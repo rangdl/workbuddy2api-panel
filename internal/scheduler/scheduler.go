@@ -10,7 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -22,7 +21,6 @@ import (
 // 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
 type Config struct {
 	Pool           *pool.Pool
-	Upstream       *upstream.Client
 	CheckinHours   []int // 默认 [9, 21]
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
@@ -71,11 +69,6 @@ type Config struct {
 type Scheduler struct {
 	cfg Config
 
-	// mu/adoptTried 领养当日失败记录：uid → 自然日（CST）。门槛未达的账号当日不再重试，
-	// 避免同日多趟对上游重试轰炸；进程重启即清零（无需持久化）。
-	mu         sync.Mutex
-	adoptTried map[string]string
-
 	// schedMu 保护排程参数（时点/开关）；Reconfigure 可在运行期热改（面板保存配置时调用）。
 	// rearmSchedule/rearmBalance/rearmSweep/rearmTravel 是「排程已变，立即重算」通知：
 	// Run 与各周期循环各自消费，分别用独立 channel（同 channel 被多个 select 消费会丢信号）。
@@ -88,7 +81,7 @@ type Scheduler struct {
 	rearmTravel chan struct{}
 
 	// travelBlindbox 能量盲盒配置（schedule.travel_blindbox_*），atomic 读写：
-	// 面板保存配置后 SetTravelBlindbox 热改，下一趟 travelOne 即生效。
+	// 面板保存配置后 SetTravelBlindbox 热改，下一趟旅行巡检即生效。
 	travelBlindboxEnabled   atomic.Bool
 	travelBlindboxMaxPerRun atomic.Int64
 
@@ -136,7 +129,6 @@ func New(cfg Config) *Scheduler {
 	}
 	sch := &Scheduler{
 		cfg:           cfg,
-		adoptTried:    make(map[string]string),
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
 		rearmSweep:    make(chan struct{}, 1),
@@ -487,13 +479,13 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 			case taskCheckin:
 				s.RunCheckinNow()
 			case taskTravel:
-				s.RunTravelNow()
+				s.RunTravelContext(ctx)
 			case taskActivity:
 				s.runActivity(ctx)
 			case taskKeepalive:
 				s.RunKeepaliveNow()
 			case taskBlackcat:
-				s.RunBlackcatNow()
+				s.RunBlackcatContext(ctx)
 			case taskGrowth:
 				// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
 				s.schedMu.Lock()
@@ -545,8 +537,8 @@ func (s *Scheduler) RunCheckinNow() {
 // 无 AccessToken 的跳过；账号间限速 activityAccountDelay。
 // CN 与 global 账号**都上报**（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上
 // code=0 OK，点亮连登）；一条上报同时点亮 growth 连登 + 解锁 first_buddy 任务。
-// 上报成功后续跑 streak 自检（checkActivityStreak）：回读连登天数，发现
-// 「上报 200 但 streak 没涨」的静默丢弃（只读 oracle，不做重试）。
+// 上报成功后的 streak 自检在账号实现内部（Account.ReportActivity）：回读连登
+// 天数，发现「上报 200 但 streak 没涨」的静默丢弃（只读 oracle，不做重试）。
 // RunActivityNow 是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走
 // runActivity（ctx 取消时立即放弃剩余账号，不等限速睡满）。
 func (s *Scheduler) RunActivityNow() {
@@ -559,30 +551,9 @@ func (s *Scheduler) RunActivityNow() {
 // 「上报 → 等 settle → 回读 streak」整条链在账号内部完成，门控（企业版跳过、
 // global 不跳过）也在那里。调度器只负责节奏（账号间限速）与 include_disabled 开关。
 func (s *Scheduler) runActivity(ctx context.Context) {
-	pool.SetCapabilityDelay(activityAccountDelay)
+	ctx = pool.WithCapabilityDelay(ctx, activityAccountDelay)
 	ctx = pool.WithIncludeDisabledInTasks(ctx, s.includeDisabledInTasks())
 	s.cfg.Pool.ActivityAll(ctx)
-}
-
-// checkActivityStreak 上报成功后回读连登天数（只读 oracle，发现静默失败）。
-// 背景：REPORT-active-map.md §2 实测「上报 200 但静默丢弃」（缺 userId 时 progress 不动），
-// 上报 200 ≠ streak 计分——需要回读验证闭环。
-// 异常检测口径：days==0 → warn（report OK but streak.days=0 (silent drop?)）；
-// GET 失败 → warn 但不影响主流程（上报本身已成功，按天幂等，不做重试）。
-// 日志每号一行、一眼可 grep：`activity %s: streak days=%d`（成功也打，方便对账）。
-// 返回 true 表示「上报 OK 但 streak 可疑」（days==0 或回读失败），供测试断言。
-func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
-	days, err := s.cfg.Upstream.GrowthStreak(a)
-	if err != nil {
-		log.Printf("activity %s: streak check failed (report OK): %v", logfmt.Label(a.UID, a.NicknameValue()), err)
-		return true
-	}
-	if days == 0 {
-		log.Printf("activity %s: report OK but streak.days=0 (silent drop?)", logfmt.Label(a.UID, a.NicknameValue()))
-		return true
-	}
-	log.Printf("activity %s: streak days=%d", logfmt.Label(a.UID, a.NicknameValue()), days)
-	return false
 }
 
 // RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。

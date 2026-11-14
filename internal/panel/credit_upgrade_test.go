@@ -27,8 +27,8 @@ import (
 	"testing"
 	"time"
 
-	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"

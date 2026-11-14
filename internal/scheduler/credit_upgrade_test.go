@@ -105,7 +105,7 @@ func TestUpgConcurrentFullRefreshLedgerConsistent(t *testing.T) {
 
 	ledger := credithist.New(ledgerPath, 2000)
 	up.SetCreditObserver(ledger.Observe)
-	s := New(Config{Pool: p, Upstream: up})
+	s := New(Config{Pool: p})
 
 	// 首轮：全部建立基线，0 条流水
 	s.RunBalanceRefreshNow()

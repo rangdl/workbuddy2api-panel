@@ -25,6 +25,11 @@ type Backend struct {
 }
 
 // New 构造 backend。
+//
+// Retry 字段不在这里设置：降级重试依赖 server 侧的 degradeGate 与提示词配置，
+// 由装配方（server 的兼容垫片 / cmd/server/main.go）负责注入。
+// 漏注入的表现是「内容拦截误报后直接 400，不再降级重试」——静默失效，
+// 所以两处装配都必须设（见 server.newCodeBuddyBackend 与 main.go）。
 func New(c *upstream.Client, enabled func() bool, load func() ([]*auth.Auth, error)) *Backend {
 	return &Backend{Client: c, EnabledFn: enabled, LoadFn: load}
 }
@@ -43,45 +48,6 @@ func (b *Backend) Enabled() bool {
 	}
 	return true
 }
-
-func (b *Backend) Accounts() ([]gateway.Account, error) {
-	if b.LoadFn == nil {
-		return nil, errors.New("codebuddy: load function not configured")
-	}
-	raw, err := b.LoadFn()
-	if err != nil {
-		return nil, err
-	}
-	return Wrap(raw), nil
-}
-
-// Supports 该账号能否服务这个模型。
-//
-// 实现说明：CodeBuddy 的模型目录是按 realm 从上游动态拉的，本层不做网络查询；
-// 只要上游目录里登记过该模型（或目录尚未拉到时保守放行）即视为支持。
-// 是否真的能出票最终由上游决定（11102 会走 ActionModelCooldown 避让）。
-func (b *Backend) Supports(acc gateway.Account, bareModel string) bool {
-	if acc == nil || bareModel == "" {
-		return true
-	}
-	a := Unwrap(acc)
-	if a == nil {
-		return false
-	}
-	if b.Client == nil {
-		return true
-	}
-	// 倍率表就是上游目录的投影：有倍率条目即代表该 (realm, 模型) 组合在上游存在。
-	// 目录未覆盖时保守放行——宁可让上游回 11102（走模型级避让），也不要因为
-	// 目录未刷新就把可用账号整体排除。
-	if rate := b.Client.ModelRate(a.Realm(), bareModel); rate != "" {
-		return true
-	}
-	return true
-}
-
-// WireModel CodeBuddy 的 wire 名即模型名本身（不做映射）。
-func (b *Backend) WireModel(acc gateway.Account, bareModel string) string { return bareModel }
 
 // Chat 发一次请求并返回规范化回程。
 //
@@ -162,14 +128,6 @@ func (b *Backend) Chat(ctx context.Context, acc gateway.Account, in *gateway.Inb
 			return stats, nil
 		},
 	}, nil
-}
-
-// Credits CodeBuddy 的余额由上游 usage 接口提供，此处不支持。
-//
-// 说明：余额刷新走 scheduler 的专用链路（它需要 realm、企业版判定等上下文），
-// 不在本接口内重复实现。返回 ErrCreditsUnsupported 让调用方走原路径。
-func (b *Backend) Credits(ctx context.Context, acc gateway.Account) (*gateway.Credits, error) {
-	return nil, gateway.ErrCreditsUnsupported
 }
 
 // RetryHook 内容拦截降级重试（由 server 注入，见 Backend.Retry）。

@@ -158,7 +158,6 @@ func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	s := New(Config{
 		Pool:              p,
-		Upstream:          up,
 		CheckinDisabled:   true,
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
@@ -258,7 +257,6 @@ func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
 	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足")
 	s := New(Config{
 		Pool:           p,
-		Upstream:       up,
 		CheckinHours:   []int{9, 21},
 		KeepaliveHours: []int{22},
 	})
@@ -289,7 +287,7 @@ func TestRunKeepaliveRefreshesTokens(t *testing.T) {
 		BillingBaseCN: srv.URL,
 	}
 	p.Add(cbAccount(up, a))
-	s := New(Config{Pool: p, Upstream: up})
+	s := New(Config{Pool: p})
 	s.RunKeepaliveNow()
 	if f.refreshCalls.Load() != 1 {
 		t.Errorf("refresh calls=%d", f.refreshCalls.Load())
@@ -315,7 +313,7 @@ func TestRunKeepaliveSessionDeadDisables(t *testing.T) {
 		BillingBaseCN: srv.URL,
 	}
 	p.Add(cbAccount(up, a))
-	s := New(Config{Pool: p, Upstream: up})
+	s := New(Config{Pool: p})
 	// P0-1：12153 连续 N 次才禁用。前 2 次刷新失败不应杀号（误判防护）。
 	s.RunKeepaliveNow()
 	if st, _ := p.Status("u1"); st.Disabled {
@@ -359,7 +357,7 @@ func TestRunKeepaliveSessionDeadResetBySuccess(t *testing.T) {
 		BillingBaseCN: srv.URL,
 	}
 	p.Add(cbAccount(up, a))
-	s := New(Config{Pool: p, Upstream: up})
+	s := New(Config{Pool: p})
 	s.RunKeepaliveNow() // 12153 #1
 	s.RunKeepaliveNow() // 12153 #2
 	if st, _ := p.Status("u1"); st.Disabled {
@@ -392,7 +390,7 @@ func TestCheckinErrorDoesNotCrash(t *testing.T) {
 		BillingBaseCN: srv.URL,
 	}
 	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	s := New(Config{Pool: p, Upstream: up})
+	s := New(Config{Pool: p})
 	// 不应 panic
 	s.RunCheckinNow()
 	s.RunKeepaliveNow()
@@ -413,7 +411,7 @@ func TestRunBalanceRefreshNowUpdatesCreditsAndRevives(t *testing.T) {
 	p.Add(cbAccount(up, &auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足")
 	p.Disable("u2", "manual")
-	s := New(Config{Pool: p, Upstream: up})
+	s := New(Config{Pool: p})
 	s.RunBalanceRefreshNow()
 
 	st, _ := p.Status("u1")
@@ -462,7 +460,7 @@ func TestRunBalanceRefreshReplacesExpirySnapshot(t *testing.T) {
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	p.SetCreditsDetailed("u1", 999, 999, 999, time.Now().Add(time.Hour), 999)
-	s := New(Config{Pool: p, Upstream: up, ExpiringSoonWindow: 7 * 24 * time.Hour})
+	s := New(Config{Pool: p, ExpiringSoonWindow: 7 * 24 * time.Hour})
 	s.RunBalanceRefreshNow()
 
 	st, _ := p.Status("u1")
@@ -513,9 +511,9 @@ func TestRunCheckinSkipsDisabledByDefault(t *testing.T) {
 	srv := f.server()
 	defer srv.Close()
 
-		up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	p := poolWithDisabledAccount(up)
-	s := New(Config{Pool: p, Upstream: up, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22}})
+	s := New(Config{Pool: p, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22}})
 
 	s.RunCheckinNow()
 	if got := f.checkinCalls.Load(); got != 1 {
@@ -530,10 +528,10 @@ func TestRunCheckinIncludesDisabledWhenConfigured(t *testing.T) {
 	srv := f.server()
 	defer srv.Close()
 
-		up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	p := poolWithDisabledAccount(up)
 	s := New(Config{
-		Pool: p, Upstream: up,
+		Pool:                   p,
 		CheckinHours:           []int{9, 21},
 		IncludeDisabledInTasks: true,
 	})
@@ -558,9 +556,9 @@ func TestRunKeepaliveIncludesDisabledRenewsToken(t *testing.T) {
 	srv := f.server()
 	defer srv.Close()
 
-		up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	p := poolWithDisabledAccount(up)
-	s := New(Config{Pool: p, Upstream: up, IncludeDisabledInTasks: true})
+	s := New(Config{Pool: p, IncludeDisabledInTasks: true})
 
 	s.RunKeepaliveNow()
 	if got := f.refreshCalls.Load(); got != 2 {
@@ -575,9 +573,9 @@ func TestRunBalanceRefreshIncludesDisabledUpdatesCredits(t *testing.T) {
 	srv := f.server()
 	defer srv.Close()
 
-		up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	p := poolWithDisabledAccount(up)
-	s := New(Config{Pool: p, Upstream: up, IncludeDisabledInTasks: true})
+	s := New(Config{Pool: p, IncludeDisabledInTasks: true})
 
 	s.RunBalanceRefreshNow()
 	st, _ := p.Status("u2")
@@ -595,9 +593,9 @@ func TestSetIncludeDisabledInTasksHot(t *testing.T) {
 	srv := f.server()
 	defer srv.Close()
 
-		up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	p := poolWithDisabledAccount(up)
-	s := New(Config{Pool: p, Upstream: up})
+	s := New(Config{Pool: p})
 
 	s.RunCheckinNow()
 	if got := f.checkinCalls.Load(); got != 1 {
@@ -627,7 +625,7 @@ func TestPausedAccountStillRunsKeepaliveTasks(t *testing.T) {
 	if !p.Pause("u2") {
 		t.Fatal("Pause 失败")
 	}
-	s := New(Config{Pool: p, Upstream: up}) // 有意不设 IncludeDisabledInTasks
+	s := New(Config{Pool: p}) // 有意不设 IncludeDisabledInTasks
 
 	s.RunCheckinNow()
 	if got := f.checkinCalls.Load(); got != 2 {
@@ -666,7 +664,7 @@ func TestPausedVsDisabledTaskParticipation(t *testing.T) {
 	p.Add(cbAccount(up, &auth.Auth{UID: "u3", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	p.Pause("u2")
 	p.Disable("u3", "manual disable (test)")
-	s := New(Config{Pool: p, Upstream: up}) // 全局开关有意保持关闭
+	s := New(Config{Pool: p}) // 全局开关有意保持关闭
 
 	s.RunCheckinNow()
 	// u1（正常）+ u2（暂停）签到；u3（禁用）跳过 ⇒ 2 次
@@ -674,7 +672,6 @@ func TestPausedVsDisabledTaskParticipation(t *testing.T) {
 		t.Errorf("checkin calls=%d want 2（正常 + 暂停参与；禁用跳过）", got)
 	}
 }
-
 
 // TestPausedStillTravels 暂停号照常跑旅行：旅行是纯 RPC（状态/派出/领奖 +
 // 领养前置上报），不发模型对话，与「让位防风控」不冲突——唯一被跳过的
@@ -689,7 +686,7 @@ func TestPausedStillTravels(t *testing.T) {
 	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	p.Add(cbAccount(up, &auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	p.Pause("u2")
-	s := New(Config{Pool: p, Upstream: up})
+	s := New(Config{Pool: p})
 
 	s.RunTravelNow()
 	if got := f.travelCalls.Load(); got != 2 {

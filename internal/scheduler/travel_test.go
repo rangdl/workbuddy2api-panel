@@ -180,7 +180,7 @@ func newTravelScheduler(t *testing.T, srv *httptest.Server, uids ...string) (*Sc
 	for _, uid := range uids {
 		p.Add(cbAccount(up, &auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	}
-	return New(Config{Pool: p, Upstream: up, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22}}), p
+	return New(Config{Pool: p, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22}}), p
 }
 
 // TestRunCheckinNowNoLongerTriggersTravel 签到收尾不再跑旅行（旅行已剥离为独立排程）。
@@ -550,7 +550,7 @@ func TestRunTravelActionErrorsDoNotAbort(t *testing.T) {
 
 // TestRunTravelLoopCancelsWhenDisabled 无任何整点任务时 Run 不空转，ctx 取消即返回。
 func TestRunTravelLoopCancelsWhenDisabled(t *testing.T) {
-	s := &Scheduler{cfg: Config{}, adoptTried: map[string]string{}}
+	s := &Scheduler{cfg: Config{}}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { s.Run(ctx); close(done) }()

@@ -83,25 +83,29 @@ type Traveler interface {
 }
 
 // BlindboxOutcome 一次盲盒处理的结果。
+//
+// JSON tag 是**前端契约**（`panel/js/accounts.js` 直接读 `travel_state` /
+// `will_open` / `energy` 等）。这些字段经 `pool.BlindboxResult` 嵌入后摊平
+// 序列化，缺 tag 会让前端读到 undefined、整列显示空白。
 type BlindboxOutcome struct {
 	// TravelState 当前旅行状态（盲盒只能在 idle 时开）。
-	TravelState string
+	TravelState string `json:"travel_state"`
 	// Energy 能量余额。
-	Energy int64
+	Energy int64 `json:"energy"`
 	// Affordable 上游算出的可开次数。
-	Affordable int
+	Affordable int `json:"affordable"`
 	// CostPerOpen 单次消耗能量。
-	CostPerOpen int64
+	CostPerOpen int64 `json:"cost_per_open"`
 	// MaxOpen 上游允许的单趟上限。
-	MaxOpen int
+	MaxOpen int `json:"max_open_count"`
 	// WillOpen 本次计划开几次（0 = 不开）。
-	WillOpen int
+	WillOpen int `json:"will_open"`
 	// Decision 给用户看的一句话理由（面板直接渲染）。
-	Decision string
+	Decision string `json:"decision"`
 	// Opened 是否真的开了（dry-run 时为 false）。
-	Opened bool
+	Opened bool `json:"opened"`
 	// Prize 奖品名（可能为空）。
-	Prize string
+	Prize string `json:"prize,omitempty"`
 }
 
 // Blindboxer 账号支持「能量盲盒」玩法。

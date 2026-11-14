@@ -7,11 +7,15 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -102,7 +106,7 @@ func TestChatParityBothPaths(t *testing.T) {
 	body := []byte(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 
 	cases := []struct {
-		name string
+		name     string
 		behavior func(string) (int, string, bool)
 	}{
 		{"200 正常流", func(string) (int, string, bool) { return 200, sseOK, true }},
@@ -155,10 +159,10 @@ func TestChatParityBackendWritesModelCooldown(t *testing.T) {
 
 	f := &gateway.Failure{
 		Decision: gateway.Decision{
-			Action:  gateway.ActionModelCooldown,
-			Rotate:  false,
-			Kind:    "model_unknown",
-			Code:    "4001",
+			Action: gateway.ActionModelCooldown,
+			Rotate: false,
+			Kind:   "model_unknown",
+			Code:   "4001",
 		},
 		HTTPStatus: 400,
 	}
@@ -318,5 +322,319 @@ func TestDeletedEndpointsReturn404(t *testing.T) {
 		if rec.Code != http.StatusNotFound {
 			t.Errorf("%s status=%d, want 404", path, rec.Code)
 		}
+	}
+}
+
+// ── 聊天链路收敛的语义保留回归 ──────────────────────────────────────
+//
+// 这三条都是「删除内联路径时被漏掉」的行为，必须钉住：
+// 收敛后它们不再有内联实现兜底，只能靠 dispatch 路径自己保证。
+
+// TestWafIpFailFastStillArmed WAF IP 级 fail-fast 的计数入口必须仍被调用。
+//
+// 回归点：noteWaf 原先只在旧内联路径的 WAF 处置分支里调用，删掉内联后
+// 零调用——IP 级拦截判定彻底失效，网关会持续换号打同一出口 IP。
+func TestWafIpFailFastStillArmed(t *testing.T) {
+	var hits int
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			hits++
+			return &http.Response{
+				StatusCode: 403,
+				Header:     http.Header{"Content-Type": []string{"text/html"}},
+				Body:       io.NopCloser(strings.NewReader(`<html>blocked by waf</html>`)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// 两个不同账号都撞 WAF 403 → 应激活 IP 级判定并终止轮转，
+	// 而不是把 MaxRotate 次全打完。
+	if hits >= 3 {
+		t.Errorf("upstream hits=%d（WAF IP 级 fail-fast 未生效，轮转打满了）", hits)
+	}
+	if !h.wafIP.active() {
+		t.Error("两个不同账号 WAF 403 后应激活 IP 级拦截判定")
+	}
+}
+
+// TestEmptyUpstreamStreamMarkedAsError 200 + 零有效帧必须标成流错误。
+//
+// 回归点：旧内联路径用 IsEmptyStreamError 单独判定并收敛到 502 观测；
+// 删掉内联后若不补，失败流会被记成 200 成功（运维看到假成功）。
+func TestEmptyUpstreamStreamMarkedAsError(t *testing.T) {
+	const emptySSE = "data: [DONE]\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, emptySSE, true })
+	reqLog := reqlog.New(reqlog.Config{})
+	h := NewHandler(Config{
+		Pool:       testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:   up,
+		RequestLog: reqLog,
+	})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	s := reqLog.Snapshot()
+	if s.Completed == 0 || len(s.Recent) == 0 {
+		t.Fatal("应有请求日志事件")
+	}
+	e := s.Recent[len(s.Recent)-1]
+	// HTTP 状态码只能是 200（头已在开流时发出，无法回改），但**观测口径**
+	// 必须收敛到失败：outcome=stream_error 且 OK=false。
+	if e.OK {
+		t.Errorf("空流不应标记成功，实际 status=%d OK=%v outcome=%s", e.Status, e.OK, e.Outcome)
+	}
+	if e.Outcome != reqlog.OutcomeStreamError {
+		t.Errorf("空流 outcome=%s, want %s", e.Outcome, reqlog.OutcomeStreamError)
+	}
+}
+
+// TestClientDisconnectMarkedInterrupted 客户端断连不能记成 success。
+//
+// 回归点：旧内联路径对写失败单独归为 OutcomeInterrupted。收敛后若不区分，
+// 断连会被记成成功，污染成功率统计。
+func TestClientDisconnectMarkedInterrupted(t *testing.T) {
+	// 用一个写到一半就报错的 ResponseWriter 模拟客户端断连。
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	reqLog := reqlog.New(reqlog.Config{})
+	h := NewHandler(Config{
+		Pool:       testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:   up,
+		RequestLog: reqLog,
+	})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := &brokenWriter{ResponseRecorder: httptest.NewRecorder()}
+	h.ServeHTTP(rec, req)
+
+	s := reqLog.Snapshot()
+	if s.Completed == 0 || len(s.Recent) == 0 {
+		t.Fatal("应有请求日志事件")
+	}
+	e := s.Recent[len(s.Recent)-1]
+	if e.Outcome == reqlog.OutcomeSuccess {
+		t.Errorf("客户端断连不应记为 success，实际 outcome=%s", e.Outcome)
+	}
+}
+
+// brokenWriter 第一次 Write 就失败，模拟客户端已断开。
+type brokenWriter struct {
+	*httptest.ResponseRecorder
+	writes int
+}
+
+func (b *brokenWriter) Write(p []byte) (int, error) {
+	b.writes++
+	if b.writes > 1 {
+		return 0, io.ErrClosedPipe
+	}
+	return b.ResponseRecorder.Write(p)
+}
+
+func (b *brokenWriter) Flush() {}
+
+// TestTraeStatsStillRecorded Trae 账号的运行期统计必须仍被写入。
+//
+// 回归点：旧 `internal/server/trae.go` 在请求入口调 `h.traeStats.Begin`
+// （在途+1，结束时结算）。9a55778 删掉独立 Trae 端点时连带删了这两处调用，
+// 统一链路没补回——面板「Trae 签到」区块的 成功/失败/在途 三列因此恒为 0。
+func TestTraeStatsStillRecorded(t *testing.T) {
+	h, _, _ := newAccountingHandler(t)
+	stats := trae.NewStats()
+	h.cfg.TraeStats = stats
+
+	body := `{"model":"trae:cn:glm-5.2","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	v := stats.Get("t1")
+	if v.InFlight != 0 {
+		t.Errorf("请求结束后在途=%d, want 0（finish 未结算）", v.InFlight)
+	}
+	if v.SuccessCount == 0 && v.ErrTotal == 0 {
+		t.Error("成功/失败计数都未增加，统计链路断了")
+	}
+}
+
+// TestDegradedRetryWorksWithInjectedRegistry 生产形态（显式注入 Registry）也必须能降级重试。
+//
+// 回归点：ensureCodeBuddyBackend 的兼容垫片在「已有注册表」时直接 return，
+// 而 main 用 backendcb.New 装配（不设 Retry）。于是测试走垫片（有 Retry）、
+// 生产走显式装配（无 Retry）——内容拦截误报后直接 400，降级重试完全失效。
+// 这条用例用 NewCodeBuddyBackend 复刻生产装配，断言降级重试真的发生。
+func TestDegradedRetryWorksWithInjectedRegistry(t *testing.T) {
+	var bodies [][]byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, raw)
+			if len(bodies) == 1 {
+				return &http.Response{
+					StatusCode: 400,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"code":"11-128","msg":"blocked by security policy"}`)),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	gate := NewDegradeGate()
+	reg := gateway.NewRegistry()
+	reg.Register(NewCodeBuddyBackend(up, func() bool { return true }, nil, gate, "passthrough"))
+
+	h := NewHandler(Config{
+		Pool:        p,
+		Upstream:    up,
+		Backends:    reg,
+		DegradeGate: gate,
+		PromptMode:  "passthrough",
+	})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"原始指纹"},{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s（生产装配下应降级重试成功）", rec.Code, rec.Body)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("应打 2 次上游（首次 400 + 降级重试），实际 %d", len(bodies))
+	}
+	if !strings.Contains(string(bodies[1]), prompt.Degraded) {
+		t.Errorf("第二次出站 body 应使用 Degraded 提示词: %s", bodies[1])
+	}
+	if !gate.Active() {
+		t.Error("降级状态机应被触发（否则后续请求仍会先撞 400）")
+	}
+}
+
+// TestModelBlockedRotatesToNextAccount 11158（账号类型级权限拒绝）必须换号。
+//
+// 回归点：ErrModelBlocked 曾被标 Rotate=false，dispatch 直接 backendStop——
+// 而 11158 是**账号类型**级拒绝，同域另一个有权限的号本来能成功。
+// 默认部署（cross_domain_fallback 关闭）会让「首个号 11158」直接 400。
+func TestModelBlockedRotatesToNextAccount(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(auth string) (int, string, bool) {
+		calls++
+		if auth == "Bearer at-bad" {
+			return 400, `{"code":11158,"msg":"该账号类型无此模型权限"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s（应换到 good 号成功）", rec.Code, rec.Body)
+	}
+	if calls < 2 {
+		t.Errorf("上游调用 %d 次，应至少 2 次（bad 11158 → good 成功）", calls)
+	}
+	// 注意：good 号成功后会对**自己的能力**调 BlockModelClear，但 bad 号的
+	// 负缓存按 (账号,模型) 独立存储，仍应保留——它下次选号要避开。
+	// 这里只能间接验证：bad 号被 tried 排除且请求最终成功，说明它确实被判过。
+	st, ok := p.Status("bad")
+	if !ok {
+		t.Fatal("bad 号应在池中")
+	}
+	if st.SuccessCount != 0 {
+		t.Errorf("bad 号不应记成功，实际 %d", st.SuccessCount)
+	}
+}
+
+// TestTraeFailureNotRoutedToCodeBuddyPolicy Trae 的失败不得走 CodeBuddy 精细策略。
+//
+// 回归点：applyFailure 曾按 Decision.Kind **字符串**反查 CodeBuddy 的 ErrKind。
+// Trae 的 soft_rate / session_dead / server / client 与 CodeBuddy 枚举逐字同名，
+// 于是 Trae 的 429 用了 CodeBuddy 的 softCooldown（默认 600s）而不是自己的 60s，
+// 5xx 也不再中冷却（applyErrorPolicy 的 ErrServer 只 NoteError）。
+func TestTraeFailureNotRoutedToCodeBuddyPolicy(t *testing.T) {
+	p := pool.New("")
+	p.Add(fakeGatewayAccount{uid: "t1", backend: "trae"})
+	h := NewHandler(Config{Pool: p})
+	acc := fakeGatewayAccount{uid: "t1", backend: "trae"}
+
+	// Trae 的 soft_rate：ActionCoolShort，Cooldown 60s（Trae 自己的口径）。
+	f := &gateway.Failure{
+		Decision: gateway.Decision{
+			Kind:     "soft_rate",
+			Policy:   gateway.PolicyGeneric, // Trae 的 Decide 不设 Policy
+			Action:   gateway.ActionCoolShort,
+			Cooldown: 60 * time.Second,
+			Rotate:   true,
+			Message:  "429 rate limited",
+		},
+		HTTPStatus: 429,
+	}
+	h.applyFailure(acc, "glm-5.2", f, &chatStat{})
+
+	st, ok := p.Status("t1")
+	if !ok {
+		t.Fatal("账号应在池中")
+	}
+	if !st.Cooling {
+		t.Fatal("Trae 的 429 应让账号进入冷却")
+	}
+	// 60s 而非 600s：若走了 CodeBuddy 策略，冷却会是 h.softCooldown()（默认 600s）。
+	if st.CoolRemaining > 120 {
+		t.Errorf("冷却剩余 %ds，应接近 60s（说明被路由到了 CodeBuddy 的 softCooldown）", st.CoolRemaining)
+	}
+}
+
+// TestCodeBuddyFailureUsesDetailedPolicy CodeBuddy 的失败仍走精细策略（对照组）。
+func TestCodeBuddyFailureUsesDetailedPolicy(t *testing.T) {
+	p := pool.New("")
+	p.Add(fakeGatewayAccount{uid: "c1", backend: "codebuddy"})
+	h := NewHandler(Config{Pool: p})
+	acc := fakeGatewayAccount{uid: "c1", backend: "codebuddy"}
+
+	// CodeBuddy 的 ErrModelBlocked：走 applyErrorPolicy → BlockModelBackoff。
+	f := &gateway.Failure{
+		Decision: gateway.Decision{
+			Kind:   upstream.ErrModelBlocked.String(),
+			Policy: gateway.PolicyCodeBuddy,
+			Action: gateway.ActionModelCooldown,
+			Rotate: true,
+		},
+		HTTPStatus: 400,
+	}
+	h.applyFailure(acc, "glm-5.2", f, &chatStat{})
+
+	if bs := p.ModelBlocked("glm-5.2"); !bs.Blocked {
+		t.Error("CodeBuddy 的 ErrModelBlocked 应写模型负缓存（精细策略）")
 	}
 }

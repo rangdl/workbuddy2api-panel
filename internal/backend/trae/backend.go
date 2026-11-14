@@ -37,67 +37,6 @@ func (b *Backend) config() *traepkg.Config {
 	return b.ConfigFn()
 }
 
-func (b *Backend) Accounts() ([]gateway.Account, error) {
-	cfg := b.config()
-	if cfg == nil {
-		return nil, nil
-	}
-	accs := Wrap(cfg, b.Client)
-	// 账号对象自己持有 configFn：热重载后它要能读到新配置（换 base、改设备号）。
-	for i := range accs {
-		if a, ok := accs[i].(Account); ok {
-			a.ConfigFn = b.ConfigFn
-			accs[i] = a
-		}
-	}
-	return accs, nil
-}
-
-// Supports 该账号能否服务这个模型。
-//
-// Trae 的准入由 modelPairs（内置映射）+ 上游目录共同决定：
-// 先在 modelPairs 里查，查不到再看目录里有没有该 config_name。
-// 两者都未命中时**拒绝**——Trae 对未收录模型会回 4001，提前排除比让
-// 上游拒绝更省额度。
-func (b *Backend) Supports(acc gateway.Account, bareModel string) bool {
-	if acc == nil || bareModel == "" {
-		return true
-	}
-	a := Unwrap(acc)
-	if a == nil || b.Client == nil {
-		return false
-	}
-	if _, _, ok := traepkg.ModelPair(bareModel); ok {
-		return true
-	}
-	cfg := b.config()
-	if cfg == nil {
-		return false
-	}
-	// Remote 目录的判据更严：要过 isCallableModel（usage/config_source/展示名）。
-	// 该模型在目录里存在但不可调用（工具配置 / 账号自带模型）时应拒绝——
-	// 否则会选中它再被上游 4001 拒绝，白烧一次额度。
-	if remote := b.Client.FetchRemoteModels(context.Background(), cfg, a, false); remote != nil {
-		if row, ok := remote[bareModel]; ok {
-			return traepkg.IsCallableModel(row)
-		}
-	}
-	// Remote 未覆盖时回落 wire 名册（get_detail_param）。
-	cat := b.Client.FetchCatalog(context.Background(), cfg, a, false)
-	if cat == nil || !cat.Live {
-		return false
-	}
-	return cat.FunctionForConfigName(bareModel) != ""
-}
-
-// WireModel 客户端模型名 → Trae 的 config_name。
-func (b *Backend) WireModel(acc gateway.Account, bareModel string) string {
-	if cfgName, _, ok := traepkg.ModelPair(bareModel); ok {
-		return cfgName
-	}
-	return bareModel
-}
-
 // Chat 发一次请求。
 func (b *Backend) Chat(ctx context.Context, acc gateway.Account, in *gateway.Inbound) (*gateway.Outbound, error) {
 	a := Unwrap(acc)
@@ -170,42 +109,6 @@ func (b *Backend) Chat(ctx context.Context, acc gateway.Account, in *gateway.Inb
 			return stats, err
 		},
 	}, nil
-}
-
-// Credits 查询余额。
-//
-// 关键：Available 必须取 CreditsSummary.General（product_id != 209），
-// **不能**用 Total——Total 含 Work 积分，而对话只消耗 IDE 额度，
-// 用 Total 会让快耗尽的账号看起来健康，选号权重随之失真。
-func (b *Backend) Credits(ctx context.Context, acc gateway.Account) (*gateway.Credits, error) {
-	a := Unwrap(acc)
-	if a == nil {
-		return nil, errors.New("trae: account is not a Trae account")
-	}
-	cfg := b.config()
-	if cfg == nil {
-		return nil, errors.New("trae: config not loaded")
-	}
-	sum, err := b.Client.QueryCredits(ctx, cfg, a)
-	if err != nil {
-		return nil, err
-	}
-	out := &gateway.Credits{
-		Available: sum.General,
-		Limit:     sum.Limit,
-	}
-	// 到期时间：取最早一批仍有剩余的包（CreditPack.EndTime 是上游原样字符串）。
-	for _, p := range sum.Packs {
-		if p.IsWork() || p.Remaining() <= 0 {
-			continue
-		}
-		if t, ok := traepkg.ParsePackTime(p.EndTime); ok {
-			if out.Earliest.IsZero() || t.Before(out.Earliest) {
-				out.Earliest = t
-			}
-		}
-	}
-	return out, nil
 }
 
 // RetryHook Trae 没有内容拦截降级重试。

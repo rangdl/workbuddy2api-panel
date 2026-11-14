@@ -82,7 +82,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
 | 🖥️ **Web 管理面板** | 内嵌管理面板（明暗主题，九个视图，前端按视图拆分嵌入二进制）：账号运维 / 用量与积分分析 / 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
-| 🚂 **Trae 上游** | Trae 账号接入（`/trae/v1/*` 独立前缀）：请求体改写为 `llm_utils_chat`、SOLO 自定义 SSE 转 OpenAI、设备凭证（tc 信封解密 + DeviceProof 签名），见 [Trae 上游](#-trae-上游协议层已实现) |
+| 🚂 **Trae 上游** | Trae 账号接入（**与 CodeBuddy 同一入口** `/v1/*`，用模型名前缀 `trae:` 指定）：请求体改写为 `llm_utils_chat`、SOLO 自定义 SSE 转 OpenAI、设备凭证（tc 信封解密 + DeviceProof 签名），见 [Trae 上游](#-trae-上游协议层已实现) |
 
 ## 🎯 成长任务一键完成（17/18）
 
@@ -766,7 +766,7 @@ http://127.0.0.1:7863/panel/
 | **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
 | **配置** | 在线编辑 config/config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关） |
 | **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道 + 关键词筛选，默认只渲染最新 50 条，「更早」按游标翻页（环形缓冲淘汰旧行不会导致重复或漏行），「自动滚动」仅在看最新一页且原本在底部时生效；底部 **积分历史**（每次真实查到余额与上次比对，变动即留痕） |
-| **Trae 签到** | Trae 上游的账号与签到管理：`/trae/v1/*` 开关、对话上游 base、IDE 版本；逐账号签到与「上次签到结果」、每日自动签到（时点可配）、OAuth 登录添加账号（**可指定设备号**）、导入设备凭证（DeviceProof 签名用）；保存后热生效 |
+| **Trae 签到** | Trae 上游的账号与签到管理：Trae 上游开关、对话上游 base、IDE 版本；逐账号签到与「上次签到结果」、每日自动签到（时点可配）、OAuth 登录添加账号（**可指定设备号**）、导入设备凭证（DeviceProof 签名用）；保存后热生效 |
 
 顶部另有「刷新」（向上游全量查询真实余额并回写；面板轮询只读内存、不打上游，桌面 5 秒 / 移动端 15 秒）与「添加账号」（浏览器内完成 OAuth 设备授权：显示授权链接 + 自动轮询，登录后凭证落盘并**热加载进池，免重启**，也支持导入 cockpit tools 导出的 JSON）。
 
@@ -833,9 +833,6 @@ http://127.0.0.1:7863/panel/
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
-| `POST /trae/v1/chat/completions` | Bearer | **Trae 上游**：OpenAI Chat → `llm_utils_chat`，回程 SOLO SSE → OpenAI |
-| `POST /trae/v1/responses` | Bearer | Trae 上游的 Responses 协议接入（Chat 中转 + 回程投影） |
-| `GET /trae/v1/models` | Bearer | Trae 内置模型目录 |
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
 
@@ -893,13 +890,12 @@ http://127.0.0.1:7863/panel/
 
 ## 🚂 Trae 上游（协议层已实现）
 
-Trae 接入使用**独立前缀 `/trae/v1/*`**，与 `/v1/*`（CodeBuddy）、`/tp/v1/*`（第三方）三者互不冲突。
+Trae **没有独立前缀**：对话统一走 `/v1/*`，用模型名前缀 `trae:` 指定上游（例如 `trae:cn:glm-5.3`）。选号、回退、粘性、并发控制全部复用主链路。
 
-| 端点 | 说明 |
+| 用法 | 说明 |
 |---|---|
-| `POST /trae/v1/chat/completions` | OpenAI Chat → `llm_utils_chat`，回程 SOLO 自定义 SSE → OpenAI |
-| `POST /trae/v1/responses` | Responses → Chat → SOLO，回程投影回 Responses |
-| `GET /trae/v1/models` | 内置模型目录（与请求构造的模型映射同源） |
+| `POST /v1/chat/completions`，`model` 带 `trae:` 前缀 | OpenAI Chat → `llm_utils_chat`，回程 SOLO 自定义 SSE → OpenAI |
+| `GET /v1/models` | Trae 模型并入同一份列表（倍率走 `credits` 字段） |
 
 ### 配置（`config/trae.json`，与 `config/config.json` 同目录）
 
@@ -930,7 +926,7 @@ auths/
 > 为什么分文件：refreshToken 是轮换链，两个账号并发续期时共写一个 `trae.json`
 > 会让后写者覆盖先写者刚更新的另一个账号。分文件后各写各的。
 
-`enabled` 缺省 `false`：未启用时 `/trae/v1/*` 一律 404，现有功能完全不受影响。
+`enabled` 缺省 `false`：未启用时 Trae 账号不参与调度，`trae:` 前缀会解析为未知模型，现有功能完全不受影响。
 
 ### 已实现
 

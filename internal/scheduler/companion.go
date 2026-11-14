@@ -16,15 +16,19 @@ var (
 	nightChatAccountDelay = 800 * time.Millisecond
 )
 
-// activityStreakSettle 已迁移到账号实现（backend/codebuddy/features.go）。
-// 这里保留同名变量仅供测试引用，不再参与流程。
-var activityStreakSettle = 8 * time.Second
+// activityStreakSettle 已迁到账号实现（backend/codebuddy/features.go）——
+// 那里才有真正的等待逻辑，本包不再保留同名变量（保留了也是空转，
+// 曾导致测试改 0 无效、整包被拖慢 70 秒）。测试请用
+// codebuddy.SetActivityStreakSettle(0)。
 
-// cstZone 上游每日重置按自然日 00:00 CST（Asia/Shanghai）。
+// cstZone 上游每日重置按自然日 00:00 CST (Asia/Shanghai)。
 // 中国无夏令时，固定 +8 即可，不依赖容器 tzdata。
 var cstZone = time.FixedZone("CST", 8*60*60)
 
 // travelDay 返回 t 所属的上游自然日（CST），格式 2006-01-02。
+//
+// 生产的旅行日判定已迁到 pool/capabilities.go 与 backend/codebuddy/features.go
+// （各留一份，因为池不能 import backend）。本函数仅保留给 CST 换算的单测。
 func travelDay(t time.Time) string {
 	return t.In(cstZone).Format("2006-01-02")
 }

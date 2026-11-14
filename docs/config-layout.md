@@ -5,9 +5,6 @@
 ```
 config/                        用户会手改的配置
 ├── config.json                主配置（监听、api_key、池参数、排程…）
-├── responses.json             Responses / Codex 接入
-├── anthropic.json             Anthropic / Claude Code 接入
-├── third_party.json           第三方 OpenAI 兼容上游
 ├── trae.json                  Trae 上游
 ├── model.json                 模型上下文/输出上限缓存（可手改）
 └── .migrated                  迁移标记（自动生成，勿手动创建）
@@ -58,9 +55,9 @@ Trae 账号**不再内嵌在 `trae.json` 里**，改为 `auths/trae-<uid>.json`�
 - 两个目录不存在时自动创建。
 - `config/config.json` 不存在时，生成一份含随机 `api_key` 的推荐配置，并把
   `api_key` 打印到日志（只打印这一次）。
-- 四个副配置不存在时，各写一份默认文件。其中 `anthropic.json` /
-  `third_party.json` / `trae.json` 一律 `enabled: false`——写默认值不会替用户
-  开启一个没配过的上游；`responses.json` 保持既有行为，默认启用。
+- `trae.json` 不存在时写一份默认文件，`enabled: false`——写默认值不会替用户
+  开启一个没配过的上游。（`responses.json` / `anthropic.json` / `third_party.json`
+  已随对应功能移除，不再生成，也不再从旧目录迁移。）
 
 ## 从旧版升级
 

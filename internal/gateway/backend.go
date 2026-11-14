@@ -26,22 +26,6 @@ type Backend interface {
 	// 会话在下次 Resolve 时自然失效。
 	Enabled() bool
 
-	// Accounts 从各自来源装载账号。
-	//
-	// 每次调用都应反映磁盘最新状态（CodeBuddy 扫描 auths/ 目录，Trae 读
-	// trae-*.json）。池的 Sync 会定期调用它。
-	Accounts() ([]Account, error)
-
-	// Supports 该账号能否服务这个模型（已剥离前缀的 Bare 名）。
-	//
-	// 契约：纯查表，**不得发网络请求**——它在选号热路径上被逐账号调用。
-	// 返回 false 的账号不进入候选集。
-	Supports(acc Account, bareModel string) bool
-
-	// WireModel 客户端模型名 → 该上游的 wire 名（日志/账单对照用）。
-	// 无映射时返回空串，调用方回落到 bareModel。
-	WireModel(acc Account, bareModel string) string
-
 	// Chat 发一次请求。
 	//
 	// 失败时返回 *Failure（已带 Decision），调用方不再二次分类。
@@ -51,15 +35,18 @@ type Backend interface {
 	// 依次尝试（跨上游回退），任何原地修改都会污染后续尝试。
 	Chat(ctx context.Context, acc Account, in *Inbound) (*Outbound, error)
 
-	// Credits 查询余额（调度器余额刷新与面板共用）。
-	// 不支持时返回 ErrCreditsUnsupported。
-	Credits(ctx context.Context, acc Account) (*Credits, error)
-
 	// RetryHook 链路特有的「同账号内重试」逻辑（可选，nil = 无）。
 	//
 	// CodeBuddy 用它实现内容拦截时的降级提示词重试；Trae 无此概念。
 	RetryHook() RetryHook
 }
+
+// 本接口曾另有 Accounts / Supports / WireModel / Credits 四个方法，现已删除：
+//   - 账号装载走 backend 各自的 Wrap（main 装配时调用），池只经 Sync/Add 接收；
+//   - 模型可服务性靠上游报错后记负缓存（事后学习），不做事前查表；
+//   - wire 名映射在 PrepareChatBody 内部完成；
+//   - 余额查询统一走账号对象（gateway.Account.Credits）。
+// 四个方法都零生产调用，留着只会让「新上游要实现什么」这件事看起来比实际复杂。
 
 // RetryHook 同账号内的重试改写。
 type RetryHook interface {

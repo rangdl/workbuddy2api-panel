@@ -31,7 +31,7 @@ type Pool struct {
 	// 口径天然一致，改配置即时生效。
 	expiringSoonWindow atomic.Int64
 	stateFp            string
-	dirty       atomic.Bool // 内存有变更待落盘
+	dirty              atomic.Bool // 内存有变更待落盘
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
 	// SaveState/LoadState 经它接线，与本地 state.json 并存作启动恢复备份。
 	store StoreSnapshotter

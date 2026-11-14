@@ -84,7 +84,7 @@ func enterpriseTestScheduler(t *testing.T, enterprise bool) (*Scheduler, *record
 		WebBaseCN:     srv.URL,
 	}
 	p.Add(cbAccount(up, a))
-	s := New(Config{Pool: p, Upstream: up})
+	s := New(Config{Pool: p})
 	return s, r
 }
 

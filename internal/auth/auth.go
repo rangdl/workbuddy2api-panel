@@ -246,6 +246,7 @@ func (a *Auth) SupportsPersonalGrowth() bool { return !a.IsEnterprise() }
 //     同样会带该章；
 //   - 该章随 refresh 继承（refresh 端点不重新判定身份），一次登录即长期携带，
 //     表现为「服务跑了一段时间后任务突然全停」。
+//
 // 下游 fork（misakano7545/workbuddy2api-panel）独立得出同一结论并明确注释：
 // 「不要再用 token_source=enterprise_switch 判定企业上下文……企业形态一律以
 // enterpriseId 为准」。

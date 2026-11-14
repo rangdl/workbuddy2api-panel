@@ -2,9 +2,11 @@ package pool
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 )
@@ -257,4 +259,126 @@ func TestCompensationClaimOneUnknownAccount(t *testing.T) {
 	if !errors.Is(err, ErrNoSuchAccount) {
 		t.Errorf("err = %v, want ErrNoSuchAccount", err)
 	}
+}
+
+// TestBlindboxResultJSONContract 盲盒结果的 JSON 字段名是前端契约。
+//
+// 回归点：gateway.BlindboxOutcome 曾完全没有 json tag，经 BlindboxResult 嵌入
+// 摊平后序列化成 TravelState/WillOpen 这种 Go 字段名，而前端读的是
+// travel_state / will_open —— 面板表格整列显示空白。
+func TestBlindboxResultJSONContract(t *testing.T) {
+	r := BlindboxResult{
+		UID:      "u1",
+		Nickname: "甲",
+		BlindboxOutcome: gateway.BlindboxOutcome{
+			TravelState: "idle",
+			Energy:      125,
+			Affordable:  5,
+			CostPerOpen: 10,
+			MaxOpen:     5,
+			WillOpen:    3,
+			Decision:    "可开 3 次",
+			Opened:      true,
+			Prize:       "量子喵",
+		},
+	}
+	raw, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	// 前端 panel/js/accounts.js 实际读取的键。
+	for _, k := range []string{
+		"uid", "nickname", "travel_state", "energy", "affordable",
+		"cost_per_open", "max_open_count", "will_open", "decision", "opened", "prize",
+	} {
+		if _, ok := m[k]; !ok {
+			t.Errorf("缺少 JSON 键 %q（前端契约）", k)
+		}
+	}
+	// Go 字段名不应泄漏到线上。
+	for _, k := range []string{"TravelState", "WillOpen", "MaxOpen", "CostPerOpen"} {
+		if _, ok := m[k]; ok {
+			t.Errorf("泄漏了 Go 字段名 %q", k)
+		}
+	}
+}
+
+// TestCompensationStatusAllKeepsDisabledRow 禁用账号必须以 skip 行出现在面板结果里。
+//
+// 回归点：CompensationStatusAll 曾走 IncludeDisabled=false 的账号集合，禁用号
+// 被直接过滤掉——面板表格里凭空少一行，用户以为账号丢了。旧 compTargets 是
+// 明确把 disabled 作为 skip 行返回的。
+func TestCompensationStatusAllKeepsDisabledRow(t *testing.T) {
+	p := New("")
+	p.Add(capableAccount{uid: "u1", backend: "codebuddy"})
+	p.Add(capableAccount{uid: "u2", backend: "codebuddy"})
+	p.Disable("u2", "凭证失效")
+
+	rows := p.CompensationStatusAll(context.Background())
+	if len(rows) != 2 {
+		t.Fatalf("应返回 2 行（含禁用号），实际 %d", len(rows))
+	}
+	var found bool
+	for _, r := range rows {
+		if r.UID != "u2" {
+			continue
+		}
+		found = true
+		if r.Skip != CompSkipDisabled {
+			t.Errorf("禁用号 skip=%q, want %q", r.Skip, CompSkipDisabled)
+		}
+		if r.SkipMsg == "" {
+			t.Error("禁用号应有 skip 说明（面板要显示原因）")
+		}
+	}
+	if !found {
+		t.Error("禁用号 u2 从结果里消失了")
+	}
+}
+
+// TestBlackcatAllRespectsWindow 窗口外不得发起任何上游调用。
+//
+// 回归点：窗口守卫原只在 scheduler 层，任何新的 Pool.BlackcatAll 调用方都会
+// 绕过它，在白天白烧真实对话额度。
+func TestBlackcatAllRespectsWindow(t *testing.T) {
+	SetCapabilityDelay(0)
+	defer SetBlackcatWindowCheck(nil)
+
+	calls := &atomic.Int32{}
+	p := New("")
+	p.Add(blackcatAccount{capableAccount{uid: "u1", backend: "codebuddy"}, calls})
+
+	// 窗口外：直接返回空，不打上游。
+	SetBlackcatWindowCheck(func(time.Time) bool { return false })
+	if got := p.BlackcatAll(context.Background()); len(got) != 0 {
+		t.Errorf("窗口外应返回空，实际 %d 行", len(got))
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("窗口外不应发起上游调用，实际 %d 次", n)
+	}
+
+	// 窗口内：正常执行。
+	SetBlackcatWindowCheck(func(time.Time) bool { return true })
+	got := p.BlackcatAll(context.Background())
+	if len(got) != 1 {
+		t.Errorf("窗口内应返回 1 行，实际 %d", len(got))
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("窗口内应调用 1 次，实际 %d", n)
+	}
+}
+
+// blackcatAccount 只实现 BlackcatRunner。
+type blackcatAccount struct {
+	capableAccount
+	calls *atomic.Int32
+}
+
+func (a blackcatAccount) RunBlackcat(context.Context) (gateway.BlackcatOutcome, error) {
+	a.calls.Add(1)
+	return gateway.BlackcatOutcome{Need: 1, Completed: 1}, nil
 }

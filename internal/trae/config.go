@@ -1,7 +1,7 @@
 // Package trae 实现 Trae（trae.cn / trae.com.cn）上游接入。
 //
-// 与 internal/upstream（CodeBuddy）和 internal/thirdparty（OpenAI 兼容）并列的
-// 第三个上游 provider。对话经 /v1/* 统一调度（模型名带 "trae:" 前缀指定），
+// 与 internal/upstream（CodeBuddy）并列的上游 provider（第三方上游已移除）。
+// 对话经 /v1/* 统一调度（模型名带 "trae:" 前缀指定），
 // 签到/积分等运维能力由面板直接调用本包。
 //
 // 协议要点（蓝本：TraeWorkAssistant 的 api_server/，2026-09 实测结论）：

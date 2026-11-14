@@ -75,7 +75,7 @@ func compensationScheduler(t *testing.T, rec *compensationRecorder, accts ...*au
 	for _, a := range accts {
 		p.Add(cbAccount(up, a))
 	}
-	return New(Config{Pool: p, Upstream: up})
+	return New(Config{Pool: p})
 }
 
 // TestCompensationStatusAllKeepsPoolOrder 钉住行序（S10）。

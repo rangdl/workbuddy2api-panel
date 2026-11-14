@@ -50,6 +50,21 @@ var (
 	activityStreakSettle = 8 * time.Second
 )
 
+// SetActivityStreakSettle 覆盖活跃上报后回读 streak 的等待时长（测试用，<=0 = 不等待）。
+//
+// 为什么需要导出：等待发生在账号实现内部，而测试在 scheduler 包。不提供这个
+// 入口的话，`fastActivity(t)` 改 scheduler 侧的同名变量完全无效——每个账号
+// 仍真等 8 秒，整包测试被拖到 70+ 秒。
+func SetActivityStreakSettle(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	activityStreakSettle = d
+}
+
+// ActivityStreakSettle 当前生效的等待时长（测试断言用）。
+func ActivityStreakSettle() time.Duration { return activityStreakSettle }
+
 // cstZone 上游每日重置按自然日 00:00 CST（Asia/Shanghai）。中国无夏令时，固定 +8 即可，
 // 不依赖容器 tzdata。
 var cstZone = time.FixedZone("CST", 8*60*60)
@@ -74,8 +89,8 @@ func travelDay(t time.Time) string {
 // SupportsPersonalGrowth（只认 enterpriseId）。
 //
 // 凭证判据分两档，与改造前各任务的既有口径保持一致：
-//   - 旅行/连登/夜猫子/补偿 看 RefreshTokenValue（它们可能触发 token 续期）；
-//   - 活跃上报只看 AccessTokenValue（纯上报，不续期）。
+//   - 旅行/连登/夜猫子 看 RefreshTokenValue（它们可能触发 token 续期）；
+//   - 补偿/活跃上报 只看 AccessTokenValue（纯 RPC，不续期）。
 func (x Account) capabilityGate() error {
 	return x.gate(requireRefreshToken, false)
 }
@@ -169,8 +184,15 @@ func (x Account) Travel(ctx context.Context, opts gateway.TravelOptions) (gatewa
 			return gateway.TravelOutcome{Action: "claimed", State: ts.State, Reward: reward}, nil
 		}
 		// 领奖后回到 idle：同趟继续（盲盒 → 派出）。
+		//
+		// Action 必须反映**本趟最终动作**：如果又派出去了，Action 保持
+		// "departed"（调度器据此 poke 到站定时器）；只有「领完就停」才回落
+		// "claimed"。曾无条件覆盖成 "claimed"，导致到站闭环派出后不 poke、
+		// 日志也不显示派出。
 		out := x.travelIdlePhase(label, ts, opts)
-		out.Action = "claimed"
+		if out.Action != "departed" {
+			out.Action = "claimed"
+		}
 		out.Reward = reward
 		return out, nil
 	}
@@ -545,6 +567,9 @@ func compactJSON(raw json.RawMessage) string {
 //
 // 注意这是特色能力里唯一**会发真实模型对话**的（逐条 ChatStream 发短对话），
 // 池因此对 paused 账号跳过本能力（见 pool.BlackcatAll）。
+//
+// 窗口守卫在**池层**（pool.BlackcatAll）：这是调度策略（几点算夜间），
+// 且需要可注入时钟供测试控制。这里不再重复判定。
 func (x Account) RunBlackcat(ctx context.Context) (gateway.BlackcatOutcome, error) {
 	if err := x.capabilityGate(); err != nil {
 		return gateway.BlackcatOutcome{}, err
@@ -673,14 +698,22 @@ func (x Account) ReportActivity(ctx context.Context) (gateway.ActivityOutcome, e
 	case <-ctx.Done():
 		return gateway.ActivityOutcome{Message: "上报成功（ctx 取消，未回读 streak）"}, nil
 	}
+	// 三条日志是**运维对账通道**（靠 grep `activity .*streak days=` 逐号核对）。
+	// 它们必须真的打出来，不能只放在返回值的 Message 里——调用方
+	// （pool.ActivityAll → scheduler/panel）都丢弃了返回值。
+	label := logfmt.Label(x.A.UID, x.A.NicknameValue())
 	days, err := x.client.GrowthStreak(x.A)
 	if err != nil {
+		log.Printf("activity %s: streak check failed (report OK): %v", label, err)
 		return gateway.ActivityOutcome{Message: "report OK, streak check failed"}, nil
 	}
 	if days == 0 {
+		log.Printf("activity %s: report OK but streak.days=0 (silent drop?)", label)
 		return gateway.ActivityOutcome{StreakDays: 0,
 			Message: "report OK but streak.days=0 (silent drop?)"}, nil
 	}
+	// 成功也打一行：方便对账（旧实现同理）。
+	log.Printf("activity %s: streak days=%d", label, days)
 	return gateway.ActivityOutcome{StreakDays: days,
 		Message: fmt.Sprintf("streak days=%d", days)}, nil
 }

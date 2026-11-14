@@ -1198,10 +1198,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="box">
         <header><h3>Trae 上游</h3><span class="grow"></span><span class="note" id="traePath"></span></header>
         <div class="pad">
-          <div class="switch"><span class="lb">启用 /trae/v1/*</span>
+          <div class="switch"><span class="lb">启用 Trae 上游</span>
             <input type="checkbox" id="traeEnabled"></div>
-          <div class="hint">客户端把 base_url 指向 <code>http://&lt;主机&gt;:&lt;端口&gt;/trae/v1</code> 即可走 Trae 上游；
-            与 <code>/v1/*</code>（CodeBuddy）、<code>/tp/v1/*</code>（第三方）三者互不冲突。</div>
+          <div class="hint">启用后 Trae 账号参与调度。**没有独立前缀**——对话仍走 <code>/v1/*</code>，
+            用模型名前缀 <code>trae:</code> 指定上游（如 <code>trae:cn:glm-5.3</code>）。</div>
           <div class="grid2">
             <label class="fld"><span class="lb">对话上游 base</span>
               <input id="traeChatBase" placeholder="https://trae-api-cn.mchost.guru"></label>

@@ -7,7 +7,7 @@
 //
 // 与固定 hours 的关系：hours 继续作为兜底（timer 漏唤醒/机器长时间关机时仍有一趟），
 // timer 负责主路径「到站即领、领完接着派出」。timer 不增加稳态上游请求
-// （只在到点后跑一次 travelOne），其余时间纯 sleep。
+// （只在到点后对单个账号跑一次巡检），其余时间纯 sleep。
 package scheduler
 
 import (
@@ -50,13 +50,14 @@ type travelTimerParams struct {
 }
 
 // travelTimerDefaults 生产取值：
-//   （没有 poll 项：无在途行程时定时器阻塞等事件，不做周期轮询——猫一天只派出
-//     一趟，周期重查等于每小时对全池空发一次 travel/status。）
-//   - step 与 wallclockCheckStep 同口径；
-//   - minWait 1s：到点瞬间查 status 可能仍返回 traveling（上游时间只到秒），
-//     留 1s 缓冲避免白跑一趟。已过点的行程不受此限，立即触发；
-//   - jitterMax 15min：到站后随机再等 0~15 分钟才领奖，避免「0 秒领取」的机器特征。
-//     猫到站后奖励不会过期（实测挂 19 天仍可领），等待无风险。
+//
+//	（没有 poll 项：无在途行程时定时器阻塞等事件，不做周期轮询——猫一天只派出
+//	  一趟，周期重查等于每小时对全池空发一次 travel/status。）
+//	- step 与 wallclockCheckStep 同口径；
+//	- minWait 1s：到点瞬间查 status 可能仍返回 traveling（上游时间只到秒），
+//	  留 1s 缓冲避免白跑一趟。已过点的行程不受此限，立即触发；
+//	- jitterMax 15min：到站后随机再等 0~15 分钟才领奖，避免「0 秒领取」的机器特征。
+//	  猫到站后奖励不会过期（实测挂 19 天仍可领），等待无风险。
 var travelTimerDefaults = travelTimerParams{
 	step:      wallclockCheckStep,
 	minWait:   time.Second,
@@ -119,7 +120,7 @@ type travelArrival struct {
 // 每轮（被唤醒后）：
 //  1. 遍历全池查 travel/status，收集在途账号的到站时刻；
 //  2. 取最早的一个，sleep 到点；
-//  3. 到点只对那个账号跑 travelOne（领奖 → 重查 → 盲盒 → 再派出）；
+//  3. 到点只对那个账号跑巡检（领奖 → 重查 → 盲盒 → 再派出）；
 //  4. 重算下一轮。
 //
 // fired 记「哪一趟行程已经触发过」（uid → 上游 arrive_at）：上游若持续返回
@@ -267,7 +268,7 @@ func travelDueTime(ts gateway.TravelSnapshot, now time.Time) (at time.Time, key 
 			remain = ts.ArriveAt - ts.ServerNow
 		}
 		if remain < 0 {
-			remain = 0 // 已过点：立即唤醒（travelOne 按真实状态决定领奖/跳过）
+			remain = 0 // 已过点：立即唤醒（巡检按真实状态决定领奖/跳过）
 		}
 		return now.Add(time.Duration(remain) * time.Second), ts.ArriveAt, false, true
 	default:

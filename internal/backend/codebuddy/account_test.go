@@ -1,8 +1,8 @@
 package codebuddy
 
 import (
-	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"context"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"

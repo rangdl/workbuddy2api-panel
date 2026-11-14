@@ -52,9 +52,9 @@ func TestCreditsUsesGeneralNotTotal(t *testing.T) {
 		AppID:          traepkg.DefaultAppID,
 	}
 	acc := &traepkg.Account{UID: "u1", AccessToken: "tok"}
-	b := New(traepkg.NewClient(), func() *traepkg.Config { return cfg })
 
-	c, err := b.Credits(context.Background(), Account{A: acc, realm: "cn"})
+	// Backend.Credits 已删（零生产调用）；余额统一走账号对象。
+	c, err := Account{A: acc, realm: "cn", client: traepkg.NewClient(), ConfigFn: func() *traepkg.Config { return cfg }}.Credits(context.Background())
 	if err != nil {
 		t.Fatalf("Credits: %v", err)
 	}
@@ -78,11 +78,8 @@ func TestBackendAccountsRealm(t *testing.T) {
 			{UID: "u2", Name: "乙", AccessToken: "t2", Disabled: true},
 		},
 	}
-	b := New(traepkg.NewClient(), func() *traepkg.Config { return cfg })
-	accs, err := b.Accounts()
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Backend.Accounts 已删（零生产调用）；装载走 Wrap。
+	accs := Wrap(cfg, traepkg.NewClient())
 	if len(accs) != 2 {
 		t.Fatalf("账号数 = %d", len(accs))
 	}
@@ -98,29 +95,26 @@ func TestBackendAccountsRealm(t *testing.T) {
 
 // TestBackendSupportsUsesModelPairs 内置映射里的模型应被支持。
 func TestBackendSupportsUsesModelPairs(t *testing.T) {
-	cfg := &traepkg.Config{Enabled: true, ChatBase: "http://127.0.0.1:1"}
-	b := New(traepkg.NewClient(), func() *traepkg.Config { return cfg })
-	acc := Account{A: &traepkg.Account{UID: "u1", AccessToken: "t"}, realm: "cn"}
-
-	if !b.Supports(acc, "glm-5.2") {
+	// Backend.Supports 已删（零生产调用）；准入判定靠 ModelPair 查表。
+	if _, _, ok := traepkg.ModelPair("glm-5.2"); !ok {
 		t.Error("glm-5.2 在内置映射里，应被支持")
 	}
-	// 未收录且目录拉不到 → 拒绝（Trae 会回 4001，提前排除更省额度）。
-	if b.Supports(acc, "totally-unknown-model-xyz") {
-		t.Error("未收录模型不应被支持")
+	// 未收录 → 上游会回 4001，由模型级负缓存事后学习（不做事前查表）。
+	if _, _, ok := traepkg.ModelPair("totally-unknown-model-xyz"); ok {
+		t.Error("未收录模型不应出现在内置映射里")
 	}
 }
 
 // TestWireModel 客户端名 → config_name 映射。
 func TestWireModel(t *testing.T) {
-	b := &Backend{}
-	acc := Account{A: &traepkg.Account{UID: "u1"}, realm: "cn"}
-	if got := b.WireModel(acc, "deepseek-v4-flash"); got != "DeepSeek-V4-Flash" {
-		t.Errorf("WireModel = %q, want DeepSeek-V4-Flash", got)
+	// Backend.WireModel 已删（零生产调用）；映射由 ModelPair 提供，
+	// 在 PrepareChatBody 内部使用。
+	// ModelPair 返回 (config_name, model_name)：前者是上游 wire 名。
+	if configName, _, ok := traepkg.ModelPair("deepseek-v4-flash"); !ok || configName == "" {
+		t.Errorf("ModelPair configName=%q ok=%v, want 非空", configName, ok)
 	}
-	// 无映射时原样返回。
-	if got := b.WireModel(acc, "some-new-model"); got != "some-new-model" {
-		t.Errorf("WireModel = %q", got)
+	if _, _, ok := traepkg.ModelPair("some-new-model"); ok {
+		t.Error("无映射的模型不应出现在内置表里")
 	}
 }
 

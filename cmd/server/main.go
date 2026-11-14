@@ -217,7 +217,6 @@ func main() {
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
-		Upstream:       up,
 		CheckinHours:   cfg.Schedule.CheckinHours,
 		TravelHours:    cfg.Schedule.TravelHours,
 		ActivityHours:  cfg.Schedule.ActivityHours,
@@ -407,8 +406,18 @@ func main() {
 	// 多上游注册表：CodeBuddy 始终注册（它是默认链路）；Trae 按 trae.json 的
 	// enabled 开关参与——Enabled() 运行期读配置，面板热重载后即时生效。
 	backends := gateway.NewRegistry()
-	backends.Register(backendcb.New(up, func() bool { return true },
-		func() ([]*auth.Auth, error) { return auth.LoadDir(cfg.AuthDir) }))
+	// 降级状态机：backend 的 RetryHook 与 Handler 必须共享同一实例
+	//（后者用它判断「降级期直达 Degraded 提示词」）。
+	degradeGate := server.NewDegradeGate()
+	// PromptMode 缺省与 server.NewHandler 保持一致（custom）：两处取值不同会让
+	// RetryHook 的「只在 passthrough/append 降级重试」判断失效。
+	promptMode := cfg.Prompt.Mode
+	if promptMode == "" {
+		promptMode = "custom"
+	}
+	backends.Register(server.NewCodeBuddyBackend(up, func() bool { return true },
+		func() ([]*auth.Auth, error) { return auth.LoadDir(cfg.AuthDir) },
+		degradeGate, promptMode))
 	backends.Register(backendtrae.New(traeClient, func() *trae.Config {
 		tcfg, err := trae.Load(trae.ConfigPath(*cfgPath), cfg.AuthDir)
 		if err != nil {
@@ -434,6 +443,7 @@ func main() {
 		Usage:        rec,
 		RequestLog:   requestLog,
 		PromptMode:   cfg.Prompt.Mode,
+		DegradeGate:  degradeGate,
 		PromptText:   cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。

@@ -19,6 +19,7 @@ import (
 func Decide(kind upstream.ErrKind, status int, msg string, retryAfter time.Duration) gateway.Decision {
 	d := gateway.Decision{
 		Kind:    kind.String(),
+		Policy:  gateway.PolicyCodeBuddy,
 		Code:    statusCode(status),
 		Message: msg,
 	}
@@ -41,8 +42,17 @@ func Decide(kind upstream.ErrKind, status int, msg string, retryAfter time.Durat
 		// 上游偶发 404：短冷却，不累计错误计数（防雪崩）。
 		d.Action, d.Rotate = gateway.ActionCoolShort, true
 	case upstream.ErrModelBlocked:
-		// 11102「该后端无此模型」：(账号,模型) 负缓存，账号对其余模型仍健康。
-		d.Action, d.Rotate = gateway.ActionModelCooldown, false
+		// 11102「该后端无此模型」/ 11158「该账号类型无此模型权限」：
+		// (账号,模型) 负缓存避让，**并且换号**。
+		//
+		// 为什么 Rotate=true：11158 是**账号类型**级权限拒绝——同一模型换一个有
+		// 权限的账号仍可能成功（upstream 的 client_test 明确记录了这一点）。
+		// 11102 同样是按账号后端的确定性答复：写负缓存的目的正是「跳过这个号、
+		// 试下一个」。旧内联路径也是 continue 换号，只有轮转耗尽后才在末端报
+		// model_unavailable。
+		// 设成 false 会让「多账号同域、首个号 11158」直接返回 400，而本来
+		// 第二个号能成功——这是默认部署（cross_domain_fallback 关闭）的常见形态。
+		d.Action, d.Rotate = gateway.ActionModelCooldown, true
 	case upstream.ErrContentBlocked, upstream.ErrBadParams, upstream.ErrPromptTooLong,
 		upstream.ErrImageInvalid, upstream.ErrUpstreamBusy, upstream.ErrChannelRefused:
 		// 全部是请求级问题：换号无用。

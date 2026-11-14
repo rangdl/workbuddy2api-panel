@@ -2,8 +2,7 @@
 //
 // 目录约定（相对于启动目录）：
 //
-//	config/   用户会手改的配置：config.json / responses.json / anthropic.json
-//	          / third_party.json / trae.json / model.json
+//	config/   用户会手改的配置：config.json / trae.json / model.json
 //	data/     程序自己写的运行时状态：state.json / usage.json / credit-history.json
 //	          / output_probes.json / request-logs/
 //
@@ -79,9 +78,6 @@ type legacyFile struct {
 
 var legacyFiles = []legacyFile{
 	{"config.json", "config"},
-	{"responses.json", "config"},
-	{"anthropic.json", "config"},
-	{"third_party.json", "config"},
 	{"trae.json", "config"},
 	{"model.json", "config"},
 	{"state.json", "data"},

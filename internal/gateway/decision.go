@@ -14,6 +14,20 @@ import (
 // 为什么 Action 与 Rotate 分开：两者语义独立。「不罚账号」不等于「该换号」，
 // 反过来也一样——请求本身有问题时不罚号，换号也只会把同一个错误烧两遍。
 
+// Policy 失败处置策略的归属方。
+//
+// 由 backend 在构造 Decision 时自己标注——它是「我的错误该由谁的策略处理」的
+// 唯一权威答案，调用方不需要按 Kind 名字猜。
+type Policy int
+
+const (
+	// PolicyGeneric 通用策略（gateway.Action 的固定时长冷却）。
+	// 零值：新增 backend 不显式标注时走这里，行为可预测。
+	PolicyGeneric Policy = iota
+	// PolicyCodeBuddy CodeBuddy 的精细策略（applyErrorPolicy 的 12 类分支）。
+	PolicyCodeBuddy
+)
+
 // Action 对账号的处置。
 type Action int
 
@@ -72,7 +86,19 @@ type Decision struct {
 	Cooldown time.Duration
 	// Kind backend 的原始分类名（"plan_limit" / "session_dead"），
 	// 仅用于日志与面板展示——调度逻辑不读它。
+	//
+	// ⚠️ **不要用它做跨层判定**：不同上游的 Kind 会撞名（Trae 的
+	// soft_rate/session_dead/server/client 与 CodeBuddy 的 ErrKind 同名但
+	// 语义与冷却时长不同）。需要按上游分流时用 Policy 字段。
 	Kind string
+	// Policy 该失败应由哪套处置策略处理。
+	//
+	// 为什么需要：CodeBuddy 的 applyErrorPolicy 有 12 类精细分支（6004 墙钟
+	// 对齐、11102 指数负缓存、softStreak 封顶），通用 applyDecision 只有固定
+	// 时长。用 Kind 字符串反查会因撞名把 Trae 的失败送进 CodeBuddy 策略
+	// （soft_rate 冷却被放大 10 倍、session_dead 的 reason 写成 12153 等）。
+	// 由 backend 在自己决定时显式标注，调用方不再猜。
+	Policy Policy
 	// Code 上游原始业务码（"1005" / "11102"）。
 	Code string
 	// Message 可读原因（优先上游原文）。

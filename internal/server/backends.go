@@ -1,6 +1,7 @@
 package server
 
 import (
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
@@ -40,9 +41,34 @@ func (h *Handler) newCodeBuddyBackend() *backendcb.Backend {
 	return &backendcb.Backend{
 		Client:    h.cfg.Upstream,
 		EnabledFn: func() bool { return true },
-		Retry:     degradeRetryHook{gate: &h.degrade, mode: h.cfg.PromptMode},
+		Retry:     degradeRetryHook{gate: h.degrade, mode: h.cfg.PromptMode},
 	}
 }
+
+// NewCodeBuddyBackend 供 cmd/server 装配用：构造**带降级重试**的 CodeBuddy backend。
+//
+// 为什么必须导出一个构造器而不是让 main 直接 backendcb.New：
+// 生产装配走的是「显式注入 Registry」这条路径，而 ensureCodeBuddyBackend 的
+// 兼容垫片在「已有注册表」时直接 return。若 main 用 backendcb.New（不带 Retry），
+// 生产环境的 RetryHook 恒为 nil —— 内容是别误报后直接 400，降级重试完全失效。
+// 而测试走垫片路径（有 Retry），所以测试全绿、线上失效，是最难发现的那类不一致。
+//
+// gate 与 mode 由调用方传入：它们属于网关策略，backend 包不认识。
+func NewCodeBuddyBackend(c *upstream.Client, enabled func() bool,
+	load func() ([]*auth.Auth, error), gate *DegradeGate, promptMode string) *backendcb.Backend {
+	return &backendcb.Backend{
+		Client:    c,
+		EnabledFn: enabled,
+		LoadFn:    load,
+		Retry:     degradeRetryHook{gate: gate, mode: promptMode},
+	}
+}
+
+// DegradeGate 降级状态机的对外句柄（main 需要跨 Handler 共享同一实例）。
+type DegradeGate = degradeGate
+
+// NewDegradeGate 构造一个空的降级状态机。
+func NewDegradeGate() *DegradeGate { return &degradeGate{} }
 
 // degradeRetryHook 内容拦截时的同账号重试改写。
 //

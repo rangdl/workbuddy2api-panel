@@ -47,7 +47,8 @@ const (
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
-func (k ErrKind) String() string {	switch k {
+func (k ErrKind) String() string {
+	switch k {
 	case ErrHardCredit:
 		return "hard_credit"
 	case ErrSoftRate:

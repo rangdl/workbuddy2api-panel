@@ -153,7 +153,7 @@ func (p *Pool) TravelAllWith(ctx context.Context, base gateway.TravelOptions) []
 	p.forEachCapable(ctx, capOptions{
 		IncludePaused: true,
 		Concurrency:   1,
-		Delay:         capDelay(),
+		Delay:         capDelay(ctx),
 		StopOnCancel:  true,
 	}, func(acc gateway.Account) {
 		r := TravelResult{UID: acc.UID(), Nickname: acc.Nickname()}
@@ -279,7 +279,7 @@ func (p *Pool) BlindboxAll(ctx context.Context, apply bool, maxPerRun int) []Bli
 	p.forEachCapable(ctx, capOptions{
 		IncludePaused: true,
 		Concurrency:   1,
-		Delay:         capDelay(),
+		Delay:         capDelay(ctx),
 		StopOnCancel:  true,
 	}, func(acc gateway.Account) {
 		r := BlindboxResult{UID: acc.UID(), Nickname: acc.Nickname()}
@@ -321,7 +321,7 @@ func (p *Pool) StreakAll(ctx context.Context) []StreakResult {
 	p.forEachCapable(ctx, capOptions{
 		IncludePaused: true,
 		Concurrency:   1,
-		Delay:         capDelay(),
+		Delay:         capDelay(ctx),
 		StopOnCancel:  true,
 	}, func(acc gateway.Account) {
 		r := StreakResult{UID: acc.UID(), Nickname: acc.Nickname()}
@@ -350,17 +350,44 @@ type BlackcatResult struct {
 	Err      error
 }
 
+// blackcatWindowCheck 夜猫子窗口判定（可注入，测试用）。
+//
+// 判定放在池层而不是账号实现：这是**调度策略**（几点算夜间），与「账号有什么
+// 能力」无关；且需要一个可替换的时钟供测试在白天也能验证窗口逻辑。
+// 任何新的调用方接入 Pool.BlackcatAll 都会自动受这个守卫保护。
+var blackcatWindowCheck = defaultBlackcatWindow
+
+// defaultBlackcatWindow 23:00–08:00 计数窗口。
+func defaultBlackcatWindow(now time.Time) bool {
+	h := now.Hour()
+	return h >= 23 || h < 8
+}
+
+// SetBlackcatWindowCheck 替换窗口判定（测试用；传 nil 恢复默认）。
+func SetBlackcatWindowCheck(fn func(time.Time) bool) {
+	if fn == nil {
+		blackcatWindowCheck = defaultBlackcatWindow
+		return
+	}
+	blackcatWindowCheck = fn
+}
+
 // BlackcatAll 对所有适用账号执行夜猫子任务（串行 800ms）。
 //
 // **不包含 paused 账号**：夜猫子是全任务体系里唯一「整任务都是真实模型对话」的
 // （逐条 ChatStream 发短对话），与「让位防风控」正面冲突。旅行/连登/补偿都是
 // 纯 RPC 或领奖，照常跑。
+//
+// 窗口外直接返回空：夜猫子只在该时段计分，白天执行纯属白烧对话额度。
 func (p *Pool) BlackcatAll(ctx context.Context) []BlackcatResult {
+	if !blackcatWindowCheck(time.Now()) {
+		return nil
+	}
 	var out []BlackcatResult
 	p.forEachCapable(ctx, capOptions{
 		IncludePaused: false,
 		Concurrency:   1,
-		Delay:         capDelay(),
+		Delay:         capDelay(ctx),
 		StopOnCancel:  true,
 	}, func(acc gateway.Account) {
 		r := BlackcatResult{UID: acc.UID(), Nickname: acc.Nickname()}
@@ -440,16 +467,28 @@ func (r *CompensationResult) fill(o gateway.CompensationOutcome, err error) {
 
 // CompensationStatusAll 查全部适用账号的补偿状态（只读，不领取）。
 //
+// **包含已禁用账号**：它们不进上游查询，但必须以 skip 行出现在结果里——
+// 面板靠这一行告诉用户「这个号为什么没动」。把它们过滤掉会让账号从表格里
+// 凭空消失，用户以为账号丢了（旧 compTargets 正是这么做的）。
+//
 // 并发 3（与既有 package 遍历口径一致）。**输出顺序与池顺序一致**：并发写入
 // 会让「goroutine 完成顺序」决定行序，面板逐行对齐会随机漂移，所以按账号下标
 // 预分配切片、各自只写自己那一格。
 func (p *Pool) CompensationStatusAll(ctx context.Context) []CompensationResult {
-	accs := p.capableAccounts(capOptions{IncludePaused: true})
-	out := make([]CompensationResult, len(accs))
+	// members 而非 accounts：需要 Status.Disabled 来判断该不该发起上游查询。
+	members := p.Members(MemberFilter{IncludeDisabled: true, IncludePaused: true})
+	out := make([]CompensationResult, len(members))
 	sem := make(chan struct{}, 3)
 	var wg sync.WaitGroup
-	for i, acc := range accs {
+	for i, m := range members {
+		acc := m.Acc
 		out[i] = CompensationResult{UID: acc.UID(), Nickname: acc.Nickname()}
+		// 禁用号：不查上游，但保留 skip 行。
+		if m.Status.Disabled {
+			out[i].Skip = CompSkipDisabled
+			out[i].SkipMsg = "账号已禁用"
+			continue
+		}
 		c, ok := acc.(gateway.Compensator)
 		if !ok {
 			continue
@@ -466,7 +505,7 @@ func (p *Pool) CompensationStatusAll(ctx context.Context) []CompensationResult {
 				// 原因。面板靠它显示「这个号为什么不参与」——把它丢掉会让企业号
 				// 从表格里凭空消失，用户以为账号丢了。
 				out[i].Unsupported = true
-				out[i].Skip = compSkipReasonFor(accs[i])
+				out[i].Skip = compSkipReasonFor(acc)
 				out[i].SkipMsg = unsupportedMessage(out[i].Skip)
 			case err != nil:
 				out[i].fill(gateway.CompensationOutcome{}, err)
@@ -485,16 +524,21 @@ func (p *Pool) CompensationStatusAll(ctx context.Context) []CompensationResult {
 // 不影响后一个号的判定，且账号量通常是个位数。
 func (p *Pool) CompensationClaimAll(ctx context.Context) []CompensationResult {
 	var out []CompensationResult
-	p.forEachCapable(ctx, capOptions{
-		IncludePaused: true,
-		Concurrency:   1,
-		Delay:         capDelay(),
-		StopOnCancel:  true,
-	}, func(acc gateway.Account) {
+	// 与 StatusAll 同口径：禁用号保留 skip 行（面板要能显示「为什么没领」）。
+	for _, m := range p.Members(MemberFilter{IncludeDisabled: true, IncludePaused: true}) {
+		acc := m.Acc
 		r := CompensationResult{UID: acc.UID(), Nickname: acc.Nickname()}
+		if m.Status.Disabled {
+			r.Skip, r.SkipMsg = CompSkipDisabled, "账号已禁用"
+			out = append(out, r)
+			continue
+		}
 		c, ok := acc.(gateway.Compensator)
 		if !ok {
-			return
+			continue
+		}
+		if ctx.Err() != nil {
+			break
 		}
 		outcome, err := c.CompensationClaim(ctx)
 		switch {
@@ -511,7 +555,7 @@ func (p *Pool) CompensationClaimAll(ctx context.Context) []CompensationResult {
 			}
 		}
 		out = append(out, r)
-	})
+	}
 	return out
 }
 
@@ -535,7 +579,7 @@ func (p *Pool) ActivityAll(ctx context.Context) []ActivityResult {
 		IncludeDisabled: includeDisabledInTasks(ctx),
 		IncludePaused:   true,
 		Concurrency:     1,
-		Delay:           capDelay(),
+		Delay:           capDelay(ctx),
 		StopOnCancel:    true,
 	}, func(acc gateway.Account) {
 		r := ActivityResult{UID: acc.UID(), Nickname: acc.Nickname()}
@@ -662,29 +706,48 @@ func WithIncludeDisabledInTasks(ctx context.Context, v bool) context.Context {
 
 // 特色能力的默认账号间延迟（与改造前的 travelAccountDelay 同值同口径）。
 //
-// 用 atomic 而非普通变量：调度器可能随时改动它（配置热重载 / 测试置 0），
-// 而批量调度正在另一个 goroutine 里读——普通变量会被 -race 抓到。
-var capabilityDelay atomic.Int64
+// 注意：这里只是**默认值**。真正的延迟由调用方经 ctx 传入（见 WithCapabilityDelay），
+// 因为 scheduler 的 runBatch 会**并发**派发多类任务（旅行/活跃/夜猫子同时跑），
+// 用一个全局变量会让它们互相覆盖——旅行设 800ms、活跃设 0 时，谁后写谁生效。
+var defaultCapabilityDelay atomic.Int64
 
 func init() {
-	capabilityDelay.Store(int64(800 * time.Millisecond))
+	defaultCapabilityDelay.Store(int64(800 * time.Millisecond))
 }
 
-// SetCapabilityDelay 覆盖特色能力的账号间延迟（<=0 表示不等待）。
+// WithCapabilityDelay 为本次批量调度指定账号间延迟（>=0；0 = 不等待）。
 //
-// 仅供调用方（调度器）把自身配置/测试开关同步进来：调度器把 travelAccountDelay
-// 置 0 是既有测试的约定，池不认识调度器，所以需要一个注入点。
+// 用 ctx 而不是全局变量：任务之间互不干扰，也不需要调用方在巡检前后成对
+// set/reset（那种写法在并发任务下必然串味）。
+func WithCapabilityDelay(ctx context.Context, d time.Duration) context.Context {
+	if d < 0 {
+		d = 0
+	}
+	return context.WithValue(ctx, ctxKeyCapDelay, d)
+}
+
+const ctxKeyCapDelay ctxKey = "pool.capabilityDelay"
+
+// capDelay 本次批量调度生效的延迟：ctx 指定优先，否则用默认值。
+func capDelay(ctx context.Context) time.Duration {
+	if v, ok := ctx.Value(ctxKeyCapDelay).(time.Duration); ok {
+		return v
+	}
+	return time.Duration(defaultCapabilityDelay.Load())
+}
+
+// SetCapabilityDelay 覆盖**默认**账号间延迟（<=0 表示不等待）。
+//
+// 只影响未通过 WithCapabilityDelay 指定延迟的调用方。保留它是为了兼容既有
+// 测试（它们用 `SetCapabilityDelay(0)` 关掉真实等待）。
 func SetCapabilityDelay(d time.Duration) {
 	if d < 0 {
 		d = 0
 	}
-	capabilityDelay.Store(int64(d))
+	defaultCapabilityDelay.Store(int64(d))
 }
 
-// CapabilityDelay 当前生效的账号间延迟（测试断言用）。
+// CapabilityDelay 当前生效的**默认**延迟（测试断言用）。
 func CapabilityDelay() time.Duration {
-	return time.Duration(capabilityDelay.Load())
+	return time.Duration(defaultCapabilityDelay.Load())
 }
-
-// capDelay 批量调度读取的延迟值。
-func capDelay() time.Duration { return CapabilityDelay() }

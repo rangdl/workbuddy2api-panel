@@ -25,7 +25,7 @@ const (
 	maxErrorBodyBytes = 64 * 1024
 )
 
-// Client Trae 上游客户端（双 http.Client 共享连接池，与 thirdparty 同策略）。
+// Client Trae 上游客户端（双 http.Client 共享连接池）。
 type Client struct {
 	transport  *http.Transport
 	streamHTTP *http.Client

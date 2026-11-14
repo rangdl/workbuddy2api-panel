@@ -8,6 +8,8 @@ package scheduler
 
 import (
 	"context"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 )
 
 // RunStreakBonusNow 对所有适用账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。
@@ -19,5 +21,5 @@ func (s *Scheduler) RunStreakBonusNow() {
 
 // RunStreakBonusContext 同 RunStreakBonusNow，但可被 ctx 中断（停机时立即退出）。
 func (s *Scheduler) RunStreakBonusContext(ctx context.Context) {
-	s.cfg.Pool.StreakAll(ctx)
+	s.cfg.Pool.StreakAll(pool.WithCapabilityDelay(ctx, travelAccountDelay))
 }

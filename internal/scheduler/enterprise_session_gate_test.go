@@ -38,7 +38,7 @@ func personalWithSwitchClaimScheduler(t *testing.T) (*Scheduler, *recorderUpstre
 		WebBaseCN:     srv.URL,
 	}
 	p.Add(cbAccount(up, a))
-	return New(Config{Pool: p, Upstream: up}), r
+	return New(Config{Pool: p}), r
 }
 
 // enterpriseAccountScheduler 构造真企业版（enterpriseId 非空）的调度器。
@@ -64,7 +64,7 @@ func enterpriseAccountScheduler(t *testing.T) (*Scheduler, *recorderUpstream) {
 		WebBaseCN:     srv.URL,
 	}
 	p.Add(cbAccount(up, a))
-	return New(Config{Pool: p, Upstream: up}), r
+	return New(Config{Pool: p}), r
 }
 
 // TestPersonalAccountWithSwitchClaimRunsAllTasks 个人号带 enterprise_switch 章时，
