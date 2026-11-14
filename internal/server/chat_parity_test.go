@@ -168,7 +168,67 @@ func TestChatParityBackendWritesModelCooldown(t *testing.T) {
 	}
 }
 
-// TestHealthzNoWarnOnDeletedEndpoints 已删除的三条协议端点必须 404。
+// TestApplyFailureRoutesCodeBuddyKindToDetailedPolicy CodeBuddy 的失败必须走
+// 精细策略 applyErrorPolicy，而不是固定时长的 applyDecision。
+//
+// 回归点：dispatch 路径原先把所有失败都交给 applyDecision，其冷却时长只有
+// 固定 1m/5m/12h。若把 CodeBuddy 也切到这条路径，6004 的墙钟重置对齐、
+// 11102 的指数负缓存、softStreak 封顶这些精细语义会全部丢失（降级）。
+func TestApplyFailureRoutesCodeBuddyKindToDetailedPolicy(t *testing.T) {
+	h := NewHandler(Config{})
+	acc := fakeGatewayAccount{uid: "u1", backend: "codebuddy"}
+	st := &chatStat{}
+
+	// ErrModelBlocked（11102）走精细策略 → BlockModelBackoff 写负缓存。
+	f := &gateway.Failure{
+		Decision: gateway.Decision{
+			Kind:    upstream.ErrModelBlocked.String(),
+			Action:  gateway.ActionModelCooldown,
+			Rotate:  false,
+			Message: "11102 model not found",
+		},
+		HTTPStatus: 400,
+	}
+	p := pool.New("")
+	p.Add(acc)
+	h.cfg.Pool = p
+	h.applyFailure(acc, "glm-5.2", f, st)
+
+	if bs := p.ModelBlocked("glm-5.2"); !bs.Blocked {
+		t.Errorf("ErrModelBlocked 应写模型负缓存，实际 %+v", bs)
+	}
+}
+
+// TestApplyFailureNonCodeBuddyKindFallsBack Trae 的 Kind 不匹配 CodeBuddy 枚举，
+// 必须回落到通用 applyDecision。
+func TestApplyFailureNonCodeBuddyKindFallsBack(t *testing.T) {
+	p := pool.New("")
+	p.Add(fakeGatewayAccount{uid: "t1", backend: "trae"})
+	h := NewHandler(Config{Pool: p})
+	acc := fakeGatewayAccount{uid: "t1", backend: "trae"}
+
+	// Trae 的 plan_limit → ActionCoolLong + 12h 固定冷却。
+	f := &gateway.Failure{
+		Decision: gateway.Decision{
+			Kind:    "plan_limit",
+			Action:  gateway.ActionCoolLong,
+			Rotate:  true,
+			Message: "1005 quota exhausted",
+		},
+		HTTPStatus: 402,
+	}
+	h.applyFailure(acc, "glm-5.2", f, &chatStat{})
+
+	st, ok := p.Status("t1")
+	if !ok {
+		t.Fatal("账号应在池中")
+	}
+	if !st.Cooling || st.CoolKind != "hard_credit" {
+		t.Errorf("plan_limit 应进入 CoolHard，实际 cooling=%v kind=%q", st.Cooling, st.CoolKind)
+	}
+}
+
+// healthzNoWarnOnDeletedEndpoints 已删除的三条协议端点必须 404。
 //
 // 阶段 1 的回归保护：确保删除是完整的（路由不再注册）。
 func TestDeletedEndpointsReturn404(t *testing.T) {

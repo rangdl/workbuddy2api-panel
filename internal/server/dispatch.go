@@ -118,22 +118,65 @@ func (h *Handler) handleBackendFailure(acc gateway.Account, model string, err er
 		log.Printf("WARN: [server] backend chat acct=%s: %v", acc.UID(), err)
 		return backendRetry, err
 	}
-	h.applyDecision(acc, model, f)
+	h.applyFailure(acc, model, f, st)
 	status := f.HTTPStatus
 	if status < 400 {
 		status = http.StatusBadGateway
 	}
 	st.status = status
-	msg := string(f.Body)
-	if msg == "" {
-		msg = f.Message
-	}
 	// Rotate 是 backend 对「换号是否有意义」的明确判断：请求体畸形、模型不可用
 	// 这类错误换到哪个号都得到同样结果，继续轮转只会把同一个错误烧 MaxRotate 遍。
 	if !f.Decision.Rotate {
 		return backendStop, f
 	}
 	return backendRetry, f
+}
+
+// applyFailure 按账号所属上游选择精细错误策略。
+//
+// 为什么不能统一走 applyDecision：CodeBuddy 的 applyErrorPolicy 有 12 类分支，
+// 包含 6004 的墙钟重置对齐、11102 的指数负缓存、softStreak 封顶、WAF 的 IP 级
+// fail-fast 等精细化处置；applyDecision 只有固定时长（1m/5m/12h）。把 CodeBuddy
+// 的失败交给 applyDecision 就是**降级**。
+//
+// 判据用 Decision.Kind（backend 的 Decide 已原样保留 ErrKind 字符串），
+// 而不是判断账号后端类型——这样 Trae 的错误（Kind="plan_limit" 等）自然落到
+// applyDecision，无需维护一张「哪些 Kind 属于 CodeBuddy」的名单。
+func (h *Handler) applyFailure(acc gateway.Account, model string, f *gateway.Failure, st *chatStat) {
+	if kind, ok := codebuddyErrKind(f.Decision.Kind); ok {
+		body := string(f.Body)
+		if body == "" {
+			body = f.Message
+		}
+		// Retry-After 头在 backend 分类时已折算进 Decision.Cooldown，
+		// 这里还原成 *upstream.Error 让 WAF/429 的 retry-after 分支照常生效。
+		var uerr *upstream.Error
+		if f.Decision.Cooldown > 0 {
+			uerr = &upstream.Error{Kind: kind, Status: f.HTTPStatus, RetryAfter: f.Decision.Cooldown}
+		}
+		h.applyErrorPolicy(acc.UID(), kind, body, model, uerr)
+		return
+	}
+	h.applyDecision(acc, model, f)
+}
+
+// codebuddyErrKind 把 Decision.Kind 还原成 CodeBuddy 的 ErrKind。
+//
+// 只认 upstream.ErrKind 的合法名字；Trae 的 Kind（plan_limit / device_proof /
+// model_unknown 等）不在其中，自然返回 false。
+//
+// 跳过 ErrNone：它是「成功」，不会作为失败 Kind 出现，且若真出现也不该按
+// CodeBuddy 策略处置（那是防御分支）。
+func codebuddyErrKind(name string) (upstream.ErrKind, bool) {
+	for k := upstream.ErrKind(0); k <= upstream.ErrClient; k++ {
+		if k == upstream.ErrNone {
+			continue
+		}
+		if k.String() == name {
+			return k, true
+		}
+	}
+	return 0, false
 }
 
 // applyDecision 按统一处置动作更新账号状态。
