@@ -103,6 +103,30 @@ function mdSearchText(m) {
     .filter(Boolean).join(' ').toLowerCase();
 }
 
+// mdRealmOf 取模型 id 里的域段。
+//
+// 两种形态：CodeBuddy 是 "<realm>:<模型>"（cn:glm-5.2），Trae 是
+// "trae:<realm>:<模型>"（trae:cn:doubao-…）。直接 startsWith 判断会把 Trae 的
+// CN 模型当成非 CN 而筛掉，所以先剥掉上游前缀再取域。
+function mdRealmOf(m) {
+  let id = String((m && m.id) || '');
+  if (id.startsWith('trae:')) id = id.slice('trae:'.length);
+  const i = id.indexOf(':');
+  return i > 0 ? id.slice(0, i) : '';
+}
+
+// mdUpstreamOf 模型所属上游。条目自带 upstream 字段（后端标注）；缺字段时按 ID
+// 前缀回退——"trae:" 开头的必然是 Trae，其余走 CodeBuddy。回退不是冗余：老缓存
+// 或第三方构造的条目可能没有该字段，按前缀判断比整列空白好。
+function mdUpstreamOf(m) {
+  const own = String((m && m.upstream) || '');
+  if (own) return own;
+  return String((m && m.id) || '').startsWith('trae:') ? 'trae' : 'codebuddy';
+}
+
+// mdUpstreamLabel 上游的展示名（徽标与筛选项共用同一套文案）。
+const MD_UPSTREAM_LABEL = { codebuddy: 'CodeBuddy', trae: 'Trae' };
+
 // mdMatch 单个模型是否满足全部筛选条件。
 function mdMatch(m, f) {
   f = f || mdFilter;
@@ -113,7 +137,8 @@ function mdMatch(m, f) {
       if (!text.includes(kw)) return false;
     }
   }
-  if (f.realm && !String(m.id || '').startsWith(f.realm + ':')) return false;
+  if (f.upstream && mdUpstreamOf(m) !== f.upstream) return false;
+  if (f.realm && mdRealmOf(m) !== f.realm) return false;
   if (f.cap === 'tool' && !m.supports_tool_call) return false;
   if (f.cap === 'vision' && !m.supports_images) return false;
   if (f.cap === 'reasoning' && !m.supports_reasoning) return false;
@@ -203,6 +228,15 @@ function mdAvailabilityTag(m) {
   return ' <span class="tag ' + av.cls + ' md-avail" title="' + esc(av.tip) + '">' + esc(av.label) + '</span>';
 }
 
+// mdUpstreamTag 上游徽标（「模型」列 ID 前）。用颜色区分：Trae 用 warn 色，
+// CodeBuddy 用 mute 色——前者是后接入的少数派，需要一眼能从长列表里挑出来。
+function mdUpstreamTag(m) {
+  const up = mdUpstreamOf(m);
+  const label = MD_UPSTREAM_LABEL[up] || up;
+  const cls = up === 'trae' ? 'warn' : 'mute';
+  return '<span class="tag ' + cls + ' md-up" title="上游：' + esc(label) + '">' + esc(label) + '</span> ';
+}
+
 // mdRowHtml 单个模型行（纯渲染，便于独立测试）。
 function mdRowHtml(m, pr) {
   const eff = (m.supported_efforts || []).slice();
@@ -217,7 +251,7 @@ function mdRowHtml(m, pr) {
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
   const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm"><span class="mid">' + esc(m.id) + '</span>' + mdAvailabilityTag(m) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + mdUpstreamTag(m) + '<span class="mid">' + esc(m.id) + '</span>' + mdAvailabilityTag(m) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
     '<td class="num">' + rateCell(m) + '</td>' +
     '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
     '<td class="efs" style="white-space:normal">' + effs + '</td>' +
@@ -241,8 +275,8 @@ function renderModels() {
 }
 
 function resetModelFilter() {
-  mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
-  $('mdQ').value = ''; $('mdRealm').value = ''; $('mdCap').value = '';
+  mdFilter = { q: '', upstream: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
+  $('mdQ').value = ''; $('mdUpstream').value = ''; $('mdRealm').value = ''; $('mdCap').value = '';
   $('mdEffort').value = ''; $('mdPromo').value = ''; $('mdSort').value = 'default';
   renderModels();
 }
@@ -253,7 +287,7 @@ $('mdQ').oninput = () => {
   clearTimeout(mdQTimer);
   mdQTimer = setTimeout(() => { mdFilter.q = $('mdQ').value.trim(); renderModels(); }, 120);
 };
-for (const [id, key] of [['mdRealm', 'realm'], ['mdCap', 'cap'], ['mdEffort', 'effort'], ['mdPromo', 'promo'], ['mdSort', 'sort']]) {
+for (const [id, key] of [['mdUpstream', 'upstream'], ['mdRealm', 'realm'], ['mdCap', 'cap'], ['mdEffort', 'effort'], ['mdPromo', 'promo'], ['mdSort', 'sort']]) {
   const el = $(id);
   if (!el) continue;
   el.onchange = () => { mdFilter[key] = el.value; renderModels(); };

@@ -452,6 +452,71 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// 按上游筛选 + 上游徽标：Trae 的 ID 是 "trae:cn:<模型>"（三段），CodeBuddy 是
+// "<realm>:<模型>"（两段）。域筛选若只看 startsWith(realm+":")，Trae 的 CN 模型
+// 会被判成非 CN 而整片消失——这是加 Trae 后最容易踩的坑。
+func TestAppJSModelUpstreamFilter(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; model upstream filter test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function mdRateValue');
+const end = src.indexOf('function mdRowHtml');
+if (start < 0 || end < 0) throw new Error('model filter helpers not found');
+const ctx = { Number, String, Array, Object, isFinite, parseFloat, esc: s => String(s) };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.mdMatch=mdMatch; this.mdSortList=mdSortList; this.mdUpstreamTag=mdUpstreamTag; this.mdUpstreamOf=mdUpstreamOf; this.mdRealmOf=mdRealmOf;', ctx);
+const models = [
+  { id: 'cn:glm-5.2', upstream: 'codebuddy', name: 'GLM-5.2' },
+  { id: 'global:hy3', upstream: 'codebuddy', name: 'Hy3 Global' },
+  { id: 'trae:cn:doubao-seed', upstream: 'trae', name: 'Doubao Seed' },
+  { id: 'trae:cn:deepseek-v4', upstream: 'trae', name: 'DeepSeek V4' },
+  // 无 upstream 字段的老条目：必须按 ID 前缀回退，而不是整片空白。
+  { id: 'trae:cn:legacy', name: 'Legacy Trae' },
+];
+const ids = list => list.map(m => m.id);
+const filter = f => ids(ctx.mdSortList(models.filter(m => ctx.mdMatch(m, f)), f));
+process.stdout.write(JSON.stringify({
+  all: ids(models),
+  traeOnly: filter({ upstream: 'trae' }),
+  buddyOnly: filter({ upstream: 'codebuddy' }),
+  cnRealm: filter({ realm: 'cn' }),
+  traeCnRealm: filter({ upstream: 'trae', realm: 'cn' }),
+  traeGlobalRealm: filter({ upstream: 'trae', realm: 'global' }),
+  legacyUpstream: ctx.mdUpstreamOf(models[4]),
+  realmOfTrae: ctx.mdRealmOf(models[2]),
+  realmOfBuddy: ctx.mdRealmOf(models[0]),
+  tagTrae: ctx.mdUpstreamTag(models[2]).includes('Trae') && ctx.mdUpstreamTag(models[2]).includes('tag warn'),
+  tagBuddy: ctx.mdUpstreamTag(models[0]).includes('CodeBuddy') && ctx.mdUpstreamTag(models[0]).includes('tag mute'),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "model-upstream-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("model upstream filter node test failed: %v\n%s", err, out)
+	}
+	const want = `{"all":["cn:glm-5.2","global:hy3","trae:cn:doubao-seed","trae:cn:deepseek-v4","trae:cn:legacy"],` +
+		`"traeOnly":["trae:cn:doubao-seed","trae:cn:deepseek-v4","trae:cn:legacy"],` +
+		`"buddyOnly":["cn:glm-5.2","global:hy3"],` +
+		`"cnRealm":["cn:glm-5.2","trae:cn:doubao-seed","trae:cn:deepseek-v4","trae:cn:legacy"],` +
+		`"traeCnRealm":["trae:cn:doubao-seed","trae:cn:deepseek-v4","trae:cn:legacy"],` +
+		`"traeGlobalRealm":[],` +
+		`"legacyUpstream":"trae","realmOfTrae":"cn","realmOfBuddy":"cn",` +
+		`"tagTrae":true,"tagBuddy":true}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("model upstream filter=%s\nwant %s", out, want)
+	}
+}
+
 // Global 模型可用性标签：模型锁优先于最近请求；无本地证据时保持“待验证”，
 // 不能把上游目录里出现模型误判为当前账号有权限。
 func TestAppJSModelAvailability(t *testing.T) {

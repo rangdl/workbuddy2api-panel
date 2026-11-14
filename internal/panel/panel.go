@@ -479,9 +479,10 @@ func (p *Panel) nicknames() map[string]string {
 
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
 // 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
-// 与 /v1/models 同口径的双域输出：CN 域模型加 "cn:" 前缀、global 域加 "global:" 前缀
-// （gateway 路由协议，前端显示的 id 就是调用时要填的完整 model 值）。
-// 各域独立探测、独立容错：某域无可用账号则整域跳过；两域全空时才报错
+// 与 /v1/models 同口径的多上游输出：CN 域加 "cn:" 前缀、global 域加 "global:"
+// 前缀、Trae 加 "trae:cn:" 前缀（gateway 路由协议，前端显示的 id 就是调用时要填的
+// 完整 model 值）。每条都带 upstream 字段标明所属上游。
+// 各上游独立探测、独立容错：无可用账号则整段跳过；全部为空时才报错
 // （有错误明细回 502，一个账号都没有回 503）。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0)
@@ -520,6 +521,16 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Trae 上游：与 CN/global 并列的第三条上游，模型名前缀是 "trae:cn:"。
+	//
+	// 为什么不并进 CN 分支：Trae 的目录、倍率与能力旗标来自完全不同的上游
+	// （get_detail_param + /api/remote/v1/models），混在一起会让「这个模型走哪个
+	// 上游」无从判断。条目标注 upstream 字段，前端据此显示上游徽标与筛选项。
+	//
+	// 未启用 / 无账号**不算失败**：那是配置事实，只有当 CN、global、Trae 全都
+	// 拿不到模型时才需要报错，此时错误明细里带上「未启用」才有解释力。
+	out = append(out, p.traeModelEntries()...)
+
 	if len(out) == 0 {
 		if len(fetchErrs) > 0 {
 			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
@@ -537,6 +548,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string, remoteDefault string, httpc *http.Client) map[string]any {
 	entry := map[string]any{
 		"id":                   realm + ":" + mi.ID,
+		"upstream":             panelUpstreamCodeBuddy,
 		"name":                 mi.Name,
 		"default_effort":       mi.DefaultEffort,
 		"supported_efforts":    mi.Efforts,
@@ -579,6 +591,99 @@ func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string
 		}
 	}
 	return entry
+}
+
+// 上游标识（模型条目的 upstream 字段，前端据此显示徽标与做筛选）。
+const (
+	panelUpstreamCodeBuddy = "codebuddy"
+	panelUpstreamTrae      = "trae"
+)
+
+// traeModelEntries 生成 Trae 上游的模型条目（供「模型与档位」页展示）。
+//
+// 与 server 侧 traeModelEntries 的口径差异：那边给客户端列 id，这里给面板展示，
+// 所以多带 upstream/name/credits 等展示字段，且**只列显式前缀形态**
+// （"trae:cn:<模型>"）——裸名会与 CodeBuddy 同名模型混淆，面板要的是
+// 「这个模型属于哪个上游」的确定答案。
+//
+// 返回 nil 表示没有可列的内容（未启用 / 无账号 / 上游未给目录）。失败不报错：
+// 目录是展示增强，不该让整页 502。
+func (p *Panel) traeModelEntries() []map[string]any {
+	if p.cfg.TraeClient == nil || p.cfg.TraePath == "" {
+		return nil
+	}
+	cfg, err := trae.Load(p.cfg.TraePath, p.cfg.AuthDir)
+	if err != nil || cfg == nil || !cfg.Enabled {
+		return nil
+	}
+	acc := firstEnabledTraeAccount(cfg)
+	if acc == nil {
+		return nil
+	}
+	// remote 目录给展示名、上下文窗口与倍率；拉不到时回落内置模型表
+	// （至少让用户知道有哪些模型，只是没有定价）。
+	remote := p.cfg.TraeClient.FetchRemoteModels(context.Background(), cfg, acc, false)
+
+	ids := make([]string, 0, len(remote))
+	if len(remote) > 0 {
+		for id, row := range remote {
+			if !trae.IsCallableModel(row) {
+				continue
+			}
+			ids = append(ids, id)
+		}
+	} else {
+		ids = trae.KnownModels()
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	sort.Strings(ids)
+
+	out := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		row := remote[id]
+		display := row.DisplayName
+		if display == "" {
+			display = id
+		}
+		entry := map[string]any{
+			"id":       "trae:" + panelTraeRealm + ":" + id,
+			"upstream": panelUpstreamTrae,
+			"name":     display,
+		}
+		if row.ContextWindow > 0 {
+			entry["context_length"] = row.ContextWindow
+		}
+		if row.Multimodal {
+			entry["supports_images"] = true
+		}
+		// 倍率：与 CodeBuddy 同格式（"x0.15"）。只有上游明示才写——缺失表示未知，
+		// 不能当成免费（dsh account-pool.ts 的教训）。
+		if row.RateText != "" {
+			entry["credits"] = row.RateText
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// panelTraeRealm Trae 当前只实现 CN 域（与 server 侧 defaultTraeRealm 一致）。
+const panelTraeRealm = "cn"
+
+// firstEnabledTraeAccount 取一个可用的 Trae 账号（拉目录只需任意一个）。
+func firstEnabledTraeAccount(cfg *trae.Config) *trae.Account {
+	if cfg == nil {
+		return nil
+	}
+	for i := range cfg.Accounts {
+		a := &cfg.Accounts[i]
+		if a.Disabled || a.AccessToken == "" {
+			continue
+		}
+		return a
+	}
+	return nil
 }
 
 // modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out
