@@ -929,10 +929,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 全部由该上游的实现负责（Trae 的自定义事件流在这里被改写为
 			// OpenAI SSE）。CodeBuddy 专用逻辑（prompt 改写/粘性/模型负缓存）
 			// 不适用于它，所以整段跳过。
-			if h.dispatchViaBackend(w, r, acc, body, peek.Stream, modelRef, st, sessKey) {
-				return
-			}
+			outcome, derr := h.dispatchViaBackend(w, r, acc, body, peek.Stream, modelRef, st, sessKey)
 			tried[pool.TriedKey(acc)] = true
+			switch outcome {
+			case backendHandled:
+				return
+			case backendStop:
+				// backend 判定「换号没有意义」（Rotate=false）：终止轮转，
+				// 把本次失败原因留给末端错误透传。
+				if derr != nil {
+					lastErr = derr
+				}
+				break
+			}
+			// backendRetry：换号重试。失败原因一并记下，供轮转耗尽时透传。
+			if derr != nil {
+				lastErr = derr
+			}
+			if !rotateBackoff(i, r.Context()) {
+				break
+			}
 			continue
 		}
 		if crossRealm && h.cfg.Upstream != nil && acc.Realm() != realm {

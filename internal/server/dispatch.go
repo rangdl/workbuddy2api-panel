@@ -27,19 +27,35 @@ import (
 // 返回 true 表示已完整写出响应（调用方直接 return）；false 表示本轮失败且
 // 不值得重试，调用方继续换号。
 
+// backendOutcome 一次 backend 尝试的结果，决定主循环下一步。
+type backendOutcome int
+
+const (
+	// backendHandled 已完整写出响应（成功或已向客户端报错），主循环直接返回。
+	backendHandled backendOutcome = iota
+	// backendRetry 换号重试（Decision.Rotate=true 或未分类的传输层错误）。
+	backendRetry
+	// backendStop 终止轮转（Decision.Rotate=false：换号也只会得到同样的结果，
+	// 例如请求体畸形、模型不可用）。
+	backendStop
+)
+
 // dispatchViaBackend 用 acc 所属的 backend 处理本次请求。
+//
+// 返回值三态见 backendOutcome；第三项 err 是本次失败的原因（成功时为 nil），
+// 供调用方在轮转耗尽时把上游原文透传给客户端。
 func (h *Handler) dispatchViaBackend(w http.ResponseWriter, r *http.Request,
 	acc gateway.Account, raw []byte, stream bool, ref gateway.ModelRef,
-	st *chatStat, sessKey string) bool {
+	st *chatStat, sessKey string) (backendOutcome, error) {
 
 	be := h.backendFor(acc)
 	if be == nil {
-		return false // 未注册：按「无可用账号」处理，调用方继续换号
+		return backendRetry, nil // 未注册：按「无可用账号」处理，调用方继续换号
 	}
 
 	// 在途租约：与 CodeBuddy 共用同一名额池（搜索/多上游都算真实上游调用）。
 	if !h.cfg.Pool.Acquire(acc.UID()) {
-		return false
+		return backendRetry, nil
 	}
 	defer h.cfg.Pool.Release(acc.UID())
 
@@ -56,27 +72,27 @@ func (h *Handler) dispatchViaBackend(w http.ResponseWriter, r *http.Request,
 	started := time.Now()
 	out, err := be.Chat(r.Context(), acc, in)
 	if err != nil {
-		return h.handleBackendFailure(acc, err, st)
+		return h.handleBackendFailure(acc, ref.Bare, err, st)
 	}
 	if out == nil || out.Stream == nil {
 		st.status = http.StatusBadGateway
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "empty upstream response")
-		return true
+		return backendHandled, nil
 	}
 	defer out.Stream.Close()
 
 	if stream {
 		h.forwardBackendStream(w, acc, out, chatID, ref.Bare, st, started)
-		return true
+		return backendHandled, nil
 	}
 
 	// 非流式：把流聚合成一个 completion（backend 统一以流形式返回，
-	// 聚合逻辑复用 responses/sse 的通用能力）。
+	// 聚合逻辑复用 upstream 的通用能力）。
 	agg, stats, serr := aggregateBackend(out, chatID, ref.Bare)
 	if serr != nil {
 		st.status = http.StatusBadGateway
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", serr.Error())
-		return true
+		return backendHandled, serr
 	}
 	st.status = http.StatusOK
 	st.toks = completionTokens(agg)
@@ -87,18 +103,22 @@ func (h *Handler) dispatchViaBackend(w http.ResponseWriter, r *http.Request,
 	// recordBackendUsage 内部已包含 token/缓存/积分估算与账号级计数。
 	h.recordBackendUsage(acc, ref.Bare, stats, st)
 	writeJSON(w, http.StatusOK, agg)
-	return true
+	return backendHandled, nil
 }
 
-// handleBackendFailure 按 Decision 处置账号，返回是否已写出响应。
-func (h *Handler) handleBackendFailure(acc gateway.Account, err error, st *chatStat) bool {
+// handleBackendFailure 按 Decision 处置账号，返回三态结果与失败原因。
+//
+// model 是本次请求的裸模型名：必须传给 applyDecision，否则 ActionModelCooldown
+// 会带着空模型名调 BlockModelBackoff，而该函数见空模型名直接返回——Trae 的
+// 4001/4023「模型不可用」就永远写不进模型级负缓存，每次请求都要重新撞一遍上游。
+func (h *Handler) handleBackendFailure(acc gateway.Account, model string, err error, st *chatStat) (backendOutcome, error) {
 	var f *gateway.Failure
 	if !errors.As(err, &f) {
 		// 非分类错误（传输层/转换失败）：交给调用方换号，不处置账号。
 		log.Printf("WARN: [server] backend chat acct=%s: %v", acc.UID(), err)
-		return false
+		return backendRetry, err
 	}
-	h.applyDecision(acc, "", f)
+	h.applyDecision(acc, model, f)
 	status := f.HTTPStatus
 	if status < 400 {
 		status = http.StatusBadGateway
@@ -108,7 +128,12 @@ func (h *Handler) handleBackendFailure(acc gateway.Account, err error, st *chatS
 	if msg == "" {
 		msg = f.Message
 	}
-	return false // 仍交给调用方换号（Rotate 由 applyDecision 反映到冷却表）
+	// Rotate 是 backend 对「换号是否有意义」的明确判断：请求体畸形、模型不可用
+	// 这类错误换到哪个号都得到同样结果，继续轮转只会把同一个错误烧 MaxRotate 遍。
+	if !f.Decision.Rotate {
+		return backendStop, f
+	}
+	return backendRetry, f
 }
 
 // applyDecision 按统一处置动作更新账号状态。
