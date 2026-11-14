@@ -23,7 +23,7 @@ func poolPanel(t *testing.T, upstreamURL string) (*Panel, *pool.Pool) {
 		t.Fatalf("加载 trae.json: %v", err)
 	}
 	pl := pool.New("")
-	for _, a := range backendtrae.Wrap(cfg) {
+	for _, a := range backendtrae.Wrap(cfg, trae.NewClient()) {
 		pl.Add(a)
 	}
 	p.cfg.Pool = pl

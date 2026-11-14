@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 
@@ -15,6 +16,15 @@ func (f fakeTraeAccount) Nickname() string { return "" }
 func (f fakeTraeAccount) Realm() string    { return "cn" }
 func (f fakeTraeAccount) Backend() string  { return "trae" }
 func (f fakeTraeAccount) Enterprise() bool { return false }
+
+// 能力方法：测试替身不实现上游调用，一律返回 ErrUnsupported。
+func (f fakeTraeAccount) Credits(context.Context) (*gateway.Credits, error) {
+	return nil, gateway.ErrUnsupported
+}
+func (f fakeTraeAccount) Checkin(context.Context) (*gateway.CheckinResult, error) {
+	return nil, gateway.ErrUnsupported
+}
+func (f fakeTraeAccount) Keepalive(context.Context) error { return gateway.ErrUnsupported }
 
 // TestPauseSurvivesReloadTraeAccount Trae 账号走复合键（trae:uid），
 // 暂停状态同样必须跨重启保持。

@@ -2,8 +2,11 @@
 package trae
 
 import (
+	"context"
 	"errors"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	traepkg "github.com/linguo2625469/workbuddy2api-panel/internal/trae"
@@ -20,6 +23,11 @@ type Account struct {
 	realm string
 	// dir 账号凭证目录（"auths"），SetNickname 落盘用。空 = 只改内存。
 	dir string
+	// client / configFn 是账号**自己的能力依赖**：Credits/Checkin/Keepalive
+	// 由账号对象自己实现，而不是由外部的 backend 代劳。这样池遍历账号调
+	// 统一方法即可，不需要认识 Trae 协议。
+	client   *traepkg.Client
+	ConfigFn func() *traepkg.Config
 }
 
 func (x Account) UID() string      { return x.A.UID }
@@ -29,6 +37,14 @@ func (x Account) Backend() string  { return Name }
 
 // Enterprise Trae 没有企业版概念。
 func (x Account) Enterprise() bool { return false }
+
+// Credential 实现 gateway.CredentialUnwrapper。
+func (x Account) Credential() any {
+	if x.A == nil {
+		return nil
+	}
+	return x.A
+}
 
 // Unwrap 取出原始账号。
 func Unwrap(acc gateway.Account) *traepkg.Account {
@@ -73,20 +89,145 @@ func realmOfBase(chatBase, apiBase string) string {
 }
 
 // Wrap 把配置里的账号包装成 gateway.Account。
-func Wrap(cfg *traepkg.Config) []gateway.Account {
+//
+// client/configFn 一并注入账号对象：Credits/Checkin/Keepalive 是账号自己的
+// 能力，不该由调用方（池/调度器）代持上游依赖。
+func Wrap(cfg *traepkg.Config, client *traepkg.Client) []gateway.Account {
 	if cfg == nil {
 		return nil
 	}
 	realm := realmOfBase(cfg.ChatBase, cfg.APITraeBase)
 	out := make([]gateway.Account, 0, len(cfg.Accounts))
 	for i := range cfg.Accounts {
-		out = append(out, Account{A: &cfg.Accounts[i], realm: realm, dir: cfg.AuthDir})
+		out = append(out, Account{
+			A: &cfg.Accounts[i], realm: realm, dir: cfg.AuthDir,
+			client: client,
+		})
 	}
 	return out
 }
 
 // NicknameValue 实现 pool.Nicknamer（可选能力）。
 func (x Account) NicknameValue() string { return x.A.Name }
+
+// cfg 当前生效配置（热重载后即时生效）。
+func (x Account) cfg() *traepkg.Config {
+	if x.ConfigFn == nil {
+		return nil
+	}
+	return x.ConfigFn()
+}
+
+// Credits 查询该账号余额（含按日到期批次）。
+//
+// 口径：Remain 取 General（product_id != 209）。对话只消耗 IDE 额度，
+// 用 Total 会让快耗尽的号看起来健康。
+func (x Account) Credits(ctx context.Context) (*gateway.Credits, error) {
+	if x.client == nil || x.A == nil {
+		return nil, gateway.ErrUnsupported
+	}
+	cfg := x.cfg()
+	if cfg == nil {
+		return nil, errors.New("trae: config not loaded")
+	}
+	sum, err := x.client.QueryCredits(ctx, cfg, x.A)
+	if err != nil {
+		return nil, err
+	}
+	out := &gateway.Credits{
+		Available: sum.General,
+		Limit:     sum.Limit,
+	}
+	now := time.Now()
+	type dayAgg struct {
+		at     time.Time
+		remain int64
+	}
+	byDay := make(map[string]*dayAgg, len(sum.Packs))
+	for _, pk := range sum.Packs {
+		if pk.IsWork() {
+			continue // Work 积分不参与对话抵扣
+		}
+		remain := int64(pk.Remaining())
+		if remain <= 0 {
+			continue
+		}
+		at, ok := traepkg.ParsePackTime(pk.EndTime)
+		if !ok || !at.After(now) {
+			continue
+		}
+		day := at.In(time.Local).Format("2006-01-02")
+		agg, seen := byDay[day]
+		if !seen {
+			agg = &dayAgg{at: at}
+			byDay[day] = agg
+		} else if at.Before(agg.at) {
+			agg.at = at
+		}
+		agg.remain += remain
+	}
+	if len(byDay) > 0 {
+		dates := make([]string, 0, len(byDay))
+		for d := range byDay {
+			dates = append(dates, d)
+		}
+		sort.Strings(dates)
+		out.Buckets = make([]gateway.ExpiryBucket, 0, len(dates))
+		for _, d := range dates {
+			out.Buckets = append(out.Buckets, gateway.ExpiryBucket{
+				Date: d, ExpireAt: byDay[d].at, Remain: byDay[d].remain,
+			})
+		}
+		out.Earliest = out.Buckets[0].ExpireAt
+	}
+	return out, nil
+}
+
+// Checkin 对该账号执行一次签到。
+func (x Account) Checkin(ctx context.Context) (*gateway.CheckinResult, error) {
+	if x.client == nil || x.A == nil {
+		return nil, gateway.ErrUnsupported
+	}
+	cfg := x.cfg()
+	if cfg == nil {
+		return nil, errors.New("trae: config not loaded")
+	}
+	// 签到前按需续期：过期 token 会被上游分类成 session_dead 直接摘号，
+	// 而实际上刷新一下就能签。
+	if cfg.RefreshBeforeCheckinEnabled() {
+		if _, err := x.client.EnsureTokenFresh(ctx, cfg, x.A, 2*time.Hour); err != nil {
+			return nil, errors.New("签到前续期失败: " + err.Error())
+		}
+	}
+	res, err := x.client.Checkin(ctx, cfg, x.A)
+	if err != nil {
+		// 9004/9095 是「设备/账号今日已签」的幂等拒绝，按成功处理。
+		if apiErr, ok := err.(*traepkg.APIError); ok {
+			if cls := apiErr.Classification(); cls.Already {
+				return &gateway.CheckinResult{Already: true, Message: cls.Message}, nil
+			}
+		}
+		return nil, err
+	}
+	return &gateway.CheckinResult{
+		Already: res.Already,
+		Reward:  res.Reward,
+		Message: res.Message,
+	}, nil
+}
+
+// Keepalive 刷新 access_token（Trae 的 refreshToken 会轮换，必须落盘）。
+func (x Account) Keepalive(ctx context.Context) error {
+	if x.client == nil || x.A == nil {
+		return gateway.ErrUnsupported
+	}
+	cfg := x.cfg()
+	if cfg == nil {
+		return errors.New("trae: config not loaded")
+	}
+	_, err := x.client.EnsureTokenFresh(ctx, cfg, x.A, 0)
+	return err
+}
 
 // SetNickname 更新昵称并落盘到 trae-<uid>.json。
 //

@@ -114,8 +114,9 @@ func main() {
 		_ = store.Close()
 	}()
 	p.SetStore(store)
-	p.RestoreFromSnapshot()            // 择新恢复：Redis 快照比本地新才采用，否则本地优先
-	p.SyncToDir(pool.WrapAuths(auths)) // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
+	// 账号入池推迟到 upstream.Client 构造之后（见下方 syncCodeBuddyAccountsToPool）：
+	// 账号对象要持有 client 才能自己实现 Credits/Checkin/Keepalive。
+	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 
 	// 熔断器 + 在途上限（含 global 分档）+ 连败降权 + 闲置补偿调优（从 config 注入，
 	// 非正值回退默认）。
@@ -159,6 +160,11 @@ func main() {
 	}
 
 	up := upstream.New()
+
+	// CodeBuddy 账号入池：账号对象持有 client，Credits/Checkin/Keepalive 由它
+	// 自己实现，池与调度器都不需要认识 upstream 包。
+	// 与 auths/ 目录对齐：新账号加入、已删除文件账号剔除（状态保留）。
+	p.SyncToDir(backendcb.WrapWithClient(auths, up, func() time.Duration { return cfg.ExpiringSoonDur }))
 
 	// 积分保底的「收费」兜底判据：接上游模型目录的积分倍率表。本地实测台账无观测
 	// 时用它判收费——否则「没学过」恒等于「放行」，高价新模型会把触底号一笔打穿
@@ -324,48 +330,24 @@ func main() {
 	// Trae 上游（可选；trae.json 缺失或 enabled=false 时不启用）。
 	// 冷却表在 main 构造：面板与 handler 需共用同一实例（前者展示、后者读写）。
 	traeCfg := loadTraeConfig(*cfgPath, cfg.AuthDir)
+	traeClient := trae.NewClient()
+	// Trae 的账号对象要能读到**当前**配置（热重载后换 base / 改设备号）。
+	traeConfigFn := func() *trae.Config {
+		tcfg, err := trae.Load(trae.ConfigPath(*cfgPath), cfg.AuthDir)
+		if err != nil || tcfg == nil {
+			return nil
+		}
+		tcfg.SaveAccount = saveTraeAccountFunc(tcfg.AuthDir)
+		return tcfg
+	}
 	// Trae 账号合进同一个池：选号时按 backend 维度区分上游。
 	// 必须在 handler 构造之前完成，否则启动初期的请求选不到 Trae 号。
-	if n := syncTraeAccountsToPool(p, traeCfg); n > 0 {
+	if n := syncTraeAccountsToPool(p, traeCfg, traeClient, traeConfigFn); n > 0 {
 		log.Printf("[trae] 已同步 %d 个账号进调度池", n)
 	}
-	traeClient := trae.NewClient()
 	traeCool := trae.NewCooldowns()
 	// 运行期计数同样要在 main 构造：面板展示与 handler 记账必须是同一实例。
 	traeStats := trae.NewStats()
-	// 签到调度器：ConfigFn 每次 tick 重新读文件（热重载自然生效）；
-	// 用 trae.Load 而非 loadTraeConfig 是为了避免每分钟重复打启动摘要日志。
-	// Trae 账号合进同一个池（选号按 backend 维度区分）。启动时同步一次，
-	// 面板热重载后由 ReloadTrae 回调再同步。
-	traeSched := trae.NewScheduler(func() *trae.Config {
-		tcfg, err := trae.Load(trae.ConfigPath(*cfgPath), cfg.AuthDir)
-		if err != nil || tcfg == nil {
-			return nil
-		}
-		// 续期轮换后的 refreshToken 必须落盘（否则重启后续期全废）。
-		// 一账号一文件：只写变化的那个账号，不重写整个配置。
-		tcfg.SaveAccount = saveTraeAccountFunc(tcfg.AuthDir)
-		return tcfg
-	}, traeClient, traeCool)
-	// 签到结果回写账号池：面板首页的「签到/已签」按钮读 pool 的 last_checkin_day，
-	// 而 Trae 签到走 internal/trae（不能反向 import pool）。自动排程与面板批量
-	// 都经由 RunOnce，挂在这里两条路径一并覆盖。
-	traeSched.OnOutcomes = func(outcomes []trae.CheckinOutcome) {
-		for _, uid := range trae.CheckinDoneUIDs(outcomes) {
-			p.NoteCheckinDone(uid)
-		}
-	}
-	// 统一签到链路：同一份池、同一个排程时点，Trae 只是协议链路不同。
-	// 适配器每次调用重新读配置（运行期可能登录新账号或换设备号）。
-	sch.SetTraeCheckiner(newTraeCheckiner(func() *trae.Config {
-		tcfg, err := trae.Load(trae.ConfigPath(*cfgPath), cfg.AuthDir)
-		if err != nil || tcfg == nil {
-			return nil
-		}
-		tcfg.SaveAccount = saveTraeAccountFunc(tcfg.AuthDir)
-		return tcfg
-	}, traeClient))
-
 	// handlerRef 供面板热重载闭包引用（panel 先于 handler 构造，闭包在保存时才调用）。
 	var handlerRef *server.Handler
 	// 积分历史：把每次真实查到的余额与上一次比对，变动即留痕（新账号首次只建
@@ -428,7 +410,6 @@ func main() {
 		TraeClient:    traeClient,
 		TraeCooldowns: traeCool,
 		TraeStats:     traeStats,
-		TraeScheduler: traeSched,
 		ReloadTrae: func() error {
 			if handlerRef == nil {
 				return nil
@@ -437,8 +418,8 @@ func main() {
 			handlerRef.SetTraeConfig(tcfg)
 			// 账号变化（登录/删除/禁用）要反映到池里，否则新号选不到、
 			// 删掉的号还会被选中。
-			syncTraeAccountsToPool(p, tcfg)
-			removeStaleTraeAccounts(p, tcfg)
+			syncTraeAccountsToPool(p, tcfg, traeClient, traeConfigFn)
+			removeStaleTraeAccounts(p, tcfg, traeClient)
 			return nil
 		},
 		LoadConfig: func() (any, error) {
@@ -521,7 +502,6 @@ func main() {
 	// 只作兜底）。首轮自带启动补跑，覆盖关机期间已到站未领的行程。
 	go sch.RunTravelTimer(ctx)
 	// Trae 签到调度（独立于 CodeBuddy 的 scheduler：两者账号体系与排程配置互不相干）。
-	go traeSched.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
 

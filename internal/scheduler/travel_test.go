@@ -171,10 +171,10 @@ func startTravelTimer(t *testing.T, s *Scheduler) {
 func newTravelScheduler(t *testing.T, srv *httptest.Server, uids ...string) (*Scheduler, *pool.Pool) {
 	t.Helper()
 	p := pool.New("")
-	for _, uid := range uids {
-		p.Add(pool.WrapAuth(&auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	}
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	for _, uid := range uids {
+		p.Add(cbAccount(up, &auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	}
 	return New(Config{Pool: p, Upstream: up, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22}}), p
 }
 

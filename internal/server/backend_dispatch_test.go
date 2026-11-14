@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -93,6 +94,15 @@ func (a fakeGatewayAccount) Nickname() string { return "" }
 func (a fakeGatewayAccount) Realm() string    { return "cn" }
 func (a fakeGatewayAccount) Backend() string  { return a.backend }
 func (a fakeGatewayAccount) Enterprise() bool { return false }
+
+// 能力方法：测试替身不实现上游调用，一律返回 ErrUnsupported。
+func (a fakeGatewayAccount) Credits(context.Context) (*gateway.Credits, error) {
+	return nil, gateway.ErrUnsupported
+}
+func (a fakeGatewayAccount) Checkin(context.Context) (*gateway.CheckinResult, error) {
+	return nil, gateway.ErrUnsupported
+}
+func (a fakeGatewayAccount) Keepalive(context.Context) error { return gateway.ErrUnsupported }
 
 // TestShortIDNonEmpty 请求 id 生成不返回空串（chatcmpl 前缀拼接依赖它）。
 func TestShortIDNonEmpty(t *testing.T) {

@@ -42,7 +42,15 @@ func (b *Backend) Accounts() ([]gateway.Account, error) {
 	if cfg == nil {
 		return nil, nil
 	}
-	return Wrap(cfg), nil
+	accs := Wrap(cfg, b.Client)
+	// 账号对象自己持有 configFn：热重载后它要能读到新配置（换 base、改设备号）。
+	for i := range accs {
+		if a, ok := accs[i].(Account); ok {
+			a.ConfigFn = b.ConfigFn
+			accs[i] = a
+		}
+	}
+	return accs, nil
 }
 
 // Supports 该账号能否服务这个模型。

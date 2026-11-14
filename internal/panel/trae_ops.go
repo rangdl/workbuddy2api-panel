@@ -23,22 +23,20 @@ const traeOpTimeout = 60 * time.Second
 // traeCheckinAllTimeout 全量签到的总超时（账号间限速 800ms，账号多时耗时线性增长）。
 const traeCheckinAllTimeout = 10 * time.Minute
 
-// traeCheckinAll 触发全部账号签到（同步执行，返回逐账号结果）。
+// traeCheckinAll 触发全部 Trae 账号签到。
+//
+// 已并入账号池的统一签到流程：池遍历账号对象、逐个调 Checkin，记账（今日已签
+// 标记、日志）也由池负责。这里只做范围限定（只要 Trae 账号）与结果汇总。
 func (p *Panel) traeCheckinAll(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.TraeScheduler == nil {
-		writeErr(w, http.StatusNotImplemented, "trae scheduler not available")
+	if p.cfg.Pool == nil {
+		writeErr(w, http.StatusNotImplemented, "pool not available")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), traeCheckinAllTimeout)
 	defer cancel()
-	outcomes := p.cfg.TraeScheduler.RunOnce(ctx)
-	// 池的签到标记由 Scheduler.OnOutcomes 回写（main 注入），面板批量路径
-	// 若无注入（如测试构造的面板）则就地补一次，保证两条路径都有回写。
-	if p.cfg.TraeScheduler.OnOutcomes == nil {
-		p.noteTraeCheckinOutcomes(outcomes)
-	}
+	p.cfg.Pool.CheckinBackend(ctx, pool.BackendTrae, false)
 	p.invalidateCheckinCache() // 签到后状态已变，下次拉配置必须重新查
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": outcomes})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // noteTraeCheckinDone 把 Trae 账号的「今日已签」写回账号池。
@@ -54,16 +52,6 @@ func (p *Panel) noteTraeCheckinDone(uid string) {
 		return
 	}
 	p.cfg.Pool.NoteCheckinDone(uid)
-}
-
-// noteTraeCheckinOutcomes 按批量签到结果回写账号池的签到标记。
-//
-// 判定口径集中在 trae.CheckinDoneUIDs（与 main 注入给 Scheduler.OnOutcomes
-// 的回调同源），避免面板与自动排程两条路径各写一份规则而漂移。
-func (p *Panel) noteTraeCheckinOutcomes(outcomes []trae.CheckinOutcome) {
-	for _, uid := range trae.CheckinDoneUIDs(outcomes) {
-		p.noteTraeCheckinDone(uid)
-	}
 }
 
 // traeAccountCheckin 单账号签到。
@@ -184,19 +172,41 @@ func (p *Panel) traeAccountCredits(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "credits": sum})
 }
 
-// traeCheckinStatus 返回最近一次（自动或手动）全量签到的结果。
+// traeCheckinStatus 返回 Trae 账号的签到状态概览。
+//
+// 统一签到流程后不再有「一轮批量签到的结果列表」——签到结果直接体现在池状态
+// （CheckinDone）里。这里按池状态汇总，与首页那颗「已签」按钮同一口径。
 func (p *Panel) traeCheckinStatus(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.TraeScheduler == nil {
-		writeErr(w, http.StatusNotImplemented, "trae scheduler not available")
+	if p.cfg.Pool == nil {
+		writeErr(w, http.StatusNotImplemented, "pool not available")
 		return
 	}
-	outcomes, at := p.cfg.TraeScheduler.LastOutcomes()
-	var lastRun string
-	if !at.IsZero() {
-		lastRun = at.Format(time.RFC3339)
+	type row struct {
+		UID     string `json:"uid"`
+		Name    string `json:"name"`
+		Status  string `json:"status"`
+		Message string `json:"message"`
+	}
+	rows := make([]row, 0)
+	done := 0
+	for _, st := range p.cfg.Pool.List() {
+		if st.Backend != pool.BackendTrae {
+			continue
+		}
+		r := row{UID: st.UID, Name: st.Nickname}
+		switch {
+		case st.Disabled:
+			r.Status, r.Message = "skipped", "账号已禁用"
+		case st.CheckinDone:
+			r.Status, r.Message = "already", "今日已签到"
+			done++
+		default:
+			r.Status, r.Message = "pending", "今日尚未签到"
+		}
+		rows = append(rows, r)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "last_run": lastRun, "results": outcomes,
+		"ok": true, "total": len(rows), "done": done, "results": rows,
 	})
 }
 

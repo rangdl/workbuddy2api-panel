@@ -66,14 +66,14 @@ func compensationScheduler(t *testing.T, rec *compensationRecorder, accts ...*au
 	t.Helper()
 	srv := rec.server(t)
 	p := pool.New("")
-	for _, a := range accts {
-		p.Add(pool.WrapAuth(a))
-	}
 	up := &upstream.Client{
 		HTTP:          srv.Client(),
 		ChatBaseCN:    srv.URL,
 		BillingBaseCN: srv.URL,
 		WebBaseCN:     srv.URL,
+	}
+	for _, a := range accts {
+		p.Add(cbAccount(up, a))
 	}
 	return New(Config{Pool: p, Upstream: up})
 }

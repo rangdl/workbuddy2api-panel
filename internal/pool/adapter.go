@@ -1,6 +1,8 @@
 package pool
 
 import (
+	"context"
+
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 )
@@ -21,6 +23,17 @@ func (x authAdapter) Realm() string    { return x.a.Realm() }
 func (x authAdapter) Backend() string  { return BackendCodeBuddy }
 func (x authAdapter) Enterprise() bool { return x.a.IsEnterprise() }
 
+// 能力方法：authAdapter 只是「把 *auth.Auth 变成 gateway.Account」的最小包装，
+// 不持有 HTTP 客户端。真实的上游能力在 backend/codebuddy.Account 上——生产
+// 路径的账号经 backend 包装后入池，这个适配器只用于占位与测试。
+func (x authAdapter) Credits(context.Context) (*gateway.Credits, error) {
+	return nil, gateway.ErrUnsupported
+}
+func (x authAdapter) Checkin(context.Context) (*gateway.CheckinResult, error) {
+	return nil, gateway.ErrUnsupported
+}
+func (x authAdapter) Keepalive(context.Context) error { return gateway.ErrUnsupported }
+
 // NicknameValue / SetNickname 实现 Nicknamer（可选能力）。
 func (x authAdapter) NicknameValue() string { return x.a.NicknameValue() }
 
@@ -38,6 +51,13 @@ func UnwrapAuth(acc gateway.Account) *auth.Auth {
 	}
 	if ad, ok := acc.(*authAdapter); ok {
 		return ad.a
+	}
+	// 生产路径上的账号是 backend/codebuddy.Account（不是本包的 authAdapter），
+	// 通过可选接口取回凭证——pool 不能 import 具体 backend 包。
+	if u, ok := acc.(gateway.CredentialUnwrapper); ok {
+		if a, ok := u.Credential().(*auth.Auth); ok {
+			return a
+		}
 	}
 	return nil
 }
@@ -111,6 +131,16 @@ func (b bareAccount) Nickname() string { return "" }
 func (b bareAccount) Realm() string    { return gateway.DefaultRealm }
 func (b bareAccount) Backend() string  { return b.backend }
 func (b bareAccount) Enterprise() bool { return false }
+
+// 能力方法：bareAccount 只是占位（承载持久化状态、等真实账号替换），
+// 没有任何上游能力，一律返回 ErrUnsupported 让池跳过。
+func (b bareAccount) Credits(context.Context) (*gateway.Credits, error) {
+	return nil, gateway.ErrUnsupported
+}
+func (b bareAccount) Checkin(context.Context) (*gateway.CheckinResult, error) {
+	return nil, gateway.ErrUnsupported
+}
+func (b bareAccount) Keepalive(context.Context) error { return gateway.ErrUnsupported }
 
 // TriedKey 返回 tried 集合的键（"backend:uid"）。
 //

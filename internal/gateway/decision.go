@@ -118,4 +118,9 @@ var (
 	ErrAttemptsExhausted = errors.New("gateway: retry attempts exhausted")
 	// ErrCreditsUnsupported 该 backend 不支持余额查询。
 	ErrCreditsUnsupported = errors.New("gateway: credits query unsupported")
+	// ErrUnsupported 该账号/上游不支持这项能力（签到、保活等）。
+	//
+	// 池遍历账号执行统一任务时遇到它直接跳过：这是「上游没有这个概念」，
+	// 不是失败，不该进冷却、不该记错误。
+	ErrUnsupported = errors.New("gateway: operation unsupported")
 )

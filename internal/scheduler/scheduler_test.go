@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
@@ -148,12 +150,12 @@ func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	up := &upstream.Client{
 		HTTP:          srv.Client(),
 		ChatBaseCN:    srv.URL,
 		BillingBaseCN: srv.URL,
 	}
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	s := New(Config{
 		Pool:              p,
 		Upstream:          up,
@@ -246,14 +248,14 @@ func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
 
 	p := pool.New("")
 	a := &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}
-	p.Add(pool.WrapAuth(a))
-	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足")
 
 	up := &upstream.Client{
 		HTTP:          srv.Client(),
 		ChatBaseCN:    srv.URL,
 		BillingBaseCN: srv.URL,
 	}
+	p.Add(cbAccount(up, a))
+	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足")
 	s := New(Config{
 		Pool:           p,
 		Upstream:       up,
@@ -280,13 +282,13 @@ func TestRunKeepaliveRefreshesTokens(t *testing.T) {
 
 	p := pool.New("")
 	a := &auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1}
-	p.Add(pool.WrapAuth(a))
 
 	up := &upstream.Client{
 		HTTP:          srv.Client(),
 		ChatBaseCN:    srv.URL,
 		BillingBaseCN: srv.URL,
 	}
+	p.Add(cbAccount(up, a))
 	s := New(Config{Pool: p, Upstream: up})
 	s.RunKeepaliveNow()
 	if f.refreshCalls.Load() != 1 {
@@ -306,13 +308,13 @@ func TestRunKeepaliveSessionDeadDisables(t *testing.T) {
 
 	p := pool.New("")
 	a := &auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1}
-	p.Add(pool.WrapAuth(a))
 
 	up := &upstream.Client{
 		HTTP:          srv.Client(),
 		ChatBaseCN:    srv.URL,
 		BillingBaseCN: srv.URL,
 	}
+	p.Add(cbAccount(up, a))
 	s := New(Config{Pool: p, Upstream: up})
 	// P0-1：12153 连续 N 次才禁用。前 2 次刷新失败不应杀号（误判防护）。
 	s.RunKeepaliveNow()
@@ -350,13 +352,13 @@ func TestRunKeepaliveSessionDeadResetBySuccess(t *testing.T) {
 
 	p := pool.New("")
 	a := &auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1}
-	p.Add(pool.WrapAuth(a))
 
 	up := &upstream.Client{
 		HTTP:          srv.Client(),
 		ChatBaseCN:    srv.URL,
 		BillingBaseCN: srv.URL,
 	}
+	p.Add(cbAccount(up, a))
 	s := New(Config{Pool: p, Upstream: up})
 	s.RunKeepaliveNow() // 12153 #1
 	s.RunKeepaliveNow() // 12153 #2
@@ -384,12 +386,12 @@ func TestCheckinErrorDoesNotCrash(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	up := &upstream.Client{
 		HTTP:          srv.Client(),
 		ChatBaseCN:    srv.URL,
 		BillingBaseCN: srv.URL,
 	}
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	s := New(Config{Pool: p, Upstream: up})
 	// 不应 panic
 	s.RunCheckinNow()
@@ -405,12 +407,12 @@ func TestRunBalanceRefreshNowUpdatesCreditsAndRevives(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足")
-	p.Disable("u2", "manual")
 
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, &auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足")
+	p.Disable("u2", "manual")
 	s := New(Config{Pool: p, Upstream: up})
 	s.RunBalanceRefreshNow()
 
@@ -457,10 +459,9 @@ func TestRunBalanceRefreshReplacesExpirySnapshot(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	p.SetCreditsDetailed("u1", 999, 999, 999, time.Now().Add(time.Hour), 999)
-
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.SetCreditsDetailed("u1", 999, 999, 999, time.Now().Add(time.Hour), 999)
 	s := New(Config{Pool: p, Upstream: up, ExpiringSoonWindow: 7 * 24 * time.Hour})
 	s.RunBalanceRefreshNow()
 
@@ -498,10 +499,10 @@ func TestSetExpiringSoonWindowClearsSnapshot(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // poolWithDisabledAccount 建一个两账号池：u1 可用、u2 被人工禁用（终态）。
-func poolWithDisabledAccount() *pool.Pool {
+func poolWithDisabledAccount(up *upstream.Client) *pool.Pool {
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, &auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	p.Disable("u2", "manual disable (test)")
 	return p
 }
@@ -512,8 +513,8 @@ func TestRunCheckinSkipsDisabledByDefault(t *testing.T) {
 	srv := f.server()
 	defer srv.Close()
 
-	p := poolWithDisabledAccount()
-	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+		up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p := poolWithDisabledAccount(up)
 	s := New(Config{Pool: p, Upstream: up, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22}})
 
 	s.RunCheckinNow()
@@ -529,8 +530,8 @@ func TestRunCheckinIncludesDisabledWhenConfigured(t *testing.T) {
 	srv := f.server()
 	defer srv.Close()
 
-	p := poolWithDisabledAccount()
-	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+		up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p := poolWithDisabledAccount(up)
 	s := New(Config{
 		Pool: p, Upstream: up,
 		CheckinHours:           []int{9, 21},
@@ -557,8 +558,8 @@ func TestRunKeepaliveIncludesDisabledRenewsToken(t *testing.T) {
 	srv := f.server()
 	defer srv.Close()
 
-	p := poolWithDisabledAccount()
-	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+		up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p := poolWithDisabledAccount(up)
 	s := New(Config{Pool: p, Upstream: up, IncludeDisabledInTasks: true})
 
 	s.RunKeepaliveNow()
@@ -574,8 +575,8 @@ func TestRunBalanceRefreshIncludesDisabledUpdatesCredits(t *testing.T) {
 	srv := f.server()
 	defer srv.Close()
 
-	p := poolWithDisabledAccount()
-	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+		up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p := poolWithDisabledAccount(up)
 	s := New(Config{Pool: p, Upstream: up, IncludeDisabledInTasks: true})
 
 	s.RunBalanceRefreshNow()
@@ -594,8 +595,8 @@ func TestSetIncludeDisabledInTasksHot(t *testing.T) {
 	srv := f.server()
 	defer srv.Close()
 
-	p := poolWithDisabledAccount()
-	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+		up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p := poolWithDisabledAccount(up)
 	s := New(Config{Pool: p, Upstream: up})
 
 	s.RunCheckinNow()
@@ -620,12 +621,12 @@ func TestPausedAccountStillRunsKeepaliveTasks(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, &auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	if !p.Pause("u2") {
 		t.Fatal("Pause 失败")
 	}
-	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	s := New(Config{Pool: p, Upstream: up}) // 有意不设 IncludeDisabledInTasks
 
 	s.RunCheckinNow()
@@ -658,13 +659,13 @@ func TestPausedVsDisabledTaskParticipation(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u3", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	p.Pause("u2")
-	p.Disable("u3", "manual disable (test)")
 
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, &auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, &auth.Auth{UID: "u3", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Pause("u2")
+	p.Disable("u3", "manual disable (test)")
 	s := New(Config{Pool: p, Upstream: up}) // 全局开关有意保持关闭
 
 	s.RunCheckinNow()
@@ -684,14 +685,23 @@ func TestPausedStillTravels(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	p.Pause("u2")
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, &auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Pause("u2")
 	s := New(Config{Pool: p, Upstream: up})
 
 	s.RunTravelNow()
 	if got := f.travelCalls.Load(); got != 2 {
 		t.Errorf("travel status calls=%d want 2（u1 + 暂停号 u2 照常旅行）", got)
 	}
+}
+
+// cbAccount 把 CodeBuddy 账号包装成带能力的对象（测试统一入口）。
+//
+// 生产路径上这件事由 backend/codebuddy.WrapWithClient 完成；测试直接调用它，
+// 保证走的是同一套包装逻辑——否则测试里的账号永远返回 ErrUnsupported，
+// 签到/余额相关的断言会全部静默失效。
+func cbAccount(up *upstream.Client, a *auth.Auth) gateway.Account {
+	return backendcb.WrapWithClient([]*auth.Auth{a}, up, nil)[0]
 }

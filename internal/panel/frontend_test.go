@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"encoding/json"
 	"bytes"
 	"net/http/httptest"
 	"os"
@@ -811,7 +812,7 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("expiry summary node test failed: %v\n%s", err, out)
 	}
-	const want = `{"rows":[{"days":1,"credits":50},{"days":7,"credits":70}],"accountCount":3,"unavailable":1,"colorA":"#4f8cff","colorB":"#25b08b"}`
+	const want = `{"rows":[{"days":1,"credits":50},{"days":7,"credits":70}],"accountCount":3,"unavailable":1,"colorA":"#e2607a","colorB":"#25b08b"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry summary=%s want %s", out, want)
 	}
@@ -1575,5 +1576,51 @@ console.log('OK');
 	}
 	if !strings.Contains(string(out), "OK") {
 		t.Fatalf("unexpected output: %s", out)
+	}
+}
+
+// TestAccountColorStableAcrossSets 账号颜色只由 uid 决定，与集合里还有谁无关。
+//
+// 回归（用户反馈）：颜色曾按「排序后的下标」分配，只要有一个账号进出集合，
+// 后面所有人的颜色整体位移，图表图例就失效了。
+func TestAccountColorStableAcrossSets(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync('js/packages.js', 'utf8');
+const s = src.indexOf('const PK_ACCOUNT_COLORS');
+const e = src.indexOf('function pkBySource');
+const ctx = { Number, String, Math, Map, Array, Object, isFinite, isNaN };
+vm.createContext(ctx);
+vm.runInContext(src.slice(s, e) + '\nthis.pkAccountColorMap = pkAccountColorMap;', ctx);
+const only = ctx.pkAccountColorMap([{ uid: 'target' }]).get('target');
+const mixed = ctx.pkAccountColorMap([{ uid: 'aaa' }, { uid: 'target' }, { uid: 'zzz' }]).get('target');
+const reversed = ctx.pkAccountColorMap([{ uid: 'zzz' }, { uid: 'target' }, { uid: 'aaa' }]).get('target');
+process.stdout.write(JSON.stringify({ only, mixed, reversed }));`
+	f, err := os.CreateTemp(t.TempDir(), "color-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name()).CombinedOutput()
+	if err != nil {
+		t.Fatalf("color node test failed: %v\n%s", err, out)
+	}
+	var got struct{ Only, Mixed, Reversed string }
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("解析输出失败: %v (%s)", err, out)
+	}
+	if got.Only == "" {
+		t.Fatal("未取到颜色")
+	}
+	if got.Only != got.Mixed || got.Only != got.Reversed {
+		t.Fatalf("同一 uid 在不同集合里颜色应一致: only=%s mixed=%s reversed=%s",
+			got.Only, got.Mixed, got.Reversed)
 	}
 }

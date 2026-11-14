@@ -66,10 +66,6 @@ type Config struct {
 	// 的任务奖励领掉，不跑任何行为链路）。与 GrowthHook 同款延迟挂载；nil 时
 	// ticker 到点跳过。见 issue #174：成长队列与「一键完成」都不负责这条补领链路。
 	TaskSweepHook func()
-
-	// Trae Trae 签到与余额适配（main 注入；nil = 无 Trae 上游）。
-	// 见 trae.go：Trae 账号在同一个池里，签到也走同一套排程与冷却。
-	Trae TraeCheckiner
 }
 
 // Scheduler 调度器。
@@ -139,13 +135,23 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.BlackcatHours) == 0 {
 		cfg.BlackcatHours = []int{23}
 	}
-	return &Scheduler{
+	sch := &Scheduler{
 		cfg:           cfg,
 		adoptTried:    make(map[string]string),
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
 		rearmSweep:    make(chan struct{}, 1),
 		rearmTravel:   make(chan struct{}, 1),
+	}
+	sch.syncExpiringWindow()
+	return sch
+}
+
+// syncExpiringWindow 把快过期窗口传给池：Expiring 的计算在池里统一做，
+// 调度器只负责把策略值送进去（构造时一次 + 热重载时一次）。
+func (s *Scheduler) syncExpiringWindow() {
+	if s.cfg.Pool != nil {
+		s.cfg.Pool.SetExpiringSoonWindow(s.cfg.ExpiringSoonWindow)
 	}
 }
 
@@ -170,6 +176,7 @@ func (s *Scheduler) SetExpiringSoonWindow(d time.Duration) {
 	if changed && poolRef != nil {
 		poolRef.ClearExpiringSnapshots()
 	}
+	s.syncExpiringWindow()
 }
 
 // Reconfigure 热更新排程参数（面板保存配置后调用）：改时点/开关并通知运行中的循环重算。
@@ -525,68 +532,12 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 func (s *Scheduler) RunCheckinNow() {
-	expiringSoon := s.ExpiringSoonWindow()
+	ctx := context.Background()
+	// 签到与余额刷新都交给池：池遍历账号对象、逐个调它自己的 Checkin/Credits。
+	// 调度器不认识任何上游协议，也不再有 backend 分支。
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled && !includeDisabled {
-			continue
-		}
-		// Trae 账号与 CodeBuddy 在同一个池里：它们走 gateway 选号/转发，但凭证
-		// 形态与协议完全不同（AuthByUID 对非 CodeBuddy 返回 nil）。Trae 的签到
-		// 由 RunTraeCheckinNow 在下方统一处理，这里跳过以免被"无凭证"静默吞掉。
-		if st.Backend == pool.BackendTrae {
-			continue
-		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshTokenValue() == "" {
-			continue
-		}
-		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
-		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
-		// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
-		if a.IsGlobal() {
-			continue
-		}
-		// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
-		// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
-		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
-		// credit_floor 判定与面板额度展示的唯一数据源）。
-		if !a.IsEnterprise() {
-			if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
-				// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
-				if upstream.IsAlreadyCheckin(err) {
-					s.cfg.Pool.NoteCheckinDone(st.UID)
-					log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
-				} else {
-					log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-				}
-				// 其余业务错误也继续走余额查询
-			} else {
-				// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
-				// 重复触发时出现），成功也落一行。
-				s.cfg.Pool.NoteCheckinDone(st.UID)
-				log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
-			}
-		}
-		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次与
-		// 按自然日聚合的全部批次（首页快照与「检查」共用同一口径）。
-		remain, total, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(a, expiringSoon)
-		if err != nil {
-			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-			continue
-		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
-		s.cfg.Pool.SetCreditsSnapshot(st.UID, pool.CreditsSnapshot{
-			Remain:            remain,
-			Total:             total,
-			Expiring:          expiring,
-			EarliestAt:        earliestAt,
-			EarliestRemaining: earliestRemaining,
-			ExpiryBuckets:     poolExpiryBuckets(buckets),
-		})
-	}
-	// Trae 账号走同一套签到排程（同一时点、同一份池状态），只是协议链路不同。
-	s.RunTraeCheckinNow(context.Background())
+	s.cfg.Pool.CheckinAll(ctx, includeDisabled)
+	s.cfg.Pool.RefreshCreditsForTasks(ctx, includeDisabled)
 	s.RunStreakBonusNow()
 }
 
@@ -688,28 +639,27 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
-	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled && !includeDisabled {
+	// 保活交给池：池遍历账号对象、逐个调它自己的 Keepalive。
+	errs := s.cfg.Pool.KeepaliveAll(context.Background(), s.includeDisabledInTasks())
+	for uid, err := range errs {
+		st, ok := s.cfg.Pool.Status(uid)
+		if !ok {
 			continue
 		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshTokenValue() == "" {
-			continue
-		}
-		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-			var ue *upstream.Error
-			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
-				if s.cfg.Pool.NoteSessionDead(st.UID) {
-					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
-				}
+		log.Printf("keepalive %s: %v", logfmt.Label(uid, st.Nickname), err)
+		var ue *upstream.Error
+		if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
+			if s.cfg.Pool.NoteSessionDead(uid) {
+				log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(uid, st.Nickname), pool.SessionDeadThreshold())
 			}
 			continue
 		}
-		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
-		if err := a.SaveAtomic(); err != nil {
-			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
+		continue
+	}
+	// 刷新成功清误判计数（错误判定的账号有复活路径）。
+	for _, st := range s.cfg.Pool.List() {
+		if _, failed := errs[st.UID]; !failed {
+			s.cfg.Pool.ClearSessionDead(st.UID)
 		}
 	}
 }
@@ -735,37 +685,12 @@ func poolExpiryBuckets(in []upstream.ExpiryBucket) []pool.ExpiryBucket {
 // 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
 func (s *Scheduler) RunBalanceRefreshNow() {
-	var wg sync.WaitGroup
-	expiringSoon := s.ExpiringSoonWindow()
-	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled && !includeDisabled {
-			continue
-		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil {
-			continue
-		}
-		wg.Add(1)
-		go func(a *auth.Auth, uid string) {
-			defer wg.Done()
-			remain, total, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(a, expiringSoon)
-			if err != nil {
-				log.Printf("balance %s: %v", logfmt.Label(uid, a.NicknameValue()), err)
-				return
-			}
-			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-			s.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{
-				Remain:            remain,
-				Total:             total,
-				Expiring:          expiring,
-				EarliestAt:        earliestAt,
-				EarliestRemaining: earliestRemaining,
-				ExpiryBuckets:     poolExpiryBuckets(buckets),
-			})
-		}(a, st.UID)
+	ctx := context.Background()
+	if s.includeDisabledInTasks() {
+		s.cfg.Pool.RefreshCreditsIncludingDisabled(ctx)
+	} else {
+		s.cfg.Pool.RefreshCredits(ctx)
 	}
-	wg.Wait()
 	s.lastBalanceRefresh.Store(time.Now().UnixNano())
 }
 

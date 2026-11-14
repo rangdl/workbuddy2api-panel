@@ -27,20 +27,12 @@ func newTraeOpsPanel(t *testing.T, upstreamURL string) (*Panel, string) {
 	writeTraeTestConfig(t, path, cfg)
 	client := trae.NewClient()
 	cool := trae.NewCooldowns()
-	sched := trae.NewScheduler(func() *trae.Config {
-		c, err := trae.Load(path, "")
-		if err != nil {
-			return nil
-		}
-		return c
-	}, client, cool)
 	p := New(Config{
 		Version:       "test",
 		APIKey:        "test-key",
 		TraePath:      path,
 		TraeClient:    client,
 		TraeCooldowns: cool,
-		TraeScheduler: sched,
 	})
 	return p, path
 }
@@ -55,7 +47,12 @@ func newTraeOpsPanelWithPool(t *testing.T, upstreamURL string) (*Panel, *pool.Po
 		t.Fatalf("加载 trae.json: %v", err)
 	}
 	pl := pool.New("")
-	for _, a := range backendtrae.Wrap(cfg) {
+	for _, a := range backendtrae.Wrap(cfg, trae.NewClient()) {
+		// 账号对象要能读到配置（Credits/Checkin 内部用它）。
+		if ta, ok := a.(backendtrae.Account); ok {
+			ta.ConfigFn = func() *trae.Config { return cfg }
+			a = ta
+		}
 		pl.Add(a)
 	}
 	p.cfg.Pool = pl
@@ -148,41 +145,37 @@ func TestTraeAccountCredits(t *testing.T) {
 	}
 }
 
-// TestTraeCheckinAllAndStatus 全量签到 + 结果查询。
+// TestTraeCheckinAllAndStatus 全量签到 + 状态查询（统一流程：结果读池状态）。
 func TestTraeCheckinAllAndStatus(t *testing.T) {
 	srv := newTraeOpsUpstream(t)
-	p, _ := newTraeOpsPanel(t, srv.URL)
+	p, pl := newTraeOpsPanelWithPool(t, srv.URL)
 
-	rec := traeDo(p, http.MethodPost, "/panel/api/trae/checkin_all", "")
-	if rec.Code != http.StatusOK {
+	if rec := traeDo(p, http.MethodPost, "/panel/api/trae/checkin_all", ""); rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
 	}
-	var all struct {
-		OK      bool                  `json:"ok"`
-		Results []trae.CheckinOutcome `json:"results"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &all); err != nil {
-		t.Fatal(err)
-	}
-	if !all.OK || len(all.Results) != 1 || all.Results[0].Status != "success" {
-		t.Fatalf("全量签到结果不符: %s", rec.Body)
+	// 签到结果直接体现在池状态上（同一套记账，不再维护独立的结果列表）。
+	if st := statusByUID(t, pl, "u-1"); !st.CheckinDone {
+		t.Fatalf("批量签到后池状态应显示已签: %+v", st)
 	}
 
-	// 结果可查询（同一 scheduler 实例）
-	rec = traeDo(p, http.MethodGet, "/panel/api/trae/checkin_status", "")
+	rec := traeDo(p, http.MethodGet, "/panel/api/trae/checkin_status", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
 	var st struct {
-		OK      bool                  `json:"ok"`
-		LastRun string                `json:"last_run"`
-		Results []trae.CheckinOutcome `json:"results"`
+		OK      bool `json:"ok"`
+		Total   int  `json:"total"`
+		Done    int  `json:"done"`
+		Results []struct {
+			UID    string `json:"uid"`
+			Status string `json:"status"`
+		} `json:"results"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
 		t.Fatal(err)
 	}
-	if !st.OK || st.LastRun == "" || len(st.Results) != 1 {
-		t.Fatalf("签到结果查询不符: %s", rec.Body)
+	if !st.OK || st.Total != 1 || st.Done != 1 || len(st.Results) != 1 || st.Results[0].Status != "already" {
+		t.Fatalf("签到状态查询不符: %s", rec.Body)
 	}
 }
 
@@ -216,22 +209,6 @@ func TestTraeCheckinAllMarksPoolCheckinDone(t *testing.T) {
 	}
 	if st := statusByUID(t, pl, "u-1"); !st.CheckinDone {
 		t.Fatalf("批量签到后账号池应显示已签: %+v", st)
-	}
-}
-
-// TestCheckinUnverifiedDoesNotMarkDone 只认「本账号已签」：unverified / fail /
-// skipped / device_already 都不标记已签（device_already 是设备维度，本账号没签）。
-func TestCheckinUnverifiedDoesNotMarkDone(t *testing.T) {
-	if got := trae.CheckinDoneUIDs([]trae.CheckinOutcome{
-		{UID: "a", Status: "unverified"},
-		{UID: "b", Status: "fail"},
-		{UID: "c", Status: "skipped"},
-		{UID: "d", Status: "success"},
-		{UID: "e", Status: "already"},
-		{UID: "f", Status: "device_already"},
-		{UID: "d", Status: "already"}, // 重复 uid 只出一次
-	}); len(got) != 2 || got[0] != "d" || got[1] != "e" {
-		t.Fatalf("CheckinDoneUIDs = %v, want [d e]", got)
 	}
 }
 

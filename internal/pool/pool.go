@@ -24,7 +24,13 @@ type Pool struct {
 	uidIndex map[string][]string
 	// placeholder 占位账号工厂（持久化恢复时构造 entry.acc；nil = 只支持 CodeBuddy）。
 	placeholder func(backend, uid string) gateway.Account
-	stateFp     string
+	// expiringSoonWindow 快过期积分窗口（SetExpiringSoonWindow 注入）。
+	//
+	// 为什么放在池里而不是各 backend 的 Credits 里：这是**调度策略**
+	// （多久算「快过期」），不是上游能力。放在池里，两个上游的 Expiring
+	// 口径天然一致，改配置即时生效。
+	expiringSoonWindow atomic.Int64
+	stateFp            string
 	dirty       atomic.Bool // 内存有变更待落盘
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
 	// SaveState/LoadState 经它接线，与本地 state.json 并存作启动恢复备份。

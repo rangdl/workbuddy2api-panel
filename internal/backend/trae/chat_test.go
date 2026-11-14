@@ -181,3 +181,10 @@ func (fakeAcc) Nickname() string { return "" }
 func (fakeAcc) Realm() string    { return "cn" }
 func (fakeAcc) Backend() string  { return "codebuddy" }
 func (fakeAcc) Enterprise() bool { return false }
+func (fakeAcc) Credits(context.Context) (*gateway.Credits, error) {
+	return nil, gateway.ErrUnsupported
+}
+func (fakeAcc) Checkin(context.Context) (*gateway.CheckinResult, error) {
+	return nil, gateway.ErrUnsupported
+}
+func (fakeAcc) Keepalive(context.Context) error { return gateway.ErrUnsupported }

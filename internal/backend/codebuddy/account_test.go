@@ -1,6 +1,8 @@
 package codebuddy
 
 import (
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
+	"context"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -48,3 +50,10 @@ func (fakeAccount) Nickname() string { return "" }
 func (fakeAccount) Realm() string    { return "cn" }
 func (fakeAccount) Backend() string  { return "trae" }
 func (fakeAccount) Enterprise() bool { return false }
+func (fakeAccount) Credits(context.Context) (*gateway.Credits, error) {
+	return nil, gateway.ErrUnsupported
+}
+func (fakeAccount) Checkin(context.Context) (*gateway.CheckinResult, error) {
+	return nil, gateway.ErrUnsupported
+}
+func (fakeAccount) Keepalive(context.Context) error { return gateway.ErrUnsupported }

@@ -39,7 +39,7 @@ func newAccountingHandler(t *testing.T) (*Handler, *traepkg.Config, *pool.Pool) 
 	reg.Register(backendtrae.New(traepkg.NewClient(), func() *traepkg.Config { return cfg }))
 
 	p := pool.New("")
-	p.Add(backendtrae.Wrap(cfg)[0])
+	p.Add(backendtrae.Wrap(cfg, traepkg.NewClient())[0])
 
 	h := NewHandler(Config{
 		Pool:       p,
@@ -122,7 +122,7 @@ func TestBackendAccountingFailureCounted(t *testing.T) {
 	reg := gateway.NewRegistry()
 	reg.Register(backendtrae.New(traepkg.NewClient(), func() *traepkg.Config { return cfg }))
 	p := pool.New("")
-	p.Add(backendtrae.Wrap(cfg)[0])
+	p.Add(backendtrae.Wrap(cfg, traepkg.NewClient())[0])
 	h := NewHandler(Config{Pool: p, Backends: reg, Trae: cfg, TraeClient: traepkg.NewClient()})
 
 	body := `{"model":"trae:cn:glm-5.2","messages":[{"role":"user","content":"hi"}]}`

@@ -105,8 +105,6 @@ type Config struct {
 	// TraeCooldowns Trae 账号冷却表（展示与清理用；nil = 不展示冷却信息）。
 	// 与 server 侧共用同一实例。
 	TraeCooldowns *trae.Cooldowns
-	// TraeScheduler Trae 签到调度器（手动触发签到 / 查询最近结果用；nil = 501）。
-	TraeScheduler *trae.Scheduler
 	// TraeStats Trae 账号运行期计数（成功/失败/在途/用量展示用）。
 	// 与 server 侧共用同一实例；nil = 不展示运行期统计。
 	TraeStats *trae.Stats

@@ -521,7 +521,7 @@ func TestTraeConfigCheckinStatusBackfillsPool(t *testing.T) {
 	if err != nil || loaded == nil {
 		t.Fatalf("加载 trae.json: %v", err)
 	}
-	for _, a := range backendtrae.Wrap(loaded) {
+	for _, a := range backendtrae.Wrap(loaded, trae.NewClient()) {
 		pl.Add(a)
 	}
 	if st := statusByUID(t, pl, "u-1"); st.CheckinDone {

@@ -206,3 +206,18 @@ type ExpiryBucket struct {
 	ExpireAt time.Time
 	Remain   int64
 }
+
+// CheckinResult 一次签到的结果（与具体上游无关的归一口径）。
+type CheckinResult struct {
+	// Already 今日已签到（含上游的幂等拒绝）。
+	Already bool
+	// Reward 本次奖励积分（上游未给时为 0）。
+	Reward int64
+	// Message 上游原文或可读说明。
+	Message string
+	// Skipped 本次未执行（例如企业版账号无签到体系）。
+	//
+	// 与 ErrUnsupported 的区别：Skipped 是「这个账号正常，只是这类账号不参与」，
+	// 池按正常流程记账；ErrUnsupported 是「这个上游没实现」，池直接跳过。
+	Skipped bool
+}

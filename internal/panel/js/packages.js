@@ -12,15 +12,32 @@ const PK_ACCOUNT_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6',
 
 function pkColor(i) { return PK_COLORS[i % PK_COLORS.length]; }
 
-// pkAccountColorMap 按 UID 稳定分配颜色：排序后分配，账号刷新/重排不会换色。
+// pkAccountColorMap 按 UID 哈希分配颜色：同一账号**永远**是同一个颜色。
+//
+// 之前的实现是「排序后按下标取色」，看似稳定，实际上颜色取决于该账号在
+// 当前集合里的名次——只要有一个账号进出（增删、查询失败、两个视图的集合
+// 不同），后面所有账号的颜色整体位移，看图时分不清谁是谁。
+//
+// 哈希则与集合无关：只要 uid 不变，取到的颜色就不变。12 色调色板在账号
+// 超过 12 个时仍会撞色（鸽巢原理），但不会再"整体换色"。
 function pkAccountColorMap(list) {
-  const uids = (list || [])
-    .filter(a => a && !a.error && a.uid)
-    .map(a => String(a.uid))
-    .sort();
   const colors = new Map();
-  uids.forEach((uid, i) => colors.set(uid, PK_ACCOUNT_COLORS[i % PK_ACCOUNT_COLORS.length]));
+  for (const a of (list || [])) {
+    if (!a || a.error || !a.uid) continue;
+    const uid = String(a.uid);
+    if (!colors.has(uid)) colors.set(uid, pkAccountColor(uid));
+  }
   return colors;
+}
+
+// pkAccountColor 单账号颜色：FNV-1a 哈希 → 调色板下标。
+function pkAccountColor(uid) {
+  let h = 2166136261;
+  for (let i = 0; i < uid.length; i++) {
+    h ^= uid.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return PK_ACCOUNT_COLORS[(h >>> 0) % PK_ACCOUNT_COLORS.length];
 }
 
 /* pkBySource 把包按名称归并，得到「来源 → 面额/余额/个数」。这是对比的关键视图：

@@ -58,9 +58,9 @@ func TestRunActivityNowReportsEachAccount(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, &auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	s := New(Config{Pool: p, Upstream: up})
 
 	s.RunActivityNow()
@@ -81,11 +81,11 @@ func TestRunActivityNowSkipsDisabledAndNoToken(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "ok", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "dis", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "notoken", AccessToken: "", RefreshToken: "", ExpiresAt: 9999999999}))
-	p.Disable("dis", "test")
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p.Add(cbAccount(up, &auth.Auth{UID: "ok", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, &auth.Auth{UID: "dis", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, &auth.Auth{UID: "notoken", AccessToken: "", RefreshToken: "", ExpiresAt: 9999999999}))
+	p.Disable("dis", "test")
 	s := New(Config{Pool: p, Upstream: up})
 
 	s.RunActivityNow()
@@ -117,9 +117,9 @@ func TestRunActivityNowErrorDoesNotAbort(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "fail", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "ok", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p.Add(cbAccount(up, &auth.Auth{UID: "fail", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, &auth.Auth{UID: "ok", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	s := New(Config{Pool: p, Upstream: up})
 
 	s.RunActivityNow() // 不应 panic
@@ -166,8 +166,8 @@ func (s *activityStreakStub) handler() http.Handler {
 func activityStreakScheduler(t *testing.T, srv *httptest.Server) (*Scheduler, *pool.Pool) {
 	t.Helper()
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	return New(Config{Pool: p, Upstream: up}), p
 }
 
@@ -179,8 +179,8 @@ func TestRunActivityNowSelfCheckDaysNormal(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	s := New(Config{Pool: p, Upstream: up})
 
 	s.RunActivityNow()
@@ -201,8 +201,8 @@ func TestRunActivityNowSelfCheckSilentDrop(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	s := New(Config{Pool: p, Upstream: up})
 
 	if !s.checkActivityStreak(p.AuthByUID("u1")) {
@@ -218,8 +218,8 @@ func TestRunActivityNowSelfCheckGETFailure(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	s := New(Config{Pool: p, Upstream: up})
 
 	// 直接断言 checkActivityStreak：GET 失败 → 告警。
@@ -249,8 +249,8 @@ func TestRunActivityNowSkipsSelfCheckOnReportFail(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	s := New(Config{Pool: p, Upstream: up})
 
 	s.RunActivityNow() // 不上报成功 → 无自检
@@ -479,7 +479,6 @@ func TestRunActivityNowReportsGlobalAccount(t *testing.T) {
 	defer globalSrv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(globalAccount(t, "g1")))
 	// global base 单独指向另一台 server：断言路由按 realm 切，不碰 CN 端点。
 	up := &upstream.Client{
 		HTTP:              cnSrv.Client(),
@@ -489,6 +488,7 @@ func TestRunActivityNowReportsGlobalAccount(t *testing.T) {
 		ChatBaseGlobal:    globalSrv.URL,
 		BillingBaseGlobal: globalSrv.URL,
 	}
+	p.Add(cbAccount(up, globalAccount(t, "g1")))
 	s := New(Config{Pool: p, Upstream: up})
 
 	s.RunActivityNow()
@@ -523,8 +523,6 @@ func TestRunActivityNowMixedPoolReportsBoth(t *testing.T) {
 	defer globalSrv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "cn1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
-	p.Add(pool.WrapAuth(globalAccount(t, "g1")))
 	up := &upstream.Client{
 		HTTP:              cnSrv.Client(),
 		GlobalEnabled:     true,
@@ -533,6 +531,8 @@ func TestRunActivityNowMixedPoolReportsBoth(t *testing.T) {
 		ChatBaseGlobal:    globalSrv.URL,
 		BillingBaseGlobal: globalSrv.URL,
 	}
+	p.Add(cbAccount(up, &auth.Auth{UID: "cn1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, globalAccount(t, "g1")))
 	s := New(Config{Pool: p, Upstream: up})
 
 	s.RunActivityNow()
@@ -565,8 +565,6 @@ func TestRunActivityNowGlobalErrorDoesNotSkipCN(t *testing.T) {
 	defer globalSrv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(globalAccount(t, "g1")))
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "cn1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	up := &upstream.Client{
 		HTTP:              cnSrv.Client(),
 		GlobalEnabled:     true,
@@ -575,6 +573,8 @@ func TestRunActivityNowGlobalErrorDoesNotSkipCN(t *testing.T) {
 		ChatBaseGlobal:    globalSrv.URL,
 		BillingBaseGlobal: globalSrv.URL,
 	}
+	p.Add(cbAccount(up, globalAccount(t, "g1")))
+	p.Add(cbAccount(up, &auth.Auth{UID: "cn1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 	s := New(Config{Pool: p, Upstream: up})
 
 	s.RunActivityNow() // 不应 panic
@@ -597,7 +597,6 @@ func TestCheckinStillSkipsGlobal(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(pool.WrapAuth(globalAccount(t, "g1")))
 	up := &upstream.Client{
 		HTTP:              srv.Client(),
 		GlobalEnabled:     true,
@@ -606,6 +605,7 @@ func TestCheckinStillSkipsGlobal(t *testing.T) {
 		ChatBaseGlobal:    srv.URL,
 		BillingBaseGlobal: srv.URL,
 	}
+	p.Add(cbAccount(up, globalAccount(t, "g1")))
 	s := New(Config{Pool: p, Upstream: up})
 
 	s.RunCheckinNow()
