@@ -30,7 +30,6 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/thirdparty"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -323,10 +322,6 @@ func main() {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
 	}
 
-	// 第三方 OpenAI 兼容上游（可选）。提前到面板构造之前：面板「上游接入」页
-	// 需要同一份配置路径与转发客户端（两者共用连接池，不重复建立）。
-	tpCfg := loadThirdPartyConfig(*cfgPath)
-	tpClient := thirdparty.NewClient()
 	// Trae 上游（可选；trae.json 缺失或 enabled=false 时不启用）。
 	// 冷却表在 main 构造：面板与 handler 需共用同一实例（前者展示、后者读写）。
 	traeCfg := loadTraeConfig(*cfgPath, cfg.AuthDir)
@@ -374,37 +369,6 @@ func main() {
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
 		ConfigPath: *cfgPath,
-		// Responses / Codex 接入配置页：读写独立的 responses.json。
-		ResponsesPath: responsesConfigPath(*cfgPath),
-		// Anthropic / Claude Code 接入配置页：读写独立的 anthropic.json。
-		AnthropicPath: anthropicConfigPath(*cfgPath),
-		// 保存后热重载：重读文件并原子替换 handler 的 Responses 配置（无需重启）。
-		ReloadResponses: func() error {
-			if handlerRef == nil {
-				return nil
-			}
-			handlerRef.SetResponsesConfig(loadResponsesConfig(*cfgPath))
-			return nil
-		},
-		// Anthropic 配置热重载（同 Responses 模式）。
-		ReloadAnthropic: func() error {
-			if handlerRef == nil {
-				return nil
-			}
-			handlerRef.SetAnthropicConfig(loadAnthropicConfig(*cfgPath))
-			return nil
-		},
-		// 第三方上游「上游接入」页：读写独立的 third_party.json。
-		ThirdPartyPath:   thirdparty.ConfigPath(*cfgPath),
-		ThirdPartyClient: tpClient,
-		// 保存后热重载：只换配置，转发客户端（连接池）进程内复用。
-		ReloadThirdParty: func() error {
-			if handlerRef == nil {
-				return nil
-			}
-			handlerRef.SetThirdPartyConfig(loadThirdPartyConfig(*cfgPath))
-			return nil
-		},
 		// Trae 上游：配置 + 登录 + 设备凭证导入 + 冷却状态展示。
 		TraePath:      trae.ConfigPath(*cfgPath),
 		TraeClient:    traeClient,
@@ -476,15 +440,7 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
-		Responses:     loadResponsesConfig(*cfgPath),
-		// Anthropic Messages（/v1/messages，Claude Code）：默认禁用（anthropic.json
-		// 不存在即不注册路由），与 Responses 的默认启用相反——新增能力不改变既有部署行为面。
-		Anthropic: loadAnthropicConfig(*cfgPath),
-		// 第三方上游（/tp/v1/*）：独立于账号池链路。客户端非 nil 即注册路由，
-		// enabled 开关由 handler 运行期判断（面板可热启用，无需重启）。
-		ThirdParty:       tpCfg,
-		ThirdPartyClient: tpClient,
-		// Trae 上游（/trae/v1/*）：同样独立，与 /v1/*、/tp/v1/* 三者互不影响。
+		// Trae 上游：同样独立，与 /v1/* 互不影响。
 		Trae:          traeCfg,
 		TraeClient:    traeClient,
 		TraeCooldowns: traeCool,

@@ -82,7 +82,6 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
 | 🖥️ **Web 管理面板** | 内嵌管理面板（明暗主题，九个视图，前端按视图拆分嵌入二进制）：账号运维 / 用量与积分分析 / 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
-| 🔀 **第三方上游** ⚠️已弃用 | 除 CodeBuddy 外可挂任意 OpenAI 兼容上游，走独立前缀 `/tp/v1/*`；多上游按模型名匹配、面板增删改 + 逐条连通性测试。**已弃用**（改用 new-api 中转），代码保留待移除，见 [第三方上游](#-第三方上游openai-兼容) |
 | 🚂 **Trae 上游** | Trae 账号接入（`/trae/v1/*` 独立前缀）：请求体改写为 `llm_utils_chat`、SOLO 自定义 SSE 转 OpenAI、设备凭证（tc 信封解密 + DeviceProof 签名），见 [Trae 上游](#-trae-上游协议层已实现) |
 
 ## 🎯 成长任务一键完成（17/18）
@@ -765,10 +764,9 @@ http://127.0.0.1:7863/panel/
 | **积分构成** | **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
 | **任务中心** | 成长任务队列：一键扫描全部账号待办 → 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询。详见 [任务中心](#-任务中心面板新视图) |
 | **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
-| **配置** | 在线编辑 config/config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关）；同页含 **Responses / Codex 接入**（`responses.json`）与 **Anthropic / Claude Code 接入**（`anthropic.json`）——均 ⚠️已弃用 |
+| **配置** | 在线编辑 config/config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关） |
 | **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道 + 关键词筛选，默认只渲染最新 50 条，「更早」按游标翻页（环形缓冲淘汰旧行不会导致重复或漏行），「自动滚动」仅在看最新一页且原本在底部时生效；底部 **积分历史**（每次真实查到余额与上次比对，变动即留痕） |
 | **Trae 签到** | Trae 上游的账号与签到管理：`/trae/v1/*` 开关、对话上游 base、IDE 版本；逐账号签到与「上次签到结果」、每日自动签到（时点可配）、OAuth 登录添加账号（**可指定设备号**）、导入设备凭证（DeviceProof 签名用）；保存后热生效 |
-| **协议接入** | Responses / Codex 接入、Anthropic / Claude Code 接入（开关、模型映射拖拽排序、默认模型），以及**第三方 OpenAI 兼容上游**的增删改与逐条连通性测试。⚠️三者均已弃用（改用 new-api 中转），不再维护，后续计划移除 |
 
 顶部另有「刷新」（向上游全量查询真实余额并回写；面板轮询只读内存、不打上游，桌面 5 秒 / 移动端 15 秒）与「添加账号」（浏览器内完成 OAuth 设备授权：显示授权链接 + 自动轮询，登录后凭证落盘并**热加载进池，免重启**，也支持导入 cockpit tools 导出的 JSON）。
 
@@ -814,7 +812,7 @@ http://127.0.0.1:7863/panel/
 | 补偿 | `GET compensation`（逐号查补偿状态，**只读**）；`POST accounts/{uid}/compensation`（单号领）；`POST compensation_all`（全量领，返回 `summary{claimed,skipped,errored,credit}`——**先看 `errored` 再看 `claimed`**，否则会把「全部查询失败」说成「没有待领补偿」） |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
 | 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` |
-| 接入配置 | `GET`/`POST responses_config` · `anthropic_config` · `thirdparty_config` · `trae_config`；`POST thirdparty_test`（单条上游连通性测试） |
+| 接入配置 | `GET`/`POST config` · `trae_config`；Trae 登录与设备导入见下 |
 | Trae 运维 | `POST trae/import` · `trae/login/start` · `trae/login/finish` · `trae/accounts/{uid}/remove` · `trae/accounts/{uid}/checkin` · `trae/accounts/{uid}/credits` · `trae/checkin_all`；`GET trae/checkin_status` |
 | 写入 | `POST config`（校验 → 落盘 → 热应用，返回需重启字段清单）· `POST usage/save`（立即把内存用量落盘） |
 
@@ -831,14 +829,10 @@ http://127.0.0.1:7863/panel/
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
-| `POST /v1/messages` | `x-api-key` / Bearer | ⚠️**已弃用** **Anthropic Messages 协议接入**（Claude Code）：Anthropic → Chat 转发，回程投影回 Anthropic（含工具/思考块/SSE 六事件族）；仅在启用时可用（见「Anthropic / Claude Code 接入」，默认禁用） |
+| `POST /v1/search/messages` | Bearer（`api_key` 非空时） | 联网搜索（Anthropic Messages 兼容形态），见 [联网搜索](#联网搜索-post-v1searchmessages) |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
-| `POST /tp/v1/chat/completions` | Bearer | ⚠️**已弃用** **第三方上游**（OpenAI 兼容）转发；流式/非流式；仅在启用第三方时可用（否则 404） |
-| `POST /tp/v1/responses` | Bearer | ⚠️**已弃用** 第三方上游的 Responses 协议接入（内部转为 Chat 转发，回程投影回 Responses） |
-| `POST /tp/v1/messages` | `x-api-key` / Bearer | ⚠️**已弃用** 第三方上游的 Anthropic Messages 协议接入（Claude Code 直连第三方；内部转为 Chat 转发，回程投影回 Anthropic） |
-| `GET /tp/v1/models` | Bearer | ⚠️**已弃用** 第三方上游模型列表（来自 `third_party.json` 的 `models` 声明） |
 | `POST /trae/v1/chat/completions` | Bearer | **Trae 上游**：OpenAI Chat → `llm_utils_chat`，回程 SOLO SSE → OpenAI |
 | `POST /trae/v1/responses` | Bearer | Trae 上游的 Responses 协议接入（Chat 中转 + 回程投影） |
 | `GET /trae/v1/models` | Bearer | Trae 内置模型目录 |
@@ -896,132 +890,6 @@ http://127.0.0.1:7863/panel/
 | `activity/growth/tasks/<task_code>/claim` | POST | **领取任务奖励**（任务码在路径、无 body；**Web 域 `www.workbuddy.cn`**，非 CLI 域——这是领奖能成功的关键） |
 
 出站请求统一携带 `CLI/2.63.2 CodeBuddy/2.63.2` UA（可被 `upstream.user_agent` 覆盖）；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。领奖请求额外带 `x-client-platform: web` 与 workbuddy.cn 的 Origin/Referer。
-
-## 🔀 第三方上游（OpenAI 兼容）
-
-> **⚠️ 已弃用（2026-11-13）**：作者已改用 [new-api](https://github.com/Calcium-Ion/new-api)
-> 做上游中转，本功能**不再维护**，代码保留但不再演进，后续计划移除。
-> 保留原因：作为 new-api 不可用时的退路，且移除会牵动面板「上游接入」页（与 Trae 共用）。
-> 弃用与移除计划见 `docs/deprecated.md`。下面内容按现状记录，可能随代码演进失准。
-
-除内置的 CodeBuddy 上游外，网关可同时挂载任意 **OpenAI 兼容**上游（DeepSeek / OpenAI / 自建 vLLM / Ollama / 各类中转），走**独立前缀**，与现有链路完全隔离。
-
-### 路由与隔离
-
-| 前缀 | 上游 | 说明 |
-|---|---|---|
-| `/v1/*` | CodeBuddy 账号池 | 现有链路，行为不变 |
-| `/tp/v1/*` | 第三方（OpenAI 兼容） | 新增；不进账号池，不做冷却 / 脱敏 / 提示词改写 |
-| `/trae/v1/*` | Trae | 协议层已实现，见 [Trae 上游](#-trae-上游协议层已实现) |
-
-三者互不影响：第三方未启用时 `/tp/v1/*` 返回 404，`/v1/*` 一切照旧。
-
-### 快速开始
-
-1. 用面板左侧「**协议接入**」页维护，或手工创建 `config/third_party.json`（与 `config/config.json` 同目录，可从 `third_party.example.json` 复制）：
-
-```json
-{
-  "enabled": true,
-  "providers": [
-    {
-      "name": "deepseek",
-      "protocol": "openai",
-      "base_url": "https://api.deepseek.com/v1",
-      "api_key": "sk-xxx",
-      "models": ["deepseek-chat", "deepseek-reasoner"],
-      "timeout_seconds": 120
-    }
-  ]
-}
-```
-
-2. 客户端把 `base_url` 指向 `http://<主机>:<端口>/tp/v1` 即可（codex 另加 `wire_api = "responses"` 走 `/tp/v1/responses`）。
-
-### 字段说明
-
-| 字段 | 缺省 | 说明 |
-|---|---|---|
-| `enabled` | `false` | 总开关；关闭时 `/tp/v1/*` 一律 404 |
-| `providers[].name` | 必填 | 全局唯一；用于日志与用量视图（`realm="tp"` 分账） |
-| `providers[].base_url` | 必填 | 含或不含 `/v1` 都可（自动识别版本段 / 补齐） |
-| `providers[].chat_path` | `/chat/completions` | 非标准路径时覆盖 |
-| `providers[].models_path` | `/models` | 同上 |
-| `providers[].api_key` | 空 | 空 = 不发 `Authorization` 头 |
-| `providers[].models` | `[]` | 精确匹配（大小写不敏感）；**留空 = 兜底上游**，承接未命中其他上游的模型名 |
-| `providers[].timeout_seconds` | `120` | 只约束非流式；流式仅约束首字节 |
-| `providers[].headers` | `{}` | 额外出站头（覆盖同名默认头，用于非 Bearer 鉴权的中转） |
-
-匹配顺序：按 `providers` 数组顺序取**首个命中** `models` 的上游；都不命中时回落首个 `models` 为空的兜底上游；仍无则 404 `model_not_found`。
-
-配置错误（`name` 空 / 重复、`base_url` 空或无 scheme、协议不支持）会在**保存时**与**启动时**两处同口径拒绝（fail fast），不会静默忽略。
-
-### 行为边界（与 CodeBuddy 链路的差异）
-
-- **不做**请求体改写：effort 降级、thinking 注入、`prompt_cache_key`、指纹脱敏、系统提示词替换一律不施加——第三方是标准 OpenAI 协议，多做的改写只会制造非法参数；
-- **不做**账号轮转 / 冷却 / 熔断 / 粘性：单上游单 Key，失败即错误直返；
-- **错误处理**：HTTP 状态映射为稳定 `code`，`message` **一律透传上游原文**（含真实原因与 request id，是排查的唯一依据）；
-- **流式**：原样透传上游 SSE（不做帧重建）；非流式直传 JSON；
-- **用量**：计入 `usage` 的独立 `realm="tp"` 分账，`uid` 维度为 provider 名，不污染 CodeBuddy 账号维度。
-
-### 面板
-
-「上游接入」页支持增删改上游、启用开关、逐条「测试连接」（向该上游发一条 `max_tokens=16` 的最小请求），保存后**热生效**，无需重启。
-
-## 🤖 Anthropic / Claude Code 接入
-
-> **⚠️ 已弃用（2026-11-13）**：作者已改用 [new-api](https://github.com/Calcium-Ion/new-api)
-> 做上游中转，本功能**不再维护**，代码保留但不再演进，后续计划移除。
-> 保留原因：作为 new-api 不可用时的退路；移除需同时拆掉面板「协议接入」页。
-> 弃用与移除计划见 `docs/deprecated.md`。下面内容按现状记录，可能随代码演进失准。
-
-Claude Code CLI / Claude Desktop 讲 Anthropic Messages 协议（`/v1/messages`），与 OpenAI 系协议不互通。网关内置双向转换（Anthropic → Chat 转发，回程投影回 Anthropic），支持：
-
-- 纯文本对话（流式/非流式）、多模态图片（base64/URL）；
-- 工具全链路：`tools` 声明、assistant `tool_use` ↔ Chat `tool_calls`、`tool_result` → tool 消息（并行回喂）、`tool_choice` 四态；
-- 思维链：`thinking` 块 ↔ `reasoning_content`（含 `redacted_thinking` 占位）、`thinking.budget_tokens` → `reasoning_effort`；
-- Anthropic SSE 六事件族（`message_start` → `content_block_*` → `message_delta` → `message_stop`），`message_delta` 严格单发（重复会导致 Claude Code 中断连接）；
-- usage 缓存桶换算（`input = prompt − cached − cache_write`，防双计）。
-
-### 配置（`config/anthropic.json`，与 `config/config.json` 同目录；推荐直接用面板「配置」页）
-
-面板「配置」页含 **Anthropic / Claude Code 接入** 卡片（与 Responses / Codex 接入同款交互：启用开关 + 模型映射拖拽排序 + 默认模型），保存后**热生效**，无需重启。手写配置可从 **`anthropic.example.json`** 复制起步（已内置一套合理的默认映射）。
-
-```json
-{
-  "enabled": true,
-  "model_map": {
-    "claude-sonnet-4-5": "glm-5.2"
-  },
-  "default_model": ""
-}
-```
-
-| 字段 | 说明 |
-|---|---|
-| `enabled` | 是否响应 `/v1/messages`。**默认禁用**（面板开关或环境变量 `WB2A_ANTHROPIC_ENABLED=true` 可启用） |
-| `model_map` | Claude 客户端模型名 → 上游模型名（与 `responses.json` 的 `model_map` 同机制） |
-| `default_model` | 未命中映射时的回落模型（空 = 不改写） |
-
-### Claude Code 接入步骤
-
-```bash
-export ANTHROPIC_BASE_URL="http://<主机>:<端口>"   # 不要带 /v1 结尾！CC 会自己拼 /v1/messages，
-                                                  # 带 /v1 会双拼成 /v1/v1/messages（网关已容错，
-                                                  # 但第三方直连 /tp 场景需对应写 /tp）
-export ANTHROPIC_API_KEY="<网关 api_key>"          # 走 x-api-key 头，也兼容 Bearer
-export ANTHROPIC_MODEL="claude-sonnet-4-5"        # 需在 model_map 里映射到上游模型
-claude
-```
-
-第三方上游场景：把 `ANTHROPIC_BASE_URL` 指向 `http://<主机>:<端口>/tp` 即走 `/tp/v1/messages`（直连第三方 provider，模型映射同上）。
-
-### 行为边界
-
-- 上游 server 工具（`web_search_*` 等 Anthropic 托管工具）会被丢弃——Chat 上游无法执行服务端工具（与 Responses 侧 web_search 同口径）；
-- `document`（PDF）块暂不支持（CodeBuddy 未验证 file 形态）；
-- `cache_control` 块级标记被剥离（Chat 上游无对应语义；prompt cache 由上游自动管理）；
-- CC 会话粘性（`metadata.user_id` 提取）为后续增强项。
 
 ## 🚂 Trae 上游（协议层已实现）
 

@@ -28,7 +28,6 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/thirdparty"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -71,30 +70,6 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
-
-	// ResponsesPath responses.json 路径（面板「Responses / Codex 接入」配置页读写用；
-	// 空 = 不提供该接口）。独立于 ConfigPath，不并入主配置表单。
-	ResponsesPath string
-	// ReloadResponses 保存 responses.json 后触发热重载（由 main 注入：重读文件并
-	// 原子替换 handler 的 Responses 配置）。nil = 不热重载（需重启生效）。
-	ReloadResponses func() error
-
-	// AnthropicPath anthropic.json 路径（面板「Anthropic / Claude Code 接入」配置页
-	// 读写用；空 = 不提供该接口）。
-	AnthropicPath string
-	// ReloadAnthropic 保存 anthropic.json 后触发热重载（由 main 注入：重读文件并
-	// 原子替换 handler 的 Anthropic 配置）。nil = 不热重载（需重启生效）。
-	ReloadAnthropic func() error
-
-	// ThirdPartyPath third_party.json 路径（面板「上游接入」页读写用；
-	// 空 = 不提供该接口）。独立于 ConfigPath，不并入主配置表单。
-	ThirdPartyPath string
-	// ReloadThirdParty 保存 third_party.json 后触发热重载（由 main 注入：重读文件并
-	// 原子替换 handler 的第三方配置）。nil = 不热重载（需重启生效）。
-	ReloadThirdParty func() error
-	// ThirdPartyClient 第三方转发客户端（「测试连接」用；nil = 该接口返回 501）。
-	// 与 server 侧共用同一实例（连接池不重复建立）。
-	ThirdPartyClient *thirdparty.Client
 
 	// TraePath trae.json 路径（面板「上游接入」页的 Trae 区块读写用；空 = 不提供该接口）。
 	TraePath string
@@ -239,13 +214,6 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
-	p.mux.HandleFunc("GET /panel/api/responses_config", p.withAuth(p.getResponsesConfig))
-	p.mux.HandleFunc("POST /panel/api/responses_config", p.withAuth(p.saveResponsesConfig))
-	p.mux.HandleFunc("GET /panel/api/anthropic_config", p.withAuth(p.getAnthropicConfig))
-	p.mux.HandleFunc("POST /panel/api/anthropic_config", p.withAuth(p.saveAnthropicConfig))
-	p.mux.HandleFunc("GET /panel/api/thirdparty_config", p.withAuth(p.getThirdPartyConfig))
-	p.mux.HandleFunc("POST /panel/api/thirdparty_config", p.withAuth(p.saveThirdPartyConfig))
-	p.mux.HandleFunc("POST /panel/api/thirdparty_test", p.withAuth(p.testThirdPartyProvider))
 	p.mux.HandleFunc("GET /panel/api/trae_config", p.withAuth(p.getTraeConfig))
 	p.mux.HandleFunc("POST /panel/api/trae_config", p.withAuth(p.saveTraeConfig))
 	p.mux.HandleFunc("POST /panel/api/trae/import", p.withAuth(p.importTraeDevice))

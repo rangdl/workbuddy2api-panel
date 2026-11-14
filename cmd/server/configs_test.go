@@ -15,19 +15,17 @@ func TestEnsureAllConfigs(t *testing.T) {
 	ensureAllConfigs(cfgPath)
 
 	base := filepath.Join(dir, "config")
-	for _, name := range []string{responsesFileName, anthropicFileName, "third_party.json", "trae.json"} {
-		p := filepath.Join(base, name)
-		raw, err := os.ReadFile(p)
-		if err != nil {
-			t.Fatalf("%s 未生成: %v", name, err)
-		}
-		var v map[string]any
-		if err := json.Unmarshal(raw, &v); err != nil {
-			t.Errorf("%s 不是合法 JSON: %v\n%s", name, err, raw)
-		}
-		if _, ok := v["enabled"]; !ok {
-			t.Errorf("%s 缺少 enabled 字段", name)
-		}
+	p := filepath.Join(base, "trae.json")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("trae.json 未生成: %v", err)
+	}
+	var v map[string]any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Errorf("trae.json 不是合法 JSON: %v\n%s", err, raw)
+	}
+	if _, ok := v["enabled"]; !ok {
+		t.Error("trae.json 缺少 enabled 字段")
 	}
 }
 
@@ -38,8 +36,8 @@ func TestEnsureAllConfigsDoesNotOverwrite(t *testing.T) {
 	if err := os.MkdirAll(base, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	const mine = `{"enabled":true,"model_map":{"a":"b"}}`
-	p := filepath.Join(base, responsesFileName)
+	const mine = `{"enabled":true,"accounts":[]}`
+	p := filepath.Join(base, "trae.json")
 	if err := os.WriteFile(p, []byte(mine), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -59,29 +57,18 @@ func TestEnsureAllConfigsDisabledByDefault(t *testing.T) {
 	base := filepath.Join(dir, "config")
 	ensureAllConfigs(filepath.Join(base, "config.json"))
 
-	for _, name := range []string{anthropicFileName, "third_party.json", "trae.json"} {
-		raw, err := os.ReadFile(filepath.Join(base, name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		var v struct {
-			Enabled bool `json:"enabled"`
-		}
-		if err := json.Unmarshal(raw, &v); err != nil {
-			t.Fatal(err)
-		}
-		if v.Enabled {
-			t.Errorf("%s 默认 enabled=true，应默认关闭", name)
-		}
+	raw, err := os.ReadFile(filepath.Join(base, "trae.json"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	// responses 是既有行为：默认启用，不受影响
-	raw, _ := os.ReadFile(filepath.Join(base, responsesFileName))
-	var r struct {
+	var v struct {
 		Enabled bool `json:"enabled"`
 	}
-	json.Unmarshal(raw, &r)
-	if !r.Enabled {
-		t.Error("responses.json 默认应为 enabled=true（保持既有行为）")
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.Enabled {
+		t.Error("trae.json 默认 enabled=true，应默认关闭")
 	}
 }
 

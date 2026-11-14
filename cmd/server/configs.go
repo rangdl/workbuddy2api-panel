@@ -1,16 +1,13 @@
-// configs.go 副配置文件（responses / anthropic / third_party / trae / model）的
-// 「不存在则写默认」。
+// configs.go 副配置文件（trae / model）的「不存在则写默认」。
 //
-// 为什么需要：主配置早就支持首次运行自动生成（config.go 的 WriteDefault），但四个
-// 副配置各自「不存在 → 静默禁用 / 返回 nil」。用户第一次进面板的「协议接入」「上游接入」
-// 页只看到空白，必须自己猜到文件名和字段才能建文件。这里统一补齐。
+// 为什么需要：主配置早就支持首次运行自动生成（config.go 的 WriteDefault），但副配置
+// 各自「不存在 → 静默禁用 / 返回 nil」。用户第一次进面板的「上游接入」页只看到空白，
+// 必须自己猜到文件名和字段才能建文件。这里统一补齐。
 //
 // 默认值的选择原则：
 //   - 写「能直接看懂结构」的最小样例，而不是全量字段——注释和默认值由代码兜底，
 //     文件里留空字符串/缺省键反而更清楚（面板保存时会补齐）；
-//   - 生成的 anthropic.json / third_party.json / trae.json 一律 enabled=false：
-//     写默认值不能顺带开启一个用户没配过的上游；
-//   - responses.json 是例外（enabled=true），与既有行为一致（它就是默认启用的）。
+//   - 生成的 trae.json 一律 enabled=false：写默认值不能顺带开启一个用户没配过的上游。
 package main
 
 import (
@@ -63,38 +60,6 @@ func ensureDefaultFile(path string, build func() any) bool {
 // 必须在迁移之后、各 load*Config 之前调用。
 func ensureAllConfigs(configPath string) {
 	dir := filepath.Dir(configPath)
-	ensureDefaultFile(filepath.Join(dir, responsesFileName), func() any {
-		return map[string]any{
-			"enabled": true,
-			"model_map": map[string]string{
-				"gpt-5-codex": "glm-5.2",
-			},
-			"default_model":        "",
-			"max_cached_responses": 512,
-		}
-	})
-	ensureDefaultFile(filepath.Join(dir, anthropicFileName), func() any {
-		return map[string]any{
-			"enabled":       false,
-			"model_map":     map[string]string{},
-			"default_model": "",
-		}
-	})
-	ensureDefaultFile(filepath.Join(dir, "third_party.json"), func() any {
-		// 带一条注释性样例（enabled=false，不会真的启用），用户改成自己的地址即可。
-		return map[string]any{
-			"enabled": false,
-			"providers": []any{
-				map[string]any{
-					"name":     "example",
-					"protocol": "openai",
-					"base_url": "https://api.example.com/v1",
-					"api_key":  "",
-					"models":   []string{},
-				},
-			},
-		}
-	})
 	ensureDefaultFile(filepath.Join(dir, "trae.json"), func() any {
 		return map[string]any{
 			"enabled":  false,

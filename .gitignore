@@ -11,24 +11,20 @@ data/
 /login
 /credit
 /wb2api
+/server
 /signin_bin
 /traepoc
 /traepoc.exe
 
-# Config with secrets (use config.example.json)
+# 配置含密钥（用 config.example.json）
 # 新版布局：配置收进 config/、运行状态收进 data/（见 cmd/server/layout.go）。
 # 直接忽略整个 config/ 目录；示例文件仍在仓库根，供手工复制。
 config/
 config.json
 # 旧版平铺路径保留忽略规则：迁移期间的旧文件同样不应提交
-responses.json
 model.json
-# 第三方上游配置含 API Key（用 third_party.example.json）
-third_party.json
 # Trae 上游配置含 access_token / refresh_token / 设备私钥
 trae.json
-# Anthropic 接入配置（用 anthropic.example.json；映射本身不含密钥，防手滑写密钥）
-anthropic.json
 
 # Build artifacts
 *.tmp
@@ -65,9 +61,3 @@ server.exe
 
 # 本地 Claude Code 配置与技能包（含 fnos CLI 等，非项目代码）
 .claude/
-
-# 已弃用的设计文档（2026-11-13 弃用 Responses / Anthropic / 第三方上游）。
-# 文件仍在工作区供临时查阅，但不进版本库；确认无用后可直接删除。
-docs/responses-api-plan.md
-docs/anthropic-messages-plan.md
-docs/third-party-upstream-plan.md

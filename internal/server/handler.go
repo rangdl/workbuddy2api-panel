@@ -25,7 +25,6 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/thirdparty"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -75,21 +74,6 @@ type Config struct {
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
 	Usage *usage.Recorder
-
-	// Responses Responses 端点配置（可选；nil = 仍注册 /v1/responses，但无增量补全/模型映射）。
-	// 定义在 responses.go（同包），避免污染上游 Config 字段语义。
-	Responses *ResponsesConfig
-
-	// Anthropic Anthropic Messages 端点配置（可选；nil 或 Enabled=false 时不注册 /v1/messages）。
-	// 定义在 anthropic.go（同包）。Claude Code 等客户端接入用。
-	Anthropic *AnthropicConfig
-
-	// ThirdParty 第三方 OpenAI 兼容上游配置（可选；nil 或 Enabled=false 时不注册 /tp/ 路由）。
-	// 与 CodeBuddy 链路完全隔离：不进账号池、不套用冷却/脱敏/提示词改写。
-	// 定义在 internal/thirdparty（独立包），实现见 thirdparty.go（同包）。
-	ThirdParty *thirdparty.Config
-	// ThirdPartyClient 第三方转发客户端（ThirdParty 启用时必填；nil 则视为未启用）。
-	ThirdPartyClient *thirdparty.Client
 
 	// Trae Trae 上游配置（可选；nil 或 Enabled=false 时不参与调度）。
 	// 对话走 /v1/*（模型名带 "trae:" 前缀指定），签到等运维能力在面板里。
@@ -156,15 +140,6 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
-	// responses Responses 端点配置（运行期可原子替换：面板保存 responses.json 后
-	// 热重载，无需重启）。nil 或 Enabled=false 时 /v1/responses 返回 404。
-	responsesCfg atomic.Pointer[ResponsesConfig]
-	// anthropicCfg Anthropic Messages 端点配置（运行期可原子替换：面板保存
-	// anthropic.json 后热重载）。nil 或 Enabled=false 时 /v1/messages 返回 404。
-	anthropicCfg atomic.Pointer[AnthropicConfig]
-	// thirdpartyCfg 第三方上游配置（运行期可原子替换：面板保存 third_party.json 后
-	// 热重载，无需重启）。nil 或 Enabled=false 时 /tp/v1/* 返回 404。
-	thirdpartyCfg atomic.Pointer[thirdparty.Config]
 	// traeCfg Trae 上游配置（运行期可原子替换，供 backend 读）。
 	traeCfg atomic.Pointer[trae.Config]
 	// traeCool Trae 账号级冷却表（进程内，重启清零）。nil 时不做冷却判定。
@@ -199,43 +174,13 @@ func NewHandler(cfg Config) *Handler {
 	if h.traeStats == nil {
 		h.traeStats = trae.NewStats()
 	}
-	h.responsesCfg.Store(cfg.Responses)
-	h.anthropicCfg.Store(cfg.Anthropic)
-	h.thirdpartyCfg.Store(cfg.ThirdParty)
 	h.traeCfg.Store(cfg.Trae)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
-	// 只要注入了 Responses 配置就注册路由（enabled 的开关由 handler 运行期判断，
-	// 以便面板热切换启用/禁用；disabled 时返回 404）。
-	if cfg.Responses != nil {
-		h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
-	}
-	// Anthropic Messages（/v1/messages，Claude Code）：同 Responses 模式——
-	// 注入配置即注册路由，enabled 开关运行期判断。
-	// 鉴权用 withAuthAnthropic（CC 发 x-api-key 而非 Authorization Bearer）。
-	// /v1/v1/messages 是 CC 把 base_url 配成带 /v1 结尾时的双拼路径
-	// （CC 恒在 base_url 后追加 /v1/messages；实测 2.1.286 确认）——注册同
-	// handler 容错，避免这类配置报 404 page not found 且 CC 显示为
-	// model_not_found 误导排障。
-	if cfg.Anthropic != nil {
-		h.mux.HandleFunc("POST /v1/messages", h.withAuthAnthropic(h.anthropicMessages))
-		h.mux.HandleFunc("POST /v1/v1/messages", h.withAuthAnthropic(h.anthropicMessages))
-	}
-	// 联网搜索（Anthropic Messages 兼容形态，见 messages.go）。路径刻意不占用
-	// /v1/messages——那是 Anthropic 模型对话的标准路径，留给未来的 chat 转发。
+	// 联网搜索（Anthropic Messages 兼容形态，见 messages.go）。
 	h.mux.HandleFunc("POST /v1/search/messages", h.withAuth(h.messages))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
-	// 第三方上游（/tp/v1/*）：与 CodeBuddy 的 /v1/* 完全隔离。
-	// 只要注入了转发客户端就注册路由，enabled 开关由 handler 运行期判断——
-	// 否则面板里热启用后路由仍不存在（与 /v1/responses 同一取舍）。
-	// 这三条路由是本 fork 与上游 handler.go 的唯一交集（见 docs/third-party-upstream-plan.md §9.4）。
-	if cfg.ThirdPartyClient != nil {
-		h.mux.HandleFunc("POST /tp/v1/chat/completions", h.withAuth(h.thirdpartyChat))
-		h.mux.HandleFunc("POST /tp/v1/responses", h.withAuth(h.thirdpartyResponses))
-		h.mux.HandleFunc("POST /tp/v1/messages", h.withAuthAnthropic(h.thirdpartyAnthropicMessages))
-		h.mux.HandleFunc("GET /tp/v1/models", h.withAuth(h.thirdpartyModels))
-	}
 	// Trae 不再有独立前缀：对话统一走 /v1/*（模型名带 "trae:" 前缀即可指定上游），
 	// 回退、粘性、并发控制全部复用主链路的实现。签到/积分等运维能力仍在面板里。
 	if cfg.Panel != nil {
@@ -244,43 +189,14 @@ func NewHandler(cfg Config) *Handler {
 	return h
 }
 
-// SetResponsesConfig 运行期替换 Responses 配置（面板保存 responses.json 后热重载）。
-// 保留原增量存储实例（避免热重载丢缓存；缓存条数变化需重启）。
-func (h *Handler) SetResponsesConfig(cfg *ResponsesConfig) {
-	old := h.responsesCfg.Load()
-	if old != nil && old.Store != nil && cfg != nil {
-		cfg.Store = old.Store
-	}
-	h.responsesCfg.Store(cfg)
-}
-
-// SetAnthropicConfig 运行期替换 Anthropic Messages 配置（面板保存 anthropic.json 后热重载）。
-func (h *Handler) SetAnthropicConfig(cfg *AnthropicConfig) {
-	h.anthropicCfg.Store(cfg)
-}
-
-// SetThirdPartyConfig 运行期替换第三方上游配置（面板保存 third_party.json 后热重载）。
-// 转发客户端（ThirdPartyClient）不随之替换——它只持有连接池，与配置无关。
-func (h *Handler) SetThirdPartyConfig(cfg *thirdparty.Config) {
-	h.thirdpartyCfg.Store(cfg)
-}
-
 // SetTraeConfig 运行期替换 Trae 上游配置（面板保存 trae.json 后热重载）。
 func (h *Handler) SetTraeConfig(cfg *trae.Config) {
 	h.traeCfg.Store(cfg)
 }
 
-// requestLogPaths 需要记入请求日志的端点（POST）：/v1/chat/completions 之外的
-// /v1/responses（Codex）与 /v1/messages（Claude Code，含 /v1/v1/messages 双拼容错别名）
-// 都复用 h.chatCompletions 链路（responses.go / anthropic.go），requestTrace 会随
-// context 自动填充，因此只要在 ServeHTTP 入口建 trace，账号/模型/token 统计全量可得。
-// /tp/v1/* 是独立转发路径（不经 chatCompletions，无 chatStat 可挂），
-// 暂不接入记账。
+// requestLogPaths 需要记入请求日志的端点（POST）。
 var requestLogPaths = map[string]bool{
 	"/v1/chat/completions": true,
-	"/v1/responses":        true,
-	"/v1/messages":         true,
-	"/v1/v1/messages":      true, // CC 把 base_url 配成带 /v1 结尾时的双拼路径（见 NewHandler 注释）
 	// 搜索端点：同样消耗账号额度、同样会因上游/账号问题失败，不记账等于在面板
 	// 「请求记录」里完全看不见搜索流量。
 	"/v1/search/messages": true,
@@ -335,19 +251,6 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
-			return
-		}
-		next(w, r)
-	}
-}
-
-// withAuthAnthropic Anthropic 端点的鉴权中间件：CC 客户端发 x-api-key
-// （不发 Authorization），两者任一命中即放行（httpauth.VerifyAnthropic）。
-func (h *Handler) withAuthAnthropic(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyAnthropic(r, h.loadLive().APIKey) {
-			// Anthropic 鉴权错误形状（{"type":"error",...}），非 OpenAI 形状。
-			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key")
 			return
 		}
 		next(w, r)
