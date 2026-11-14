@@ -162,7 +162,7 @@ func TestChatParityBackendWritesModelCooldown(t *testing.T) {
 		},
 		HTTPStatus: 400,
 	}
-	h.handleBackendFailure(fakeGatewayAccount{uid: "u1", backend: "trae"}, model, f, &chatStat{})
+	h.handleBackendFailure(fakeGatewayAccount{uid: "u1", backend: "trae"}, model, f, &chatStat{}, nil)
 	if bs := p.ModelBlocked(model); !bs.Blocked {
 		t.Errorf("模型 %q 应进入负缓存，实际 %+v", model, bs)
 	}
@@ -228,7 +228,78 @@ func TestApplyFailureNonCodeBuddyKindFallsBack(t *testing.T) {
 	}
 }
 
-// healthzNoWarnOnDeletedEndpoints 已删除的三条协议端点必须 404。
+// TestUnifiedPathServesCodeBuddy CodeBuddy 现在也走 backend 分发。
+//
+// 这是收敛完成的验收点：内联路径已删除，若 backend 注册或 Unwrap 有任何问题，
+// 所有 CodeBuddy 请求都会失败。用最简单的 200 流做冒烟。
+func TestUnifiedPathServesCodeBuddy(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+
+	// 流式
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stream: code=%d body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "你好") {
+		t.Errorf("stream body missing content: %s", rec.Body)
+	}
+
+	// 非流式
+	req = httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sync: code=%d body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "你好") {
+		t.Errorf("sync body missing content: %s", rec.Body)
+	}
+}
+
+// TestUnifiedPathRecordsUsage 统一路径必须记账（token / 请求数 / 缓存）。
+//
+// 收敛过程中最容易漏的就是记账——它原来散在内联路径的 recordAttempt 里，
+// 删掉内联路径后必须由 backend 路径补上，否则面板「用量」整页归零。
+func TestUnifiedPathRecordsUsage(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("account missing")
+	}
+	if st.TokenUsage.RequestCount != 1 {
+		t.Errorf("RequestCount=%d, want 1", st.TokenUsage.RequestCount)
+	}
+	if st.TokenUsage.UsageCount != 1 {
+		t.Errorf("UsageCount=%d, want 1（token 观测必须进账号级计数）", st.TokenUsage.UsageCount)
+	}
+	if st.TokenUsage.TotalTokens != 2 {
+		t.Errorf("TotalTokens=%d, want 2", st.TokenUsage.TotalTokens)
+	}
+	if st.SuccessCount != 1 {
+		t.Errorf("SuccessCount=%d, want 1", st.SuccessCount)
+	}
+}
+
+// TestHealthzNoWarnOnDeletedEndpoints 已删除的三条协议端点必须 404。
 //
 // 阶段 1 的回归保护：确保删除是完整的（路由不再注册）。
 func TestDeletedEndpointsReturn404(t *testing.T) {

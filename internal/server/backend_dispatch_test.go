@@ -73,7 +73,7 @@ func TestBackendFailureNotWrittenAsResponse(t *testing.T) {
 	rec := httptest.NewRecorder()
 	acc := fakeGatewayAccount{uid: "u1", backend: "trae"}
 	// 非分类错误 → 不写响应、返回 backendRetry（调用方继续换号）。
-	outcome, err := h.handleBackendFailure(acc, "glm-5.2", errPlain{}, &chatStat{})
+	outcome, err := h.handleBackendFailure(acc, "glm-5.2", errPlain{}, &chatStat{}, nil)
 	if outcome != backendRetry {
 		t.Errorf("非分类错误应返回 backendRetry，实际 %v", outcome)
 	}
@@ -107,7 +107,7 @@ func TestBackendFailureRotateTrueRetries(t *testing.T) {
 		},
 		HTTPStatus: 502,
 	}
-	outcome, err := h.handleBackendFailure(fakeGatewayAccount{uid: "u1", backend: "trae"}, "glm-5.2", f, st)
+	outcome, err := h.handleBackendFailure(fakeGatewayAccount{uid: "u1", backend: "trae"}, "glm-5.2", f, st, nil)
 	if outcome != backendRetry {
 		t.Errorf("Rotate=true 应返回 backendRetry，实际 %v", outcome)
 	}
@@ -140,7 +140,7 @@ func TestBackendFailureRotateFalseStops(t *testing.T) {
 		},
 		HTTPStatus: 400,
 	}
-	outcome, _ := h.handleBackendFailure(fakeGatewayAccount{uid: "u1", backend: "trae"}, "glm-5.2", f, st)
+	outcome, _ := h.handleBackendFailure(fakeGatewayAccount{uid: "u1", backend: "trae"}, "glm-5.2", f, st, nil)
 	if outcome != backendStop {
 		t.Errorf("Rotate=false 应返回 backendStop，实际 %v", outcome)
 	}
@@ -166,7 +166,7 @@ func TestBackendFailureModelCooldownUsesRequestModel(t *testing.T) {
 		},
 		HTTPStatus: 400,
 	}
-	h.handleBackendFailure(fakeGatewayAccount{uid: "u1", backend: "trae"}, model, f, &chatStat{})
+	h.handleBackendFailure(fakeGatewayAccount{uid: "u1", backend: "trae"}, model, f, &chatStat{}, nil)
 
 	// 该 (账号, 模型) 必须进入负缓存。池里只有这一个账号，所以全池口径也应被挡住。
 	bs := p.ModelBlocked(model)

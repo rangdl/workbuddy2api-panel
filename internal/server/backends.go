@@ -3,6 +3,8 @@ package server
 import (
 	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // backends.go 多上游注册表接入。
@@ -26,8 +28,49 @@ func (h *Handler) ensureCodeBuddyBackend() {
 		return
 	}
 	reg := gateway.NewRegistry()
-	reg.Register(backendcb.New(h.cfg.Upstream, func() bool { return true }, nil))
+	reg.Register(h.newCodeBuddyBackend())
 	h.cfg.Backends = reg
+}
+
+// newCodeBuddyBackend 构造带降级重试钩子的 CodeBuddy backend。
+//
+// 降级重试（内容拦截误报 → 换中性提示词重试同一账号）依赖 server 侧的
+// degradeGate 与提示词配置，所以在这里注入而不是放进 backend 包。
+func (h *Handler) newCodeBuddyBackend() *backendcb.Backend {
+	return &backendcb.Backend{
+		Client:    h.cfg.Upstream,
+		EnabledFn: func() bool { return true },
+		Retry:     degradeRetryHook{gate: &h.degrade, mode: h.cfg.PromptMode},
+	}
+}
+
+// degradeRetryHook 内容拦截时的同账号重试改写。
+//
+// 只在 passthrough / append 模式生效：这两个模式会透传客户端原始 system，
+// 而拦截多半是 system 里的固定模板句被逐字误杀。custom 模式用的是网关自己的
+// 提示词，被拦就是用户内容本身有问题，重试没有意义。
+type degradeRetryHook struct {
+	gate *degradeGate
+	mode string
+}
+
+// OnFailure 命中内容拦截时把 system 换成中性提示词并重试一次。
+func (d degradeRetryHook) OnFailure(in *gateway.Inbound, f *gateway.Failure) (*gateway.Inbound, bool) {
+	if f == nil || f.Decision.Kind != upstream.ErrContentBlocked.String() {
+		return nil, false
+	}
+	if d.mode != "passthrough" && d.mode != "append" {
+		return nil, false
+	}
+	if d.gate != nil {
+		d.gate.Trigger()
+	}
+	// Inbound.Raw 只读约定：必须产出新副本，不能原地改（同一份 Inbound 可能
+	// 被多个上游依次尝试）。
+	next := *in
+	next.Raw = prompt.Rewrite(in.Raw, prompt.Degraded)
+	// 同一请求的 ChatID 保持不变：客户端不该把重试结果当成新消息。
+	return &next, true
 }
 
 // backendNames 返回可用于模型名前缀的上游标识（主名 + 别名，仅已启用）。

@@ -165,6 +165,11 @@ type Usage struct {
 	CacheCreation int64
 	// Reasoning 思考 token（输出的一部分）。
 	Reasoning int64
+	// Credit 上游在 usage 里直接给出的本次扣费（CodeBuddy 的 usage.credit）。
+	// 0 且 HasCredit=false 表示上游没给；有值时是**实测**，优先于任何估算。
+	Credit float64
+	// HasCredit Credit 是否有效。
+	HasCredit bool
 }
 
 // CachedPercent 缓存命中率（0~100；无输入 token 时返回 0）。

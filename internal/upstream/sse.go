@@ -485,6 +485,16 @@ type StreamOption func(*streamOptions)
 type streamOptions struct {
 	onErrorFrame func(payload string)
 	markup       *MarkupRepair
+	onUsage      func(u map[string]any)
+}
+
+// WithUsageObserver 注册 usage 观察者：流中出现 usage 字段时回调一次（后者覆盖）。
+//
+// 用途：StreamTo/StreamHint 只负责转发帧，不解析用量。需要记账的调用方
+// （backend 的 Outbound.Convert）靠这个旁路拿到末帧 usage，避免为了拿用量
+// 而把整条流重新解析一遍。
+func WithUsageObserver(fn func(u map[string]any)) StreamOption {
+	return func(o *streamOptions) { o.onUsage = fn }
 }
 
 // WithMarkupRepair 注册「模型原生工具调用标记」修复器（见 dsml.go）。
@@ -704,6 +714,13 @@ func streamEmit(emit func(frame string) error, r io.Reader, hintFn func(string) 
 				return 0, werr
 			}
 			return 0, nil
+		}
+		// usage 旁路采集：末帧 usage 是流式记账的唯一数据源。
+		// 在错误帧判定之前取——上游可能在同一帧里既报错又带 usage。
+		if o.onUsage != nil {
+			if u, ok := obj["usage"].(map[string]any); ok {
+				o.onUsage(u)
+			}
 		}
 		// 上游错误帧透传（error-passthrough）：带 error 键的帧**原样写出**，不走
 		// normalizeFrame 白名单——白名单会剥掉 error 字段，客户端就看不到上游

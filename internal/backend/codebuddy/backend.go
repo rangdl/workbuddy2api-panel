@@ -2,6 +2,7 @@ package codebuddy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -16,6 +17,11 @@ type Backend struct {
 	EnabledFn func() bool
 	// LoadFn 从 auths/ 目录装载账号（返回原始凭证，本包负责包装）。
 	LoadFn func() ([]*auth.Auth, error)
+	// Retry 内容拦截降级重试的改写器（nil = 不启用）。
+	//
+	// 由 server 注入：降级状态机（degradeGate）与提示词文本都是网关配置，
+	// 不属于上游协议；backend 只负责「把改写后的 Inbound 再发一次」。
+	Retry gateway.RetryHook
 }
 
 // New 构造 backend。
@@ -123,6 +129,9 @@ func (b *Backend) Chat(ctx context.Context, acc gateway.Account, in *gateway.Inb
 			// errFrame 保存上游 error 帧原文（6004 限流 / 内容拦截 / 审核），
 			// 流结束后据此判定账号处置。
 			var errFrame string
+			// usage 从帧里旁路采集：StreamTo 只负责转发，不解析用量。
+			// 这是流式记账的唯一数据源（token / 缓存 / 积分估算都依赖它）。
+			var usage map[string]any
 			// 标记修复：第二个参数 true = 名单为空时启用弱判定——tools 声明在
 			// 链路上丢失是实测最常见的泄漏成因，只做严格判定等于对主场景不设防。
 			repair := upstream.NewMarkupRepair(declaredTools, true)
@@ -136,9 +145,11 @@ func (b *Backend) Chat(ctx context.Context, acc gateway.Account, in *gateway.Inb
 			err := upstream.StreamTo(emit, rc, hintFn,
 				upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
 				upstream.WithMarkupRepair(repair),
+				upstream.WithUsageObserver(func(u map[string]any) { usage = u }),
 			)
 			stats.Repaired = repair.Converted()
 			stats.RepairSeen = repair.Seen()
+			stats.Usage = usageFromMap(usage)
 			if errFrame != "" {
 				stats.SentAny = true // 已下发内容后才发现错误帧，不能再改状态码
 				stats.ErrorMsg = errFrame
@@ -161,8 +172,65 @@ func (b *Backend) Credits(ctx context.Context, acc gateway.Account) (*gateway.Cr
 	return nil, gateway.ErrCreditsUnsupported
 }
 
-// RetryHook CodeBuddy 的内容拦截降级重试由 handler 层实现（需要 prompt 包）。
-func (b *Backend) RetryHook() gateway.RetryHook { return nil }
+// RetryHook 内容拦截降级重试（由 server 注入，见 Backend.Retry）。
+func (b *Backend) RetryHook() gateway.RetryHook { return b.Retry }
 
 // 编译期断言。
 var _ gateway.Backend = (*Backend)(nil)
+
+// usageFromMap 把上游 usage 原文转成跨上游的归一口径（nil = 无 usage）。
+//
+// 放在 backend 而不是 upstream 包：upstream 不认识 gateway（分层约束），
+// 而「上游 usage 字段怎么映射到统一结构」正是 backend 的职责。
+func usageFromMap(u map[string]any) *gateway.Usage {
+	if u == nil {
+		return nil
+	}
+	out := &gateway.Usage{}
+	got := false
+	if v, ok := upstream.UsagePromptTokens(u); ok {
+		out.PromptTokens = int64(v)
+		got = true
+	}
+	if v, ok := usageInt(u, "completion_tokens"); ok {
+		out.CompletionTokens = v
+		got = true
+	}
+	if v, ok := usageInt(u, "total_tokens"); ok {
+		out.TotalTokens = v
+		got = true
+	}
+	if v, ok := upstream.UsageCacheHitTokens(u); ok {
+		out.CacheRead = int64(v)
+	}
+	if v, ok := usageInt(u, "cache_creation_input_tokens"); ok {
+		out.CacheCreation = v
+	}
+	if v, ok := usageInt(u, "reasoning_tokens"); ok {
+		out.Reasoning = v
+	}
+	// credit：CodeBuddy 在 usage 里直接给出本次扣费（实测值，优先于估算）。
+	if v, ok := u["credit"].(float64); ok {
+		out.Credit, out.HasCredit = v, true
+	}
+	if !got {
+		return nil
+	}
+	return out
+}
+
+// usageInt 从 usage 顶层取整数字段。
+func usageInt(u map[string]any, key string) (int64, bool) {
+	switch n := u[key].(type) {
+	case float64:
+		return int64(n), true
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	case json.Number:
+		v, err := n.Int64()
+		return v, err == nil
+	}
+	return 0, false
+}

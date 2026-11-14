@@ -34,6 +34,19 @@ func (x authAdapter) Checkin(context.Context) (*gateway.CheckinResult, error) {
 }
 func (x authAdapter) Keepalive(context.Context) error { return gateway.ErrUnsupported }
 
+// Credential 实现 gateway.CredentialUnwrapper。
+//
+// 必需：聊天统一走 backend 后，backend 靠 Unwrap 取凭证。少了这个方法，
+// codebuddy.Unwrap 对 authAdapter 返回 nil，表现为「账号明明在池里却报
+// account is not a CodeBuddy auth」——测试与占位路径全挂，而生产（走
+// backend 包装）正常，是最难排查的那类不一致。
+func (x authAdapter) Credential() any {
+	if x.a == nil {
+		return nil
+	}
+	return x.a
+}
+
 // NicknameValue / SetNickname 实现 Nicknamer（可选能力）。
 func (x authAdapter) NicknameValue() string { return x.a.NicknameValue() }
 

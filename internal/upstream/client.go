@@ -47,8 +47,7 @@ const (
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
-func (k ErrKind) String() string {
-	switch k {
+func (k ErrKind) String() string {	switch k {
 	case ErrHardCredit:
 		return "hard_credit"
 	case ErrSoftRate:
@@ -82,6 +81,19 @@ func (k ErrKind) String() string {
 	default:
 		return "none"
 	}
+}
+
+// ErrKindOf 把 String() 的名字还原成 ErrKind（未知名字返回 ErrNone）。
+//
+// 用途：错误分类作为字符串跨层传递后（gateway.Decision.Kind），需要还原成
+// 枚举才能复用精细处置策略。名字是唯一稳定标识，比传整数更耐重构。
+func ErrKindOf(name string) ErrKind {
+	for k := ErrKind(0); k <= ErrClient; k++ {
+		if k.String() == name {
+			return k
+		}
+	}
+	return ErrNone
 }
 
 // Error 带分类的上游错误。
