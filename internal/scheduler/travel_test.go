@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
@@ -136,7 +137,11 @@ func fastTravel(t *testing.T) {
 	t.Helper()
 	old := travelAccountDelay
 	travelAccountDelay = 0
-	t.Cleanup(func() { travelAccountDelay = old })
+	pool.SetCapabilityDelay(0)
+	t.Cleanup(func() {
+		travelAccountDelay = old
+		pool.SetCapabilityDelay(old)
+	})
 }
 
 // fastTravelTimer 把该调度器的到站定时器参数调到毫秒级（只影响本实例，
@@ -399,17 +404,22 @@ func TestRunTravelAdoptTriedExpiresNextDay(t *testing.T) {
 	srv := stub.server()
 	defer srv.Close()
 
-	s, _ := newTravelScheduler(t, srv, "u1")
-	s.markAdoptTried("u1") // 当日已试过
-	s.RunTravelNow()
-	if n := stub.firstCalls.Load(); n != 0 {
-		t.Fatalf("first calls=%d want 0（当日已试过）", n)
-	}
-
-	s.adoptTried["u1"] = "2000-01-01" // 模拟昨日记录
+	s, p := newTravelScheduler(t, srv, "u1")
+	// 模拟「今日已判定门槛未达」：第一次巡检会真的打一次上游并记入当日台账。
 	s.RunTravelNow()
 	if n := stub.firstCalls.Load(); n != 1 {
-		t.Errorf("first calls=%d want 1（跨日应重试）", n)
+		t.Fatalf("first calls=%d want 1（首次应尝试）", n)
+	}
+	// 同日再跑：台账命中，不再打上游。
+	s.RunTravelNow()
+	if n := stub.firstCalls.Load(); n != 1 {
+		t.Fatalf("first calls=%d want 1（当日只试一次）", n)
+	}
+	// 模拟跨日：把台账改成昨日，应重新尝试。
+	p.ResetTravelRetryForTest("2000-01-01")
+	s.RunTravelNow()
+	if n := stub.firstCalls.Load(); n != 2 {
+		t.Errorf("first calls=%d want 2（跨日应重试）", n)
 	}
 }
 
@@ -796,7 +806,7 @@ func TestTravelDueTime(t *testing.T) {
 	local := now.Unix()
 
 	// 上游口径：还有 7200s 到站；本机 Unix 时刻故意与上游差 1 天（模拟时钟漂移）。
-	ts := &upstream.TravelState{
+	ts := gateway.TravelSnapshot{
 		State:     "traveling",
 		RecordID:  1,
 		ServerNow: local + 86400,
@@ -817,19 +827,19 @@ func TestTravelDueTime(t *testing.T) {
 	}
 
 	// 上游未回 server_now：退回本机时钟。
-	noServer := &upstream.TravelState{State: "traveling", ArriveAt: local + 600}
+	noServer := gateway.TravelSnapshot{State: "traveling", ArriveAt: local + 600}
 	if at, _, _, ok := travelDueTime(noServer, now); !ok || at.Sub(now) != 600*time.Second {
 		t.Errorf("缺 server_now 应退回本机时钟，got %v ok=%v", at, ok)
 	}
 
 	// 已过点：立即唤醒（at 不晚于 now）。
-	past := &upstream.TravelState{State: "traveling", ServerNow: local + 100, ArriveAt: local + 50}
+	past := gateway.TravelSnapshot{State: "traveling", ServerNow: local + 100, ArriveAt: local + 50}
 	if at, _, _, ok := travelDueTime(past, now); !ok || at.After(now) {
 		t.Errorf("已过点应返回不晚于 now 的时刻，got %v ok=%v", at, ok)
 	}
 
 	// arrived：立即触发（启动补跑——关机期间到站的行程，重启后马上领奖）。
-	arrived := &upstream.TravelState{State: "arrived", RecordID: 28367071}
+	arrived := gateway.TravelSnapshot{State: "arrived", RecordID: 28367071}
 	at, key, immediate, ok = travelDueTime(arrived, now)
 	if !ok || at.After(now) {
 		t.Errorf("arrived 应立即触发，got at=%v ok=%v", at, ok)
@@ -841,13 +851,12 @@ func TestTravelDueTime(t *testing.T) {
 		t.Error("arrived 应标记 immediate（启动补跑不额外等待，奖励已经等够久）")
 	}
 	// arrived 但缺 record_id：无法领奖，不参与定时（交给整点巡检记日志）。
-	if _, _, _, ok := travelDueTime(&upstream.TravelState{State: "arrived"}, now); ok {
+	if _, _, _, ok := travelDueTime(gateway.TravelSnapshot{State: "arrived"}, now); ok {
 		t.Error("arrived 缺 record_id 不应产生定时")
 	}
 
 	// 其余状态不参与定时。
-	for _, bad := range []*upstream.TravelState{
-		nil,
+	for _, bad := range []gateway.TravelSnapshot{
 		{State: "idle", ArriveAt: local + 7200, ServerNow: local},
 		{State: "traveling"}, // 无 arrive_at
 		{State: "teleporting", ArriveAt: local + 7200},
@@ -940,7 +949,7 @@ func TestTravelDepartPokesTimer(t *testing.T) {
 	}
 
 	s.travelMu.Lock()
-	s.travelOne(s.cfg.Pool.AuthByUID("u1"))
+	s.travelOneByUID("u1")
 	s.travelMu.Unlock()
 
 	if n := stub.departCalls.Load(); n != 1 {

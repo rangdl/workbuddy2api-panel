@@ -101,6 +101,11 @@ type Pool struct {
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh chan struct{}
+	// travelRetry 旅行巡检的「当日不再重试」台账：uid → 自然日（CST）。
+	//
+	// 只记「今日重试无意义」的账号（如领养门槛未达）。运行态、不持久化：
+	// 进程重启后重试一次的成本可接受，而持久化会让「今天已经错过」跨重启残留。
+	travelRetry map[string]string
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
 }

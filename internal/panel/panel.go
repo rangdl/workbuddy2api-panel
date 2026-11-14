@@ -942,12 +942,12 @@ func (p *Panel) accountCompensationClaim(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	if res.Claimed {
+	if res.Outcome.ClaimedNow {
 		p.refreshCreditsQuiet(uid)
 	}
 	// ok 反映「是否拿到确定结论」：error 非空即 false。注意前端 api() 只看
 	// HTTP 状态码，这个字段是给日志/调用方看的，真正的分流依据是 result.error。
-	writeJSON(w, http.StatusOK, map[string]any{"ok": res.Error == "", "result": res})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": res.Err == nil, "result": res})
 }
 
 // compensationAll 手动全量领取补偿（逐号查状态后领取；无待领的号静默跳过）。
@@ -958,7 +958,7 @@ func (p *Panel) compensationAll(w http.ResponseWriter, r *http.Request) {
 	}
 	results := p.cfg.Scheduler.ClaimCompensationNow()
 	for _, res := range results {
-		if res.Claimed {
+		if res.Outcome.ClaimedNow {
 			p.refreshCreditsQuiet(res.UID)
 		}
 	}

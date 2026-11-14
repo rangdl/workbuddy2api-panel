@@ -12,12 +12,23 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"log"
 	"math/rand"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+)
+
+// 行程状态字面量（与 gateway.TravelSnapshot.State 的取值一致）。
+//
+// 定义在调度器侧而不是引用上游包：到站定时器只需要比较这三个字符串，
+// 不应该因为「判断一下状态」就依赖某个具体上游的类型。
+const (
+	travelStateIdle      = "idle"
+	travelStateTraveling = "traveling"
+	travelStateArrived   = "arrived"
 )
 
 // travelTimerParams 到站定时器的时间参数。
@@ -163,14 +174,10 @@ func (s *Scheduler) RunTravelTimer(ctx context.Context) {
 				continue // 兜底轮询到期：回到循环顶重扫
 			}
 			fired[target.uid] = target.arriveAt
-			if a := s.cfg.Pool.AuthByUID(target.uid); a != nil {
-				log.Printf("travel-timer %s: 唤醒，执行 travelOne", logfmt.Label(a.UID, a.NicknameValue()))
-				s.travelMu.Lock()
-				s.travelOne(a)
-				s.travelMu.Unlock()
-			} else {
-				log.Printf("travel-timer %s: 唤醒时账号已不在池中，跳过", logfmt.Label(target.uid, target.nick))
-			}
+			log.Printf("travel-timer %s: 唤醒，执行巡检", logfmt.Label(target.uid, target.nick))
+			s.travelMu.Lock()
+			s.travelOneByUID(target.uid)
+			s.travelMu.Unlock()
 			// 唤醒后这一趟行程不再参与定时（去重），若上游仍报同一趟在途，
 			// 下一轮扫描会看到它但被 filterUnfired 过滤，退回等下一次事件
 			// （派出新行程 / 整点兜底巡检 / 手动触发）。
@@ -209,20 +216,23 @@ func filterUnfired(arrivals []travelArrival, fired map[string]int64) []travelArr
 func (s *Scheduler) scanTravelArrivals() []travelArrival {
 	var out []travelArrival
 	first := true
-	for _, a := range s.travelAccounts() {
+	for _, a := range s.travelTimerAccounts() {
 		if !first {
 			time.Sleep(travelAccountDelay)
 		}
 		first = false
-		ts, err := s.cfg.Upstream.TravelStatus(a)
+		snap, err := a.t.TravelState(context.Background())
 		if err != nil {
 			// 401/网络错误只跳过本轮（不强刷 token，交 22:00 keepalive）。
-			log.Printf("travel-timer %s: status: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
+			// ErrUnsupported = 该账号不适用（企业版/global），静默跳过。
+			if !errors.Is(err, gateway.ErrUnsupported) {
+				log.Printf("travel-timer %s: status: %v", logfmt.Label(a.uid, a.nick), err)
+			}
 			continue
 		}
-		if at, key, immediate, ok := travelDueTime(ts, time.Now()); ok {
+		if at, key, immediate, ok := travelDueTime(snap, time.Now()); ok {
 			out = append(out, travelArrival{
-				uid: a.UID, nick: a.NicknameValue(),
+				uid: a.uid, nick: a.nick,
 				at: at, arriveAt: key, immediate: immediate,
 			})
 		}
@@ -241,10 +251,7 @@ func (s *Scheduler) scanTravelArrivals() []travelArrival {
 //
 // 去重键 key：traveling 用上游 arrive_at（同一趟行程身份稳定）；arrived 用
 // RecordID（同一笔待领奖励身份稳定）。用「每轮重算的 at」当键会漂移，不行。
-func travelDueTime(ts *upstream.TravelState, now time.Time) (at time.Time, key int64, immediate bool, ok bool) {
-	if ts == nil {
-		return time.Time{}, 0, false, false
-	}
+func travelDueTime(ts gateway.TravelSnapshot, now time.Time) (at time.Time, key int64, immediate bool, ok bool) {
 	switch ts.State {
 	case travelStateArrived:
 		if ts.RecordID == 0 {

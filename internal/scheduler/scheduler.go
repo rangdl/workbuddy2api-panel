@@ -5,7 +5,6 @@ package scheduler
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -555,59 +554,14 @@ func (s *Scheduler) RunActivityNow() {
 }
 
 // runActivity 活跃上报遍历，随 ctx 取消立即退出。
+//
+// 状态机已搬到账号对象（backend/codebuddy/features.go 的 Account.ReportActivity）：
+// 「上报 → 等 settle → 回读 streak」整条链在账号内部完成，门控（企业版跳过、
+// global 不跳过）也在那里。调度器只负责节奏（账号间限速）与 include_disabled 开关。
 func (s *Scheduler) runActivity(ctx context.Context) {
-	first := true
-	includeDisabled := s.includeDisabledInTasks()
-	type reported struct{ a *auth.Auth }
-	var okList []reported
-	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled && !includeDisabled {
-			continue
-		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessTokenValue() == "" {
-			continue
-		}
-		// 企业版跳过活跃上报：/v2/report 本身返回 200（不报错），但它唯一的作用是
-		// 点亮 growth 连登天数 / 解锁 first_buddy 领养——这两者对企业号都是 403
-		// （「growth system is only available for personal users」），即**零收益**。
-		// 该类"静默无效"最易被忽略（日志无异常），故显式跳过，不给上游多发一次请求。
-		if !a.SupportsPersonalGrowth() {
-			continue
-		}
-		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
-		// 点亮连登）；realmBase 路由/头由 upstream.billingJSON/BillingHeaders 按 realm 切，
-		// 无需改动 upstream。此处曾按「D4 门控：global 无活跃体系」跳过 global，实测该
-		// 判断不成立——国际版 /v2/report 可用，跳过即国际版账号永远点不亮连登（上游
-		// a190252 同口径修复）。checkin/travel 的 global 门控不受影响，仍跳过。
-		if !first {
-			if !sleepCtx(ctx, activityAccountDelay) {
-				return // 优雅停机：不等限速睡满，剩余账号下轮再报
-			}
-		}
-		first = false
-		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
-		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
-			log.Printf("activity %s: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
-			continue
-		}
-		okList = append(okList, reported{a: a})
-	}
-	// streak 自检统一放到循环之后：上游计分是异步的，上报刚返回 200 就回读几乎
-	// 必然读到旧值，会把成功判成「silent drop」（线上实测：日志报 days=0，数秒后
-	// 实查已是 1）。先等 settle 让服务端落账，再逐号回读。
-	if len(okList) == 0 {
-		return
-	}
-	if !sleepCtx(ctx, activityStreakSettle) {
-		return
-	}
-	for _, it := range okList {
-		if !sleepCtx(ctx, activityAccountDelay) {
-			return
-		}
-		s.checkActivityStreak(it.a)
-	}
+	pool.SetCapabilityDelay(activityAccountDelay)
+	ctx = pool.WithIncludeDisabledInTasks(ctx, s.includeDisabledInTasks())
+	s.cfg.Pool.ActivityAll(ctx)
 }
 
 // checkActivityStreak 上报成功后回读连登天数（只读 oracle，发现静默失败）。

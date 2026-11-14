@@ -127,8 +127,8 @@ func TestCompensationSkippedRowsCarryNickname(t *testing.T) {
 		if rows[i].UID != "u1" {
 			continue
 		}
-		if rows[i].Skip != compSkipEnterprise {
-			t.Errorf("企业号 skip=%q want %q", rows[i].Skip, compSkipEnterprise)
+		if rows[i].Skip != pool.CompSkipEnterprise {
+			t.Errorf("企业号 skip=%q want %q", rows[i].Skip, pool.CompSkipEnterprise)
 		}
 		if rows[i].Nickname != "企业号" {
 			t.Errorf("跳过行昵称=%q want 企业号（面板靠它显示账号）", rows[i].Nickname)
@@ -192,8 +192,8 @@ func TestClaimCompensationForRejectsDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("不应报错: %v", err)
 	}
-	if res.Skip != compSkipDisabled {
-		t.Errorf("skip=%q want %q", res.Skip, compSkipDisabled)
+	if res.Skip != pool.CompSkipDisabled {
+		t.Errorf("skip=%q want %q", res.Skip, pool.CompSkipDisabled)
 	}
 	if rec.claims() != 0 {
 		t.Errorf("禁用号不应被领取，实际 claim 调用 %d 次", rec.claims())
@@ -213,9 +213,9 @@ func TestClaimCompensationOnlyWhenPending(t *testing.T) {
 		wantSkip  string
 	}{
 		{"待领取", `{"active":true,"claimed":false,"credit_num":500}`, true, ""},
-		{"已领取", `{"active":true,"claimed":true,"credit_num":500}`, false, compSkipClaimed},
-		{"无活动", `{"active":false,"claimed":false,"credit_num":0}`, false, compSkipInactive},
-		{"额度为零", `{"active":true,"claimed":false,"credit_num":0}`, false, compSkipZeroCredit},
+		{"已领取", `{"active":true,"claimed":true,"credit_num":500}`, false, pool.CompSkipClaimed},
+		{"无活动", `{"active":false,"claimed":false,"credit_num":0}`, false, pool.CompSkipInactive},
+		{"额度为零", `{"active":true,"claimed":false,"credit_num":0}`, false, pool.CompSkipZeroCredit},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -223,7 +223,7 @@ func TestClaimCompensationOnlyWhenPending(t *testing.T) {
 			s := compensationScheduler(t, rec,
 				&auth.Auth{UID: "u1", AccessToken: "at1", Nickname: "甲", ExpiresAt: 9999999999})
 
-			res := s.claimOne(s.cfg.Pool.AuthByUID("u1"))
+			res, _ := s.ClaimCompensationFor("u1")
 			if tc.wantClaim {
 				if !res.Claimed || res.Credit != 500 {
 					t.Errorf("应领取 500c，实际 claimed=%v credit=%d", res.Claimed, res.Credit)
@@ -252,12 +252,12 @@ func TestClaimCompensationOnlyWhenPending(t *testing.T) {
 func TestSummarizeCompensationDistinguishesError(t *testing.T) {
 	cases := []struct {
 		name    string
-		results []CompensationResult
+		results []pool.CompensationResult
 		want    CompensationSummary
 	}{
 		{
 			"全部查询失败",
-			[]CompensationResult{
+			[]pool.CompensationResult{
 				{UID: "u1", Error: "boom"},
 				{UID: "u2", Error: "boom"},
 			},
@@ -265,15 +265,15 @@ func TestSummarizeCompensationDistinguishesError(t *testing.T) {
 		},
 		{
 			"无待领（已领完）",
-			[]CompensationResult{
-				{UID: "u1", Skip: compSkipClaimed},
-				{UID: "u2", Skip: compSkipClaimed},
+			[]pool.CompensationResult{
+				{UID: "u1", Skip: pool.CompSkipClaimed},
+				{UID: "u2", Skip: pool.CompSkipClaimed},
 			},
 			CompensationSummary{Total: 2, Skipped: 2},
 		},
 		{
 			"混合：两个领到、一个失败",
-			[]CompensationResult{
+			[]pool.CompensationResult{
 				{UID: "u1", Claimed: true, Credit: 500},
 				{UID: "u2", Claimed: true, Credit: 500},
 				{UID: "u3", Error: "boom"},
