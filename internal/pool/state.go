@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
@@ -366,21 +365,12 @@ func (p *Pool) Status(uid string) (Status, bool) {
 	return p.statusOf(uid, e), true
 }
 
-// AuthByUID 返回账号的完整凭证（给调度器/运维接口用）。
+// AuthByUID 已移除：它返回 *auth.Auth，是 internal/pool 依赖 internal/auth
+// 的最后一处（见 docs/architecture.md「已知例外①」）。
 //
-// 语义说明：这里是**唯一**保留 CodeBuddy 具体类型的地方。调度器/面板的保号
-// 任务（签到/保活/旅行/任务）全是 CodeBuddy 专有能力，本来就要拿凭证；
-// 而选号路径走 gateway.Account 接口，两者互不干扰。
-// 非 CodeBuddy 账号（如 Trae）返回 nil——调用方按「无凭证」处理。
-func (p *Pool) AuthByUID(uid string) *auth.Auth {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	e, ok := p.lookupLocked(uid)
-	if !ok {
-		return nil
-	}
-	return UnwrapAuth(e.acc)
-}
+// 需要 CodeBuddy 凭证的调用方（cmd/server 的模型倍率预热、panel 的成长任务
+// 接口）改为：取 gateway.Account → codebuddy.Unwrap(acc)。池本身不再关心
+// 任何上游的凭证类型。
 
 // AvailableUIDs 返回当前 healthy 且未占满在途名额的账号 UID 列表（按 UID 排序，稳定输出）。
 // 供会话粘性路由（internal/session）做快路径命中校验 + 双段分配；无可用返回空切片。
