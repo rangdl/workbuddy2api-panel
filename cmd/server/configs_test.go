@@ -24,8 +24,18 @@ func TestEnsureAllConfigs(t *testing.T) {
 	if err := json.Unmarshal(raw, &v); err != nil {
 		t.Errorf("trae.json 不是合法 JSON: %v\n%s", err, raw)
 	}
-	if _, ok := v["enabled"]; !ok {
-		t.Error("trae.json 缺少 enabled 字段")
+	// 默认内容刻意是**空对象**：trae.json 只放上游协议常量与凭证策略，
+	// 字段由代码兜底成内置默认值。绝不能写 enabled:false——
+	// 上游平权后没有"启用某个上游"这回事（加了账号即启用），
+	// 留一个 false 开关只会让人以为需要手动打开。
+	if _, ok := v["enabled"]; ok {
+		t.Error("trae.json 不应包含 enabled 字段（上游平权，无启用开关）")
+	}
+	if _, ok := v["chat_base"]; ok {
+		t.Error("trae.json 不应包含 chat_base（上游路径不是配置项）")
+	}
+	if _, ok := v["schedule"]; ok {
+		t.Error("trae.json 不应包含 schedule（签到排程统一在 config.json）")
 	}
 }
 

@@ -56,15 +56,38 @@ const (
 	MaxRotate = 3
 )
 
+// TraeRealm 单个域的配置（与 codebuddy 的 Realm 同构）。
+//
+// 两个字段都是 base 覆盖：空 = 回落内置默认。Trae 的对话域与签到域是**不同域名**
+// （mchost.guru vs api.trae.cn），不能合成一个 base。
+type TraeRealm struct {
+	// ChatBase 对话上游 base；空 = DefaultChatBase。
+	ChatBase string `json:"chat_base"`
+	// APIBase 签到/积分接口 base；空 = DefaultAPITraeBase。
+	APIBase string `json:"api_base"`
+}
+
 // Config trae.json 结构。
 type Config struct {
 	// Enabled 总开关；false 时该上游不参与调度。
 	Enabled bool `json:"enabled"`
+	// CN 国内域配置（Trae 目前只有这一个域）。
+	//
+	// **域维度是刻意的**：CodeBuddy 已有 cn/global 两域，Trae 迟早也会有。
+	// 结构上先留好位置，届时只加一个 Global 字段、不改形状，消费方按 realm 取 base。
+	CN TraeRealm `json:"cn"`
+
 	// ChatBase 对话上游 base（缺省 DefaultChatBase）。
-	ChatBase string `json:"chat_base"`
+	//
+	// **兼容字段**：已并入 CN.ChatBase。保留是因为旧 trae.json 都写在这一层，
+	// Load 时若发现顶层有值而 CN.ChatBase 为空，会自动搬进 CN 段（见 Normalize）。
+	// 新写入只写 CN 段。
+	ChatBase string `json:"chat_base,omitempty"`
 	// APITraeBase 签到/积分接口 base（缺省 DefaultAPITraeBase = api.trae.cn）。
-	// 与 chat_base 不同域：对话走 mchost.guru，签到/积分走 api.trae.cn。
-	APITraeBase string `json:"api_trae_base"`
+	//
+	// **兼容字段**：同 ChatBase，已并入 CN.APIBase。与 chat_base 不同域：
+	// 对话走 mchost.guru，签到/积分走 api.trae.cn。
+	APITraeBase string `json:"api_trae_base,omitempty"`
 	// IDEVersion / IDEVersionCode / AppID 出站头覆盖（缺省用内置默认）。
 	IDEVersion     string `json:"ide_version"`
 	IDEVersionCode string `json:"ide_version_code"`
@@ -88,8 +111,16 @@ type Config struct {
 	// 由 AuthDir 指向（见 accounts.go）。这里保留字段是为了让运行期代码
 	// 继续按 `cfg.Accounts` 访问，Load 时从目录装配。
 	Accounts []Account `json:"-"`
-	// Schedule 签到排程（缺省不启用；由 trae.Scheduler 消费）。
-	Schedule CheckinSchedule `json:"schedule"`
+	// Schedule 签到排程的**遗留字段**，已不参与调度。
+	//
+	// 签到统一由 internal/scheduler 按整点触发，开关在 config.json 的
+	// schedule.checkin_backends（按上游）+ schedule.checkin_enabled（总开关）。
+	// 保留字段只为让旧 trae.json 仍能正常反序列化（未知字段会被静默忽略，
+	// 但显式保留能避免「字段消失 → 用户以为配置被吃掉」的困惑）。
+	//
+	// 不要在这里读 Enabled/Hours 做任何决策：那会让「同一个签到有两个开关」
+	// 的分裂状态复活。见 docs/architecture.md 的排程单点。
+	Schedule CheckinSchedule `json:"schedule,omitempty"`
 
 	// ---- 签到链路可调项（全部有安全缺省，一般不需要动）----
 
@@ -156,10 +187,26 @@ type Account struct {
 
 // Normalize 补齐缺省值。
 func (c *Config) Normalize() {
-	if strings.TrimSpace(c.ChatBase) == "" {
-		c.ChatBase = DefaultChatBase
+	// 旧字段 → 域段的一次性搬迁（内存内，不改磁盘）。
+	// 只在 CN 段为空时搬，避免覆盖用户已经写在新结构里的值。
+	if strings.TrimSpace(c.CN.ChatBase) == "" && strings.TrimSpace(c.ChatBase) != "" {
+		c.CN.ChatBase = c.ChatBase
 	}
-	c.ChatBase = strings.TrimRight(strings.TrimSpace(c.ChatBase), "/")
+	if strings.TrimSpace(c.CN.APIBase) == "" && strings.TrimSpace(c.APITraeBase) != "" {
+		c.CN.APIBase = c.APITraeBase
+	}
+	if strings.TrimSpace(c.CN.ChatBase) == "" {
+		c.CN.ChatBase = DefaultChatBase
+	}
+	c.CN.ChatBase = strings.TrimRight(strings.TrimSpace(c.CN.ChatBase), "/")
+	if strings.TrimSpace(c.CN.APIBase) == "" {
+		c.CN.APIBase = DefaultAPITraeBase
+	}
+	c.CN.APIBase = strings.TrimRight(strings.TrimSpace(c.CN.APIBase), "/")
+	// 反向同步：让仍在读顶层字段的老代码路径拿到生效值（读取方逐步迁移到
+	// ChatBaseFor/APIBaseFor，在两个都改完之前这层映射保证不出现两套值）。
+	c.ChatBase = c.CN.ChatBase
+	c.APITraeBase = c.CN.APIBase
 	if c.IDEVersion == "" {
 		c.IDEVersion = DefaultIDEVersion
 	}
@@ -387,13 +434,33 @@ func MigrateLegacyAccounts(configPath, defaultAuthDir string) (int, error) {
 }
 
 // ConfigPath 返回与 config.json 同目录的 trae.json 路径。
+// ChatBaseFor 取某域的对话 base（目前只有 cn；未知域回落 cn）。
+//
+// 为什么用方法而不是让调用方直接读字段：Trae 加 global 域时，所有读取点
+// 都要跟着改判断，而方法只需要在**这一处**改。这是域维度落地的最小接口。
+func (c *Config) ChatBaseFor(realm string) string {
+	if c == nil {
+		return DefaultChatBase
+	}
+	// 目前只有 cn 一个域；realm 参数为将来 global 预留。
+	return c.CN.ChatBase
+}
+
+// APIBaseFor 取某域的签到/积分 base（目前只有 cn）。
+func (c *Config) APIBaseFor(realm string) string {
+	if c == nil {
+		return DefaultAPITraeBase
+	}
+	return c.CN.APIBase
+}
+
 func ConfigPath(configPath string) string {
 	return filepath.Join(filepath.Dir(configPath), "trae.json")
 }
 
 // LogSummary 启动时打印一行摘要。
 func (c *Config) LogSummary() {
-	if c == nil || !c.Enabled {
+	if c == nil {
 		return
 	}
 	usable := 0

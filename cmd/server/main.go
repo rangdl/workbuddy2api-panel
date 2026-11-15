@@ -94,6 +94,10 @@ func main() {
 	}
 	// 副配置补齐：responses / anthropic / third_party / trae 缺失时写默认样例。
 	// 放在主配置加载之后（此时目录已确保存在），各 load*Config 之前。
+	// 上游配置的旧字段迁移必须**先于** ensureAllConfigs：后者会在文件不存在时
+	// 写一份默认 codebuddy.json，一旦写了，迁移就会因"目标文件已存在"而跳过，
+	// 旧配置的上游字段随之全部丢失（静默的配置丢失，最难发现）。
+	migrateLegacyUpstreamConfig(*cfgPath, backendcb.Path(*cfgPath))
 	ensureAllConfigs(*cfgPath)
 
 	auths, err := auth.LoadDir(cfg.AuthDir)
@@ -170,6 +174,10 @@ func main() {
 
 	up := upstream.New()
 
+	// CodeBuddy 上游配置（codebuddy.json）。缺失时返回内置默认——
+	// 上游配置独立成文件后，主配置不再承载任何上游专有字段。
+	cbCfg := loadCodeBuddyConfig(*cfgPath)
+
 	// CodeBuddy 账号入池：账号对象持有 client，Credits/Checkin/Keepalive 由它
 	// 自己实现，池与调度器都不需要认识 upstream 包。
 	// 与 auths/ 目录对齐：新账号加入、已删除文件账号剔除（状态保留）。
@@ -183,31 +191,38 @@ func main() {
 
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
-	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
+	// 聊天 SSE 首字节前（响应头）上限：cbCfg 已 normalize（缺省回落 timeout_seconds）。
 	up.HeaderTimeout = time.Duration(cfg.Upstream.HeaderTimeoutSeconds) * time.Second
 	if tr, ok := up.ChatHTTP.Transport.(*http.Transport); ok {
 		tr.ResponseHeaderTimeout = up.HeaderTimeout
 	}
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
-	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
+	up.SanitizeFingerprints.Store(cbCfg.SanitizeBlacklistFingerprints)
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
 	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
-	up.UserAgent = cfg.Upstream.UserAgent
-	up.ClientVersion = cfg.Upstream.ClientVersion
-	up.CliVersion = cfg.Upstream.CliVersion
-	up.ClientName = cfg.Upstream.ClientName
-	up.DeviceToken = cfg.Upstream.DeviceToken
-	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
-	up.PassthroughIP = cfg.Upstream.PassthroughIP
-	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
-	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
-	up.GlobalEnabled = cfg.Global.Enabled
-	up.ChatBaseGlobal = cfg.Global.ChatBase
-	up.BillingBaseGlobal = cfg.Global.BillingBase
-	applyCNChatBase(up, cfg)
-	auth.SetGlobalEnabled(cfg.Global.Enabled)
+	up.UserAgent = cbCfg.UserAgent
+	up.ClientVersion = cbCfg.ClientVersion
+	up.CliVersion = cbCfg.CliVersion
+	up.ClientName = cbCfg.ClientName
+	up.DeviceToken = cbCfg.DeviceToken
+	up.DeviceTokenFile = cbCfg.DeviceTokenFile
+	up.PassthroughIP = cbCfg.PassthroughIP
+	// global realm 路由（codebuddy.json 的 global 段）：上游侧开关（第一道闸）
+	// + base 覆盖；auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同源。
+	up.GlobalEnabled = cbCfg.Global.Enabled
+	// 空 = 不覆盖，让 upstream client 用内置默认（global 默认 www.workbuddy.ai）。
+	if b := cbCfg.ChatBaseFor("global"); b != backendcb.DefaultChatBaseGlobal {
+		up.ChatBaseGlobal = b
+	}
+	if b := cbCfg.BillingBaseFor("global"); b != backendcb.DefaultChatBaseGlobal {
+		up.BillingBaseGlobal = b
+	}
+	if b := cbCfg.ChatBaseFor("cn"); b != backendcb.DefaultChatBaseCN {
+		up.ChatBaseCN = b
+	}
+	auth.SetGlobalEnabled(cbCfg.Global.Enabled)
 	// DNS：Android 没有 /etc/resolv.conf，Go 的纯 Go 解析器会退回 127.0.0.1/::1，
 	// 于是查任何域名都变成"连本机 53 端口"（dial tcp: lookup copilot.tencent.com
 	// on [::1]:53: connection refused）。配了 dns_servers / WB2A_DNS 就显式指定。
@@ -236,6 +251,7 @@ func main() {
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
 		ExpiringSoonWindow: cfg.ExpiringSoonDur,
 		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
+		CheckinBackends:    cfg.Schedule.CheckinBackends,
 		TravelDisabled:     !cfg.Schedule.TravelEnabled,
 		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
 		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
@@ -303,7 +319,7 @@ func main() {
 	live := livecfg.New(livecfg.Snapshot{
 		APIKey:               cfg.APIKey,
 		SoftCooldown:         cfg.SoftRateDur,
-		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
+		SanitizeFingerprints: cbCfg.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
 	})
@@ -335,6 +351,13 @@ func main() {
 	// 冷却表在 main 构造：面板与 handler 需共用同一实例（前者展示、后者读写）。
 	traeCfg := loadTraeConfig(*cfgPath, cfg.AuthDir)
 	traeClient := trae.NewClient()
+	// 传输层超时与 CodeBuddy 共用同一份配置（config.json 的 upstream 段）：
+	// 两个上游的对话都是 SSE 长连接，首字节与流中空闲的语义完全相同。
+	// 此前 Trae 的首字节超时是硬编码常量、流中空闲完全没有监控。
+	traeClient.SetTimeouts(
+		time.Duration(cfg.Upstream.HeaderTimeoutSeconds)*time.Second,
+		time.Duration(cfg.Upstream.IdleTimeoutSeconds)*time.Second,
+	)
 	// Trae 的账号对象要能读到**当前**配置（热重载后换 base / 改设备号）。
 	traeConfigFn := func() *trae.Config {
 		tcfg, err := trae.Load(trae.ConfigPath(*cfgPath), cfg.AuthDir)
@@ -380,6 +403,7 @@ func main() {
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
 		ConfigPath: *cfgPath,
 		// Trae 上游：配置 + 登录 + 设备凭证导入 + 冷却状态展示。
+		CodeBuddyPath: backendcb.Path(*cfgPath),
 		TraePath:      trae.ConfigPath(*cfgPath),
 		TraeClient:    traeClient,
 		TraeCooldowns: traeCool,
@@ -478,7 +502,7 @@ func main() {
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
-		GlobalEnabled: cfg.Global.Enabled,
+		GlobalEnabled: cbCfg.Global.Enabled,
 		// Trae 上游：同样独立，与 /v1/* 互不影响。
 		Trae:          traeCfg,
 		TraeClient:    traeClient,
@@ -603,6 +627,13 @@ func panelListenPath(listen string) string {
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
 func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+	// 上游专有字段已不在 config.json 里，但它们仍需参与"保存后热应用"：
+	// 从磁盘重新读一次 codebuddy.json。面板对上游配置的写入走
+	// /panel/api/codebuddy_config，这里只关心脱敏开关的热生效。
+	cbCfg, cbErr := backendcb.Load(backendcb.Path(path))
+	if cbErr != nil {
+		cbCfg = backendcb.Default()
+	}
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -665,11 +696,11 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
 		SoftCooldown:         newCfg.SoftRateDur,
-		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
+		SanitizeFingerprints: cbCfg.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 	})
-	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	up.SanitizeFingerprints.Store(cbCfg.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
@@ -693,16 +724,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 	sch.SetTravelBlindbox(newCfg.Schedule.TravelBlindboxEnabled, newCfg.Schedule.TravelBlindboxMaxPerRun)
+	sch.SetCheckinBackends(newCfg.Schedule.CheckinBackends) // 分上游自动签到开关热生效
 
 	return restartRequiredFields(newCfg), nil
-}
-
-// applyCNChatBase 把 config cn.chat_base 装配进上游 client；空则保留内置默认，
-// 老配置（无 cn 段）行为不变。
-func applyCNChatBase(up *upstream.Client, cfg *Config) {
-	if cfg.CN.ChatBase != "" {
-		up.ChatBaseCN = cfg.CN.ChatBase
-	}
 }
 
 // restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。
@@ -719,13 +743,11 @@ func restartRequiredFields(c *Config) []string {
 	if c.StateFile != "" {
 		out = append(out, "state_file")
 	}
+	// 传输层超时：装配期写进 HTTP client，之后不再读取。
 	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds")
-	// upstream.user_agent 在装配期被写进出站 client（main.go 的 up.UserAgent = ...），
-	// 之后不再读取——不在 livecfg 热快照里，也无法热改。此前漏列，导致面板改完
-	// 显示"已保存"却不提示需要重启，用户以为没生效（issue #102 附带发现 2）。
-	out = append(out, "upstream.user_agent")
-	// cn.chat_base 同样只在装配期写进 up.ChatBaseCN（请求路径并发读取，不做热改）。
-	out = append(out, "cn.chat_base")
+	// 注意 upstream.user_agent 与 cn/global.chat_base **不在这里**：
+	// 它们已迁到 codebuddy.json，由 /panel/api/codebuddy_config 负责提示重启。
+	// 列在这里会对一个 config.json 里不存在的字段报警，误导用户去改错地方。
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}

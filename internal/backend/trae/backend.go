@@ -25,9 +25,17 @@ func (b *Backend) Name() string { return Name }
 
 func (b *Backend) Aliases() []string { return nil }
 
+// Enabled 报告 Trae 上游是否参与调度。
+//
+// 与 WorkBuddy 平权：只要配置能读到（即 trae.json 存在）就启用，不再看
+// cfg.Enabled。理由：上游之间不应该有「谁是主、谁是可选」的等级差别——加了
+// 账号就该能用，这与 WorkBuddy 的行为一致。此前 Trae 需要用户在配置里显式
+// 打开，结果出现「账号已经加进来了却调不通」的常见困惑。
+//
+// cfg.Enabled 字段保留但不再参与本判定（见 traepkg.Config.Enabled 的注释），
+// 避免旧配置在升级后被静默停用。
 func (b *Backend) Enabled() bool {
-	cfg := b.config()
-	return cfg != nil && cfg.Enabled && b.Client != nil
+	return b.config() != nil && b.Client != nil
 }
 
 func (b *Backend) config() *traepkg.Config {

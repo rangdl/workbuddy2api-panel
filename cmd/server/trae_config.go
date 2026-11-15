@@ -36,9 +36,9 @@ func loadTraeConfig(configPath, authDir string) *trae.Config {
 		return nil
 	}
 	cfg.SaveAccount = saveTraeAccountFunc(cfg.AuthDir)
-	if cfg.Enabled {
-		cfg.LogSummary()
-	}
+	// 平权后不再看 cfg.Enabled：只要有 trae.json 就打印摘要，让运维一眼看到
+	// 实际生效的 base/版本（此前 enabled=false 时静默，容易被误读成"未加载"）。
+	cfg.LogSummary()
 	return cfg
 }
 
@@ -62,7 +62,7 @@ func saveTraeAccountFunc(dir string) func(*trae.Account) error {
 // 用它（会把另一个上游的账号当成"已删除"）。所以这里用 Add 逐个加入——
 // 状态保留由 pool.upsertLocked 保证，禁用态由 trae.json 的 Disabled 字段驱动。
 func syncTraeAccountsToPool(p *pool.Pool, cfg *trae.Config, client *trae.Client, configFn func() *trae.Config, stats *trae.Stats) int {
-	if p == nil || cfg == nil || !cfg.Enabled {
+	if p == nil || cfg == nil {
 		return 0
 	}
 	accs := backendtrae.Wrap(cfg, client)
@@ -86,7 +86,7 @@ func removeStaleTraeAccounts(p *pool.Pool, cfg *trae.Config, client *trae.Client
 		return
 	}
 	live := map[string]bool{}
-	if cfg != nil && cfg.Enabled {
+	if cfg != nil {
 		for _, a := range backendtrae.Wrap(cfg, client) {
 			live[a.UID()] = true
 		}

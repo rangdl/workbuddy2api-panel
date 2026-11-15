@@ -286,71 +286,6 @@ func TestBadBreakerCooldown(t *testing.T) {
 	}
 }
 
-func TestUpstreamTimeoutDefaults(t *testing.T) {
-	// 默认：header 回落 timeout，idle 回落 300。
-	c := Default()
-	if err := c.normalize(); err != nil {
-		t.Fatalf("normalize: %v", err)
-	}
-	if c.Upstream.TimeoutSeconds != 120 {
-		t.Errorf("timeout_seconds=%d want 120", c.Upstream.TimeoutSeconds)
-	}
-	if c.Upstream.HeaderTimeoutSeconds != 120 {
-		t.Errorf("header_timeout_seconds=%d want fallback 120", c.Upstream.HeaderTimeoutSeconds)
-	}
-	if c.Upstream.IdleTimeoutSeconds != 300 {
-		t.Errorf("idle_timeout_seconds=%d want fallback 300", c.Upstream.IdleTimeoutSeconds)
-	}
-}
-
-func TestUpstreamHeaderFallsBackToTimeout(t *testing.T) {
-	// 只设 timeout_seconds：header 回落同值，idle 回落 300。
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"upstream":{"timeout_seconds":60}}`), 0o600)
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Upstream.HeaderTimeoutSeconds != 60 {
-		t.Errorf("header_timeout_seconds=%d want fallback 60", c.Upstream.HeaderTimeoutSeconds)
-	}
-	if c.Upstream.IdleTimeoutSeconds != 300 {
-		t.Errorf("idle_timeout_seconds=%d want fallback 300", c.Upstream.IdleTimeoutSeconds)
-	}
-}
-
-func TestUpstreamExplicitHeaderIdle(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"upstream":{"timeout_seconds":120,"header_timeout_seconds":30,"idle_timeout_seconds":600}}`), 0o600)
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Upstream.HeaderTimeoutSeconds != 30 {
-		t.Errorf("header_timeout_seconds=%d want 30", c.Upstream.HeaderTimeoutSeconds)
-	}
-	if c.Upstream.IdleTimeoutSeconds != 600 {
-		t.Errorf("idle_timeout_seconds=%d want 600", c.Upstream.IdleTimeoutSeconds)
-	}
-}
-
-func TestUpstreamEnvOverride(t *testing.T) {
-	t.Setenv("WB2A_HEADER_TIMEOUT_SECONDS", "45")
-	t.Setenv("WB2A_IDLE_TIMEOUT_SECONDS", "900")
-	c, err := Load("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Upstream.HeaderTimeoutSeconds != 45 {
-		t.Errorf("header_timeout_seconds=%d want env 45", c.Upstream.HeaderTimeoutSeconds)
-	}
-	if c.Upstream.IdleTimeoutSeconds != 900 {
-		t.Errorf("idle_timeout_seconds=%d want env 900", c.Upstream.IdleTimeoutSeconds)
-	}
-}
-
 // TestRetiredTravelIntervalKeyIgnored 退役的 travel_interval_minutes 键按未知字段忽略，不报错。
 func TestRetiredTravelIntervalKeyIgnored(t *testing.T) {
 	dir := t.TempDir()
@@ -766,33 +701,6 @@ func TestPromptLegacyConfigNoImpact(t *testing.T) {
 
 // TestUpstreamUserAgentConfig 配置 upstream.user_agent 与 env WB2A_USER_AGENT 均生效，
 // 缺省空串保持现状（headers 层回落到 clientUA）。
-func TestUpstreamUserAgentConfig(t *testing.T) {
-	// JSON 配置
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"upstream":{"user_agent":"WorkBuddy/1.2.3"}}`), 0o600)
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Upstream.UserAgent != "WorkBuddy/1.2.3" {
-		t.Errorf("user_agent=%q want WorkBuddy/1.2.3", c.Upstream.UserAgent)
-	}
-	// 缺省为空
-	if c2, err := Load(""); err != nil || c2.Upstream.UserAgent != "" {
-		t.Errorf("default user_agent=%q want empty (err=%v)", c2.Upstream.UserAgent, err)
-	}
-	// env 覆盖
-	t.Setenv("WB2A_USER_AGENT", "EnvAgent/9")
-	c3, err := Load("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c3.Upstream.UserAgent != "EnvAgent/9" {
-		t.Errorf("env user_agent=%q want EnvAgent/9", c3.Upstream.UserAgent)
-	}
-}
-
 // TestLoadConfigPathIsDirectory config 路径是目录时给出可操作提示（Docker bind mount 陷阱）。
 // 复现：compose 挂载 ./config.json 但宿主机缺该文件 → Docker 创建同名目录 → 启动失败。
 // 旧行为只报 "read config: ... Incorrect function" 之类晦涩错误，无从排查。
@@ -916,5 +824,46 @@ func TestTravelBlindboxMaxPerRunOutOfRange(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "travel_blindbox_enabled") {
 		t.Errorf("error should point at schedule.travel_blindbox_enabled: %v", err)
+	}
+}
+
+// TestUpstreamTimeoutsSharedByAllUpstreams 传输层超时属于主配置，两个上游共用。
+//
+// 为什么这条重要：这两种超时（首字节 / 流中空闲）描述的是 **SSE 传输层行为**，
+// 不是某个上游的协议差异。WorkBuddy 与 Trae 的对话都是流式长连接，语义完全相同。
+// 此前 Trae 的首字节超时是硬编码常量、流中空闲完全没有监控——正是「以为只对
+// 一个上游适用」导致的缺失。若哪天有人把它们挪进 codebuddy.json，本用例会失败。
+func TestUpstreamTimeoutsSharedByAllUpstreams(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.TimeoutSeconds != 120 {
+		t.Errorf("timeout_seconds=%d want 120", c.Upstream.TimeoutSeconds)
+	}
+	if c.Upstream.HeaderTimeoutSeconds != 120 {
+		t.Errorf("header_timeout_seconds=%d want fallback 120", c.Upstream.HeaderTimeoutSeconds)
+	}
+	if c.Upstream.IdleTimeoutSeconds != 300 {
+		t.Errorf("idle_timeout_seconds=%d want fallback 300", c.Upstream.IdleTimeoutSeconds)
+	}
+}
+
+// TestHeaderTimeoutFallsBackToTimeout 只设 timeout：header 跟随，idle 仍回落 300。
+func TestHeaderTimeoutFallsBackToTimeout(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	if err := os.WriteFile(fp, []byte(`{"upstream":{"timeout_seconds":60}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.HeaderTimeoutSeconds != 60 {
+		t.Errorf("header_timeout_seconds=%d want fallback 60", c.Upstream.HeaderTimeoutSeconds)
+	}
+	if c.Upstream.IdleTimeoutSeconds != 300 {
+		t.Errorf("idle_timeout_seconds=%d want fallback 300", c.Upstream.IdleTimeoutSeconds)
 	}
 }

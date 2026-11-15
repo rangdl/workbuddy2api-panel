@@ -60,10 +60,21 @@ func ensureDefaultFile(path string, build func() any) bool {
 // 必须在迁移之后、各 load*Config 之前调用。
 func ensureAllConfigs(configPath string) {
 	dir := filepath.Dir(configPath)
+	// trae.json 只放上游协议常量与凭证策略；**没有 enabled 开关**（上游平权，
+	// 加了账号即启用），也没有 schedule（已统一到 config.json）。这里写空对象，
+	// 字段由代码兜底成内置默认值。
 	ensureDefaultFile(filepath.Join(dir, "trae.json"), func() any {
+		return map[string]any{}
+	})
+	// codebuddy.json 同理：只写「用户可能想改」的少量字段，其余由代码兜底。
+	//
+	// 刻意**不**把全部字段铺出来：自动生成的配置若列着一排 `"user_agent": ""`，
+	// 用户会以为那些是"待填项"而实际含义是"用内置默认"，反而制造困惑。
+	// 这里只写结构骨架（域维度）与最常调的超时。
+	ensureDefaultFile(filepath.Join(dir, "codebuddy.json"), func() any {
 		return map[string]any{
-			"enabled":  false,
-			"accounts": []any{},
+			"cn":     map[string]any{},
+			"global": map[string]any{"enabled": true},
 		}
 	})
 }
