@@ -42,10 +42,12 @@ SPEC.md
 # docs/ 进版本库：配置布局、弃用清单等运维文档需要跟代码一起演进
 # （早期这里排除整个目录，是为了避免把上游同步过程的工作文档带进来）
 
-# 设计/计划文档（但 README.md 与 docs/ 必须进版本库）
+# 设计/计划文档（但 README.md、docs/ 与 CLAUDE.md 必须进版本库）
 *.md
 !README.md
 !docs/**/*.md
+# CLAUDE.md 是架构约束的入口指针：每个新会话自动加载，必须与代码一起演进
+!CLAUDE.md
 
 # Windows binaries
 /wb2api.exe

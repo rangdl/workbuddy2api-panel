@@ -226,6 +226,10 @@ flowchart LR
 
 上游请求在出站前经历统一的改写管线（`internal/upstream/payload.go`）：强制 `stream:true`、`developer` 角色归一、tool_choice 归一、`image_url` 字符串兼容为 OpenAI 对象形态、DeepSeek 思维链注入、`reasoning_effort` 档位降级、`reasoning_content` 回填、指纹脱敏。
 
+> **改代码前请先读 [`docs/architecture.md`](docs/architecture.md)**：上图是概览，
+> 分层约束、依赖方向、「加一个新上游要改哪些文件」以及三处已知的分层例外都在那一页。
+> 代码与那页冲突时以那页为准。
+
 ## 快速开始
 
 ### 环境要求
