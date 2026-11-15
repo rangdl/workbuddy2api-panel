@@ -205,19 +205,15 @@ type Remain struct {
 	Raw map[string]any
 }
 
-// UsageLabeller 可选能力：账号在用量账本里应该记到哪个「域」。
+// 【已移除】UsageLabeller：曾经让账号自报「用量账本里记到哪个域」。
 //
-// 为什么需要：用量视图按域分组（cn / global），而某些上游的用量在业务上
-// 需要独立分账——Trae 的积分消耗与 CodeBuddy 的套餐额度是两套体系，混在
-// 一起会让「这个域花了多少」失去意义。默认记 Realm()，实现了本接口的账号
-// 可以改成自己的标签。
+// 删除原因不是"能力设计错了"，而是**它要回答的问题本身是错的**：用量账本里
+// 域和上游是两个正交维度，域由 Realm() 回答、上游由 Backend() 回答，两个都
+// 已有权威来源。再加一个自报标签，实际结果就是 Trae 把 "trae" 写进 realm，
+// 面板「按域」冒出 cn / global / trae 三行——上游被当成了与域同级的东西。
 //
-// 未实现 = 用 Realm()。这与 Freshener 同一模式：能力可选，池与 server
-// 都不判断上游名。
-type UsageLabeller interface {
-	// UsageLabel 用量账本里的分组标签（空 = 用 Realm()）。
-	UsageLabel() string
-}
+// 要按上游分账，用 usage 包的 Backend 维度（bucket.Backend /
+// Snapshot.ByBackend），不要另造一个往 realm 里塞非域值的通道。
 
 // RemainObserver 可选能力：账号想接收上游流内上报的剩余额度。
 //
@@ -241,19 +237,16 @@ type StreamLifecycle interface {
 	BeginStream() (finish func(ok bool))
 }
 
-// CreditEstimator 可选能力：上游没在 usage 里给实测扣费时，账号自己按
-// token 与倍率估算本次消耗。
+// 【已移除】CreditEstimator：曾经让账号按「token × 模型倍率」估算本次扣费。
 //
-// 为什么是能力而不是 server 里的公式：估算口径是**上游特有的**。
-// Trae 的 chat 流不含扣费字段（实测），只能按 token × 模型倍率推算，
-// 且缓存读/写的权重各不相同（见 internal/trae/credit_estimate.go）；
-// CodeBuddy 在 usage 里直接给 credit，根本不需要估算。
+// 删除原因：**倍率的单位被理解错了，估出来的值虚高约 1500 倍**。
+// Trae 的 consumption_rate（如 0.06）是**相对倍率**（与 IDE 模型选择器显示的
+// "x0.06" 同源），不是「每 token 多少积分」。把它乘 token 数没有语义依据，
+// 面板因此出现过「6 万积分/百万 token」这种比实际高三个数量级的数字。
 //
-// 未实现 = 不计估算（面板显示 "-"，而不是编一个数）。
-// 返回值 ok=false 表示无法估算（缺 token / 倍率未知）。
-type CreditEstimator interface {
-	EstimateCredits(u *Usage, rate float64) (credit float64, ok bool)
-}
+// 真实的积分消耗只有一种可靠口径：**上游余额差**（credithist 账本已按
+// Before→After 留痕）。没有观测就不该编数字——面板显示 "—" 是诚实的，
+// 一个凭假设系数算出来的值会污染所有基于它的判断（比如"哪个模型更划算"）。
 
 // Credits 归一后的余额视图。
 //

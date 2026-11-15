@@ -2,7 +2,15 @@
 <html lang="zh-CN" data-theme="dark">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- viewport：maximum-scale/user-scalable=no 禁止移动端「聚焦输入框自动放大」。
+     根因是 iOS Safari 在 input 的 font-size <16px 时会自动 zoom-in，且放大后不会
+     自动复位，表现为「点一下输入框整页被放大、横向拖动才看得全」。两条互补修法：
+     ① 这里禁止缩放（iOS 10+ 起对 user-scalable=no 仍尊重，但个别版本会忽略）；
+     ② mobile.css 把移动端输入框字号提到 16px（触发线以下即不放大），双保险。
+     不用 user-scalable=no 单独兜底的原因：它会让用户失去手动放大无障碍内容的
+     能力，只在输入框上做手段更克制——但 iOS 的自动 zoom 不读 touch-action，
+     故仍需 viewport 层声明。 -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>WorkBuddy2API · 控制台</title>
 <style>
 /* ── 设计令牌：明暗两套独立色板 ─────────────────────────────────────────
@@ -967,12 +975,24 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="box">
           <header><h3>服务</h3><span class="grow"></span><span class="note" id="cfgPath"></span></header>
           <div class="pad">
+            <!-- name 是面板自己读的键名，浏览器也会按它猜语义并自动填充：
+                 name="listen" 被当作地址栏/街道，name/type=password 被当作登录密码。
+                 实测 iPhone Safari 会把「监听地址」填成用户昵称、API 密钥填成
+                 已存密码；一旦手滑保存，config.json 的 listen 变成非地址串，
+                 下次启动直接失败（进程无法 bind）。
+                 双重防护：
+                 ① autocomplete="off"/"new-password"（new-password 是唯一能压住
+                    Safari 密码自动填充的值，off 对密码框无效）；
+                 ② autocorrect/autocapitalize/spellcheck 全关，避免输入法改写地址。
+                 注意不能改 name：那是 config.js 的提交键名。 -->
             <div class="grid2">
               <label class="fld"><span class="lb">监听地址</span>
-                <input name="listen" placeholder=":7863">
+                <input name="listen" placeholder=":7863" autocomplete="off" autocorrect="off"
+                       autocapitalize="off" spellcheck="false" inputmode="url">
                 <span class="hint">改动需重启进程</span></label>
               <label class="fld"><span class="lb">API 密钥</span>
-                <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 不鉴权">
+                <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 不鉴权"
+                     autocomplete="new-password" autocorrect="off" autocapitalize="off" spellcheck="false">
                 <button type="button" class="xs" id="btnEye">显示</button></div>
                 <span class="hint">立即生效（含面板自身）</span></label>
             </div>

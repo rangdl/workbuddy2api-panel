@@ -94,13 +94,27 @@ function usRow(name, sub, a, mid, withPerf, nameHtml) {
     '</tr>';
 }
 
-/* ── 用量明细：三个维度共用一张表 + 页内切换 ──────────────────────────
+/* ── 用量明细：多个维度共用一张表 + 页内切换 ──────────────────────────
    账号 / 模型 / 域三张表此前各自占一个 box，页面纵向拉得很长且表头结构几乎一样。
-   现在合成一个 box：表头由维度定义生成，行渲染复用 usRow，切换零请求。 */
+   现在合成一个 box：表头由维度定义生成，行渲染复用 usRow，切换零请求。
+
+   **「按域」与「按上游」是两个维度，不能合并。** 域是 cn / global（同一个域里
+   可能同时有 CodeBuddy 和 Trae），上游是 codebuddy / trae（同一个上游可能有
+   多个域）。历史上把上游名写进 realm，导致「按域」出现 cn / global / trae 三行，
+   那是把两个正交概念混成了同一个。
+   backendLabel 把上游名翻成展示名。映射表复用 accounts.js 里的 BACKEND_LABEL
+   （同一份表，两个页面不会各自漂移）。 */
+function backendLabel(b) {
+  const s = String(b || '').trim();
+  if (!s) return '—';
+  return BACKEND_LABEL[s] || s;
+}
+
 const US_DIMS = {
-  account: { key: 'by_account', title: '账号', withRealm: true, withPerf: true, span: 10 },
-  model: { key: 'by_model', title: '模型', withRealm: false, withPerf: false, span: 7 },
-  realm: { key: 'by_realm', title: 'realm', withRealm: false, withPerf: false, span: 7 },
+  account: { key: 'by_account', title: '账号', withBackend: true, withRealm: true, withPerf: true, span: 11 },
+  model: { key: 'by_model', title: '模型', withBackend: false, withRealm: false, withPerf: false, span: 7 },
+  realm: { key: 'by_realm', title: '域', withBackend: false, withRealm: false, withPerf: false, span: 7 },
+  backend: { key: 'by_backend', title: '上游', withBackend: false, withRealm: false, withPerf: false, span: 7 },
 };
 
 // usSortRows 按当前排序字段降序（默认合计 Token，最大者最相关）。
@@ -118,6 +132,7 @@ function usSortRows(rows, sort) {
 function usDimHead(dim) {
   const m = US_DIMS[dim] || US_DIMS.account;
   return '<tr><th class="mark" aria-hidden="true"></th><th>' + esc(m.title) + '</th>' +
+    (m.withBackend ? '<th>上游</th>' : '') +
     (m.withRealm ? '<th>域</th>' : '') +
     '<th class="num">请求</th><th class="num">失败</th>' +
     '<th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>' +
@@ -135,7 +150,7 @@ function usTabsHtml(dims, active, counts) {
   }).join('');
 }
 
-const US_DIM_TABS = [['account', '按账号'], ['model', '按模型'], ['realm', '按域']];
+const US_DIM_TABS = [['account', '按账号'], ['model', '按模型'], ['realm', '按域'], ['backend', '按上游']];
 
 function renderUsageDim() {
   const d = usageData || {};
@@ -145,15 +160,24 @@ function renderUsageDim() {
     account: (d.by_account || []).length,
     model: (d.by_model || []).length,
     realm: (d.by_realm || []).length,
+    backend: (d.by_backend || []).length,
   });
   $('usDimHead').innerHTML = usDimHead(usDim);
   $('usDimBody').innerHTML = rows.map(x => {
     const isAcct = usDim === 'account';
-    const key = isAcct ? String(x.key || '').slice(0, 8) : x.key;
+    // 域/上游维度的 Key 就是该维度值；上游要翻成展示名（trae → Trae）。
+    const key = isAcct ? String(x.key || '').slice(0, 8)
+      : (usDim === 'backend' ? backendLabel(x.key) : x.key);
+    // 账号维度的额外单元格：上游 + 域两列（顺序与表头一致）。
+    // 上游维度自身不再重复显示上游名，域同理。
+    const mid = isAcct
+      ? '<td class="num">' + esc(backendLabel(x.backend)) + '</td>' +
+        '<td class="num">' + esc(x.realm || '') + '</td>'
+      : '';
     return usRow(key,
       isAcct ? (x.extra || '') : '',
       x,
-      isAcct ? '<td class="num">' + esc(x.realm || '') + '</td>' : '',
+      mid,
       m.withPerf,
       isAcct ? remarkName(x.key, esc(key)) : '');
   }).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>';
@@ -205,9 +229,12 @@ function renderCreditDim() {
     $('usCreditBody').innerHTML = accounts.map(row => {
       const uid = String(row.key || '');
       const account = row.nickname || uid.slice(0, 8) || '—';
+      // 上游 + 域分两个标签展示（历史上这里只显示 realm，而 Trae 的 realm
+      // 被写成了 "trae"，于是看起来「上游就是域」）。
+      const tags = [backendLabel(row.backend), row.realm].filter(Boolean).map(esc).join(' · ');
       return '<tr>' +
         '<td class="mark" aria-hidden="true"></td>' +
-        '<td>' + remarkName(uid, esc(account)) + '<div class="note">' + esc(row.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>' +
+        '<td>' + remarkName(uid, esc(account)) + '<div class="note">' + tags + ' · ' + esc(uid.slice(0, 8)) + '</div></td>' +
         '<td class="num">' + fmtTok(row.requests) + '</td>' +
         '<td class="num">' + fmtCredit(row.credits) + '</td>' +
         '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
@@ -266,8 +293,11 @@ function renderUsage(d) {
   $('usNote').title = note; // 窄屏单行截断时靠悬停看全
 
   // 积分扣除的四张卡片与说明。
+  // 「扣除积分」只统计**上游实测**的 credit（CodeBuddy 在 usage 里直接给）。
+  // Trae 的 chat 流不含扣费字段，逐请求积分无从得知，故它的行显示 0/—，
+  // 而不是按 token × 倍率编一个数（那个做法曾虚高约 1500 倍，已废弃）。
   $('usCreditStats').innerHTML =
-    usKpi(fmtCredit(t.credits), '扣除积分', 'c-accent', '按上游 usage.credit 累计') +
+    usKpi(fmtCredit(t.credits), '扣除积分', 'c-accent', '仅上游实测 credit，不含估算') +
     usKpi(fmtTok(t.credit_tokens), '匹配 Token', 'c-mute', '与积分同时观测到的 Token') +
     usKpi(fmtCreditRatio(t.credits_per_1m_tokens, t.credit_samples, t.credit_tokens),
       '平均积分 / 1M Token', 'c-ok', '越低越划算') +

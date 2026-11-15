@@ -57,12 +57,9 @@ func (x Account) Credential() any {
 	return x.A
 }
 
-// UsageLabel 实现 gateway.UsageLabeller：Trae 的用量在账本里单独分组。
-//
-// 理由：Trae 的积分消耗与 CodeBuddy 的套餐额度是两套体系，混进同一个域会
-// 让「这个域花了多少」失去意义。标签固定 "trae" 而不是 Realm()——Trae 的
-// 域是 base 域名推出来的（cn/global），但用量分账要按上游分。
-func (x Account) UsageLabel() string { return Name }
+// 【已移除】UsageLabel：它曾把 "trae" 当作用量账本的「域」，导致面板
+// 「按域」出现 cn / global / trae 三行。上游身份由 Backend() 回答，
+// 用量账本已按 (backend, realm) 两个维度分别记账，不再需要自报标签。
 
 // ObserveRemain 实现 gateway.RemainObserver：接收 notify_usage 上报的两份积分。
 //
@@ -91,25 +88,14 @@ func (x Account) BeginStream() func(ok bool) {
 }
 
 // 编译期断言。
+//
+// 【已移除】CreditEstimator：按「token × 倍率」估算 Trae 扣费曾是这里的一部分，
+// 但 consumption_rate 是相对倍率（x0.06 那种），不是每 token 积分数，估出来
+// 虚高约 1500 倍。真实消耗只认上游余额差（credithist 账本），不再估算。
 var (
-	_ gateway.UsageLabeller   = Account{}
 	_ gateway.RemainObserver  = Account{}
 	_ gateway.StreamLifecycle = Account{}
-	_ gateway.CreditEstimator = Account{}
 )
-
-// EstimateCredits 实现 gateway.CreditEstimator：Trae 的 chat 流不含扣费字段
-// （实测），只能按 token × 模型倍率推算。
-//
-// 公式本体在 internal/trae/credit_estimate.go（缓存读/写的权重各不相同），
-// 这里只做适配。估算值不参与选号成本分层，只作面板的数量级参考。
-func (x Account) EstimateCredits(u *gateway.Usage, rate float64) (float64, bool) {
-	if u == nil || rate <= 0 {
-		return 0, false
-	}
-	return traepkg.EstimateCreditsFromUsage(
-		u.PromptTokens, u.CacheRead, u.CacheCreation, u.CompletionTokens, rate)
-}
 
 // Unwrap 取出原始账号。
 //

@@ -41,6 +41,13 @@ const (
 	excludeHardCooling exclusion = "hard-cooling"   // 余额耗尽冷却中（仅兜底口径区分）
 	excludeCreditFloor exclusion = "credit-floor"   // 积分保底：触底不接实测收费模型
 	excludeInFlight    exclusion = "in-flight-full" // 在途名额占满
+	// excludeNoModel 该上游的模型目录里没有这个模型。
+	//
+	// 这一条防的是**跨上游模型名串号**：CodeBuddy 的模型名（如 hy4free）与
+	// Trae 的完全不同，但两者账号的 realm 都可能是 "cn"。没有这道判断时，
+	// 一个裸名或 "cn:xxx" 请求会被派给 realm=cn 的 Trae 账号，打过去必然
+	// 「模型不存在」——日志里那条 trae 账号 + cn:hy4free 就是这么来的。
+	excludeNoModel exclusion = "no-model"
 )
 
 // ok 报告该原因是否表示「可用」。
@@ -95,6 +102,14 @@ func (p *Pool) gateLocked(e *entry, s gateSpec) exclusion {
 	} else if !p.healthyLocked(e, s.model, s.now) {
 		return excludeUnhealthy
 	}
+	// 该上游是否真的提供这个模型（防跨上游模型名串号，见 excludeNoModel）。
+	//
+	// 只在**缓存已有该上游目录**时才判：缓存冷/过期时宁可放行也不要误杀——
+	// 选号路径上不能让一次目录拉取失败变成「所有号都不可用」。这与错误路径上
+	// 的 gateway_hint 同一取舍（那里也是缓存冷就退中性提示）。
+	if s.model != "" && !p.backendServesModelLocked(e.acc.Backend(), s.model) {
+		return excludeNoModel
+	}
 	// 积分保底：model 为空时恒不拦（见 floorBlockedForRealmModel 顶部早返回）。
 	if p.floorBlockedForRealmModel(e, s.model, s.realm, s.now) {
 		return excludeCreditFloor
@@ -103,6 +118,45 @@ func (p *Pool) gateLocked(e *entry, s gateSpec) exclusion {
 		return excludeInFlight
 	}
 	return excludeNone
+}
+
+// backendServesModelLocked 报告某上游的**缓存目录**里是否有这个模型。
+//
+// 三态语义（关键，决定了它能否用于排除）：
+//   - 缓存里有该上游的目录且含此模型   → true；
+//   - 缓存里有该上游的目录但**不含**此模型 → false（该排除）；
+//   - 缓存里**没有**该上游的目录（冷/过期/该上游不支持目录） → true（放行）。
+//
+// 第三态必须放行：选号是每次请求都要走的热路径，不能因为一次目录拉取失败
+// 就让整池变成不可用。宁可让请求打到上游拿一个真实的「模型不存在」，也不要
+// 在网关侧凭空判死——前者可诊断，后者表现为「所有账号突然不可用」。
+//
+// 调用方必须已持有 p.mu（读锁即可）。catalogMu 是独立的锁，两级锁顺序固定为
+// p.mu → catalogMu（catalogCached 只在拉取时不持 p.mu，故不会反向）。
+func (p *Pool) backendServesModelLocked(backend, model string) bool {
+	if backend == "" || model == "" {
+		return true
+	}
+	now := p.now()
+	p.catalogMu.Lock()
+	defer p.catalogMu.Unlock()
+	seenAny := false
+	for g, e := range p.catalogCache {
+		if g.backend != backend || len(e.models) == 0 {
+			continue
+		}
+		if now.Sub(e.fetched) >= catalogTTL {
+			continue // 过期目录不作为判据
+		}
+		seenAny = true
+		for _, m := range e.models {
+			if m.ID == model {
+				return true
+			}
+		}
+	}
+	// 没有任何新鲜目录 → 无判据，放行。
+	return !seenAny
 }
 
 // healthyLocked 健康口径：model 非空用模型级判定（6004 冷却对其它模型豁免），

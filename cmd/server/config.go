@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -585,6 +586,27 @@ func (c *Config) normalize() error {
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
+	}
+	// listen 合法性：这行必须挡住**面板误填**。
+	//
+	// 背景：配置页的「监听地址」输入框会被浏览器自动填充（Safari 把用户昵称/
+	// 地址塞进 name="listen" 的框）。用户手滑保存后，config.json 里是一个非地址
+	// 字符串，进程下次启动直接 bind 失败、再也起不来——而面板此时也打不开，
+	// 只能手工改文件。前端已加 autocomplete 抑制（见 index.html），但那是
+	// 尽力而为（不同浏览器行为不一），落盘前的校验才是确定性防线。
+	//
+	// 用 net.SplitHostPort 而不是自己拼规则：它同时覆盖 ":7863"、
+	// "127.0.0.1:7863"、"[::1]:7863" 三种合法形态。
+	//
+	// 但它**不校验端口是不是数字**（":abc" 也能过），而 net.Listen 会因此失败，
+	// 所以端口单独再查一次：必须是 0~65535 的十进制整数。
+	_, port, err := net.SplitHostPort(c.Listen)
+	if err != nil {
+		return fmt.Errorf("listen 不是合法的监听地址（应为 :端口 或 主机:端口）：%q", c.Listen)
+	}
+	portNum, err := strconv.Atoi(port)
+	if err != nil || portNum < 0 || portNum > 65535 {
+		return fmt.Errorf("listen 的端口必须是 0~65535 的整数：%q", c.Listen)
 	}
 	// 空数组与 null 反序列化后覆盖掉 Default() 的排程值（键缺席才保留），在此补齐。
 	// 空 = 未配置 → 回落默认；「禁用」一律走 *_enabled=false，两者互不混淆。

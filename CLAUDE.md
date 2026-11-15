@@ -14,8 +14,22 @@
 - **`gateway` 零 internal 依赖。** 加新抽象放这里，加具体实现放 `backend/*`。
 - **流内错误由 backend 填 `StreamStats.Decision`。** server 侧不再按上游名
   分流分类器；缺 `Decision` 会 WARN 且不罚号（契约违约要可观测）。
-- **上游专属的观测也走可选能力**：`StreamLifecycle` / `RemainObserver` /
-  `UsageLabeller` / `CreditEstimator`，不要写成 `if acc.Backend() == ...`。
+- **上游专属的观测也走可选能力**：`StreamLifecycle` / `RemainObserver`，
+  不要写成 `if acc.Backend() == ...`。
+- **「上游」和「域」是两个正交维度，绝不可合并。** 域是 `cn` / `global`
+  （同一域里可能同时有 CodeBuddy 和 Trae），上游是 `codebuddy` / `trae`
+  （同一上游可能有多个域）。上游身份一律由 `acc.Backend()` 回答、域由
+  `acc.Realm()` 回答——**不要另造一个"标签"往 realm 里塞**（历史上的
+  `UsageLabeller` 就是这么把 `"trae"` 写进 realm，让面板「按域」冒出
+  cn/global/trae 三行）。用量账本按 `(backend, realm)` 分别记账。
+- **积分只认实测，绝不按 token 推算。** Trae 的 `consumption_rate`（如 0.06）
+  是**相对倍率**（IDE 里显示的 `x0.06`），不是「每 token 多少积分」；拿它乘
+  token 数会虚高约 1500 倍。真实的逐请求扣费只有两种来源：上游在 usage 里
+  直接给的 credit，或余额差（`credithist` 账本）。两者都没有就显示 "—"。
+- **选号要校验「该上游真的有这个模型」**（`pool/gate.go` 的 `excludeNoModel`）。
+  模型名按上游隔离，但 Trae 与 CodeBuddy 的账号 realm 都可能是 `cn`，不校验
+  就会把 `cn:hy4free` 派给 Trae 账号打回「模型不存在」。判据读池里的目录缓存，
+  **缓存冷时放行**——不能因一次目录拉取失败让整池不可用。
 - **能用性判据只在 `pool/gate.go` 的 `gateLocked` 组合一次。**
   新增选号入口必须调它，不要自己拼条件。
 - **模型目录是上游级数据**（每上游挑一个号拉一次），

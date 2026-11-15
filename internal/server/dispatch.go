@@ -457,29 +457,23 @@ func (h *Handler) recordBackendUsage(acc gateway.Account, model, modelRate strin
 			st.hasCache = true
 		}
 	}
-	// 实测扣费优先：上游在 usage 里直接给了 credit（CodeBuddy）。
+	// 积分：**只认真实观测，绝不按 token 推算。**
+	//
+	// 这里曾经用 gateway.CreditEstimator 拿「模型积分倍率 × token 数」估算 Trae 的
+	// 扣费，结果是虚高约 1500 倍（面板出现 6 万积分/百万 token 这种数字）。根因是
+	// **倍率的单位被理解错了**：Trae 的 consumption_rate（如 0.06）是相对倍率、
+	// 与 IDE 模型选择器里的 "x0.06" 同源，不是「每 token 多少积分」。它乘 token 数
+	// 没有语义依据。参考实现（dsh）也从不这么算——真实扣费一律读上游余额差。
+	//
+	// 所以现在只认两条实测来源：
+	//   ① 上游在 usage 里直接给 credit（CodeBuddy）；
+	//   ② 流内 Remain.Consumed（上游明确上报的本次消耗）。
+	// Trae 的 chat 流两者都没有，于是它的逐请求积分空着——这是**诚实**的：
+	// 没有观测就不编数字。Trae 的真实消耗由积分历史账本的余额差给出。
 	if res.Usage != nil && res.Usage.HasCredit {
 		st.credit = res.Usage.Credit
 		st.hasCredit = true
 		st.creditEstimated = false
-	}
-	// 积分估算：上游没在 usage 里给实测扣费时，由账号自己按 token × 倍率
-	// 推算（gateway.CreditEstimator）。估算口径是上游特有的——Trae 的 chat 流
-	// 不含扣费字段，CodeBuddy 在 usage 里直接给 credit——所以公式留在 backend。
-	// 标成估算：它不参与选号成本分层，只作数量级参考。
-	if res.Usage != nil && !st.hasCredit {
-		if est, ok := acc.(gateway.CreditEstimator); ok {
-			if rate, hasRate := h.modelRateFor(context.Background(), acc, model); hasRate {
-				if credit, ok2 := est.EstimateCredits(res.Usage, rate); ok2 {
-					log.Printf("[server] 积分估算 acct=%s model=%s rate=%v prompt=%d cacheRead=%d cacheWrite=%d completion=%d → %.4f",
-						acc.UID(), model, rate, res.Usage.PromptTokens, res.Usage.CacheRead,
-						res.Usage.CacheCreation, res.Usage.CompletionTokens, credit)
-					st.credit = credit
-					st.hasCredit = true
-					st.creditEstimated = true
-				}
-			}
-		}
 	}
 	// 余额：notify_usage 是 Trae 唯一能在流内拿到的额度口径。
 	if res.Remain != nil {
@@ -553,21 +547,21 @@ func (h *Handler) recordBackendAccounting(acc gateway.Account, model, modelRate 
 	}
 	h.cfg.Pool.RecordTokenUsage(uid, delta)
 
-	// 用量时序（面板「用量」视图按 realm 分组）。Trae 用独立 realm 便于分账。
+	// 用量时序（面板「用量」视图）。
+	//
+	// **域和上游是两个正交维度，分别记账**：
+	//   - realm 只放真实域（cn / global），来自 acc.Realm()；
+	//   - backend 放上游名（codebuddy / trae），来自 acc.Backend()。
+	//
+	// 历史缺陷：曾经让 Trae 通过 gateway.UsageLabeller 把 "trae" 写进 realm，
+	// 于是面板「按域」出现 cn / global / trae 三行——把上游当成了与域同级的维度。
+	// 那个可选能力已经删除：上游本来就该由 acc.Backend() 回答，不该另设标签。
 	if h.cfg.Usage != nil {
 		realm := acc.Realm()
 		if realm == "" {
 			realm = "cn"
 		}
-		// 分账标签由账号自己决定（gateway.UsageLabeller）：Trae 的积分消耗
-		// 与 CodeBuddy 的套餐额度是两套体系，混在一个域会让「这个域花了多少」
-		// 失去意义。未实现该接口的上游用 Realm()。
-		if lb, ok := acc.(gateway.UsageLabeller); ok {
-			if label := lb.UsageLabel(); label != "" {
-				realm = label
-			}
-		}
-		h.cfg.Usage.Add(time.Now(), realm, uid, model, usage.Delta{
+		h.cfg.Usage.Add(time.Now(), acc.Backend(), realm, uid, model, usage.Delta{
 			PromptTokens:     delta.PromptTokens,
 			HasPromptTokens:  delta.HasPromptTokens,
 			CompletionTokens: delta.CompletionTokens,
@@ -620,6 +614,10 @@ func (h *Handler) modelRateFor(ctx context.Context, acc gateway.Account, model s
 //
 // 账号想接收这份数据就实现 gateway.RemainObserver（Trae 用它展示 IDE/Work
 // 两份积分）。dispatch 不判断上游名——未实现的账号直接跳过。
+//
+// 这里**不计算扣费**。逐请求的「这次扣了多少」需要余额差，而余额差的权威来源
+// 是 credithist 账本（它对每次余额观测留痕，本身就是 Before→After 的流水）。
+// 在 handler 里再存一份 lastRemain 会造成两个余额基线，刷新路径一多必然漂移。
 func (h *Handler) noteBackendRemain(acc gateway.Account, r *gateway.Remain) {
 	if acc == nil || r == nil {
 		return

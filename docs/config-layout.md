@@ -101,6 +101,17 @@ auths/                         账号凭证（每账号一文件，权限 0600�
 `docs/architecture.md` 的「域隔离失效」历史事故）。Trae 目前只有 `cn`，
 将来加 global 只加一段、不改结构。
 
+**域与上游是两个正交维度**，不能合并成一个字段：同一个 `cn` 域里可能同时有
+CodeBuddy 和 Trae 的账号；同一个上游也可能有多个域。所以：
+
+- 配置文件里按上游分文件（`codebuddy.json` / `trae.json`），文件内再按域分段；
+- 数据展示（用量、积分历史）必须**分开两列**，各自聚合。
+
+> 曾经的缺陷：用量账本把上游名写进了 realm 字段，面板「按域」出现
+> `cn` / `global` / `trae` 三行——上游被当成了与域同级的东西。现在账本按
+> `(backend, realm)` 两个维度分别记，旧数据在加载时自动迁移（把 `trae`
+> 搬回 backend、realm 归位到 `cn`）。
+
 **但传输层参数不按域拆**：`timeout_seconds` / `header_timeout_seconds` /
 `idle_timeout_seconds` 是 HTTP client 的属性，所有上游、所有域共用一份。
 按域各配一份会诱使人以为能给不同域设不同超时，实则要维护两套 transport，

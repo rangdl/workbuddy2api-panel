@@ -122,8 +122,19 @@ server 侧只剩一个 `applyStreamError`，统一走 `applyFailure`；缺 `Deci
 
 原先 `server/dispatch.go` 有三处 `acc.Backend() == "trae"`：在途计数、
 余额上报、用量分组。它们不是处置逻辑，但同样把上游名硬编码进了 server。
-现改为账号可选能力：`StreamLifecycle` / `RemainObserver` / `UsageLabeller` /
-`CreditEstimator`，由 Trae 的账号自己实现（统计实例经 `SetStats` 装配注入）。
+现改为账号可选能力：`StreamLifecycle` / `RemainObserver`，由 Trae 的账号
+自己实现（统计实例经 `SetStats` 装配注入）。
+
+其中两处后来被**删除**，因为把它们做成"能力"本身就是错的：
+
+- **`UsageLabeller`**（用量记到哪个域）：域和上游是两个正交维度，分别由
+  `Realm()` / `Backend()` 回答，两个都已有权威来源。再让账号自报一个标签，
+  实际结果就是 Trae 把 `"trae"` 写进 realm，面板「按域」冒出 cn/global/trae
+  三行。现在用量账本按 `(backend, realm)` 分别记账（`usage.bucket.Backend`）。
+- **`CreditEstimator`**（按 token × 倍率估算扣费）：倍率 `consumption_rate`
+  是**相对倍率**（IDE 显示的 `x0.06`），不是每 token 积分数。乘 token 数没有
+  语义依据，实测虚高约 1500 倍。真实扣费只认上游实测 credit 或余额差；
+  没有观测就显示 "—"，不编数字。
 
 **仍然保留的一处**：`server/handler.go:410` 的 `catalogPrefix` 用
 `backend == "trae"` 决定模型 ID 前缀是三段式还是两段式。这是**面向客户端的
@@ -141,7 +152,7 @@ server 侧只剩一个 `applyStreamError`，统一走 `applyFailure`；缺 `Deci
 | 文件 | 内容 |
 |---|---|
 | `account.go` | `Account`（身份 + 三项必备能力）、`QualifiedUID`、`CredentialUnwrapper` |
-| `backend.go` | `Backend`（装载/转换/发送/回程）、`Inbound`、`Outbound`、`StreamStats`（含 `Decision`）、`Usage`、`Credits`、`CheckinResult`，以及观测类可选能力 `StreamLifecycle` / `RemainObserver` / `UsageLabeller` / `CreditEstimator` |
+| `backend.go` | `Backend`（装载/转换/发送/回程）、`Inbound`、`Outbound`、`StreamStats`（含 `Decision`）、`Usage`、`Credits`、`CheckinResult`，以及观测类可选能力 `StreamLifecycle` / `RemainObserver`（`UsageLabeller` / `CreditEstimator` 已移除，原因见上方第 ④ 条） |
 | `capability.go` | 可选特色能力：`Traveler` / `Blindboxer` / `StreakRunner` / `BlackcatRunner` / `Compensator` / `ActivityReporter` / `Freshener` |
 | `catalog.go` | `CatalogModel` / `Cataloger` / `ModelRate` |
 | `decision.go` | `Decision` / `Action` / `Policy` / `Failure` / 控制流哨兵错误 |
