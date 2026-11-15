@@ -40,14 +40,14 @@ HTTP 接口（server）
          │                      │                         │
    internal/pool          internal/backend/*        internal/server
          │                      │                         │
-         │                      └── codebuddy → internal/{auth,upstream,logfmt}
-         │                          trae      → internal/trae
+         │                      ├── codebuddy → internal/{auth,upstream,logfmt}
+         │                      └── trae      → internal/trae
          │
-         ├── internal/auth      （见下方「已知例外 ①」）
          └── internal/logfmt
 
    internal/scheduler ──▶ pool, gateway, upstream, logfmt
-   internal/panel     ──▶ pool, gateway, auth, backend/*, upstream, trae, …
+   internal/panel     ──▶ pool, gateway, auth, upstream, trae, …
+                          （不 import backend/*：包装与凭证访问经装配期注入）
    cmd/server         ──▶ 以上全部（唯一的装配点）
 ```
 
@@ -73,32 +73,62 @@ HTTP 接口（server）
 
 ### 已知例外（真实存在，不要当成范本照抄）
 
-这三处是历史遗留，**新增代码不要扩大它们**：
+原来有三处违反上述依赖方向的历史遗留，**其中两处已在 2026-11-15 修掉**。
+保留这段记录是因为它们的成因有代表性，将来别再用同样的方式绕。
 
-**① `pool` 依赖 `internal/auth`，并残留两处 CodeBuddy 名判断**
-`pool/adapter.go` 的 `authAdapter` 把 `*auth.Auth` 适配成 `gateway.Account`；
-`pool/state.go` 的 `AuthByUID` 返回 `*auth.Auth`；`pool/persist.go:142,314` 用
-`BackendCodeBuddy` 判定「落盘键是裸 uid 还是 `backend:uid`」（旧 `state.json`
-向后兼容所需，不能简单删掉）。
-理由写在 `adapter.go:12`：反过来在 `auth` 上加方法会让 `auth` 反向依赖 `gateway`。
-代价是 `pool` 事实上认识 CodeBuddy 的凭证类型与名字。**新上游的占位账号走
-`SetPlaceholderFactory` 注入**（`p.placeholder`），不要往 `pool` 里再加一个上游的 import。
-落盘键的兼容逻辑若要清理，需要一次显式的 state 迁移，不应顺手改。
+**① `pool` 依赖 `internal/auth` —— 已修（commit 待补）**
 
-**② `server` 直连 `backend/trae` 的分类器**
-`server/dispatch.go:425` 用 `acc.Backend() == "trae"` 分流流内错误分类，
-`dispatch.go:443` 调 `backendtrae.Decide`。
-这是 `gateway.Failure` 抽象**没有覆盖流内错误**留下的缺口：`StreamStats` 带
-`ErrorCode/ErrorMsg`，但没带「已分类的 Decision」。正确方向是把流内错误也归一成
-`gateway.Decision` 由 backend 填（`Outbound.Convert` 已有 `StreamStats`，加一个
-`Decision` 字段即可），而不是在 `server` 里按上游名分支。
-**当前状态：已记录，未修。加第三个上游时这条分支会变成 N 条。**
+原状：`pool/adapter.go` 的 `authAdapter` 直接持有 `*auth.Auth`，
+`pool/state.go` 的 `AuthByUID` 返回 `*auth.Auth`，`UnwrapAuth`/`WrapAuth` 也在这里。
+结果是池事实上认识 CodeBuddy 的凭证类型。
 
-**③ `server` 与 `panel` 直连 `backend/codebuddy`**
-`server/backends.go` 需要构造带降级 `RetryHook` 的 CodeBuddy backend（降级状态机
-和提示词属于网关策略，不能放进 backend 包）；`panel/account_pool.go` 用
-`backendcb.WrapWithClient` 包装新导入的账号。
-这两处是「装配职责错位」——本应属于 `cmd/server`，但 `server` 的兼容垫片需要它们。
+修法：
+- `pool/adapter.go` 拆成 `pool/bare.go`（上游无关的 `bareAccount` + 占位工厂）
+- CodeBuddy 的适配器搬到 `backend/codebuddy/placeholder.go`
+- `pool.AuthByUID` 删除，需要凭证的调用方改走 `codebuddy.UnwrapAuth(acc)`
+- `cmd/server` 用 `SetPlaceholderFactory` 注入占位账号（必须在 `RestoreFromSnapshot` 之前）
+- 池的测试经 `pool/shim_test.go`（仅测试构建）重导出 `WrapAuth`，241 处调用点无需改动
+
+验证：`go list -f '{{join .Imports "\n"}}' ./internal/pool | grep internal/auth` 为空。
+
+**残留**：`pool/bare.go` 里还定义着 `BackendCodeBuddy` 常量，`persist.go:142,314`
+用它判定「落盘键是裸 uid 还是 `backend:uid`」。这是 `state.json` 的**数据格式**
+向后兼容（旧文件的键属于 CodeBuddy），不是上游逻辑分支——池不认识 CodeBuddy 的
+任何能力，只认识这个键名。要清理需要一次显式的 state 迁移，不应顺手改。
+
+**② `server` 按上游名分流流内错误 —— 已修（commit 待补）**
+
+原状：`applyStreamError` 用 `acc.Backend() == "trae"` 分到两套分类器
+（`applyTraeStreamError` / CodeBuddy 的 `applyErrorPolicy`），加第三个上游
+就要加第三个分支。根因是 `StreamStats` 只带 `ErrorCode/ErrorMsg`，没带
+「已分类的 Decision」。
+
+修法：`StreamStats` 增加 `Decision *Decision` 字段，**由 backend 在 `Convert`
+里填**（CodeBuddy 按 error 帧原文分类，Trae 按事件流业务码分类）。
+server 侧只剩一个 `applyStreamError`，统一走 `applyFailure`；缺 `Decision`
+时打 WARN 且不罚号（契约违约要可观测，但不能凭猜测罚号）。
+
+**③ `server`/`panel` 直连具体 backend —— 部分已修**
+
+- `panel` → `backend/*`：**已消除**。改为装配期注入三个闭包
+  （`WrapAccount` / `CredentialFor` / `TraeCredential`），见 `panel.Config`。
+- `server` → `backend/codebuddy`：**仍然存在，且是合理的**。
+  `server/backends.go` 要构造带降级 `RetryHook` 的 CodeBuddy backend——降级状态机
+  与提示词属于网关策略，不能放进 backend 包。这是「网关策略需要注入到 backend」，
+  不是「server 认识上游协议」。
+- `server` → `backend/trae`：**已消除**（随 ② 一起）。
+
+**④ `server` 里的上游专属观测 —— 已改为可选能力**
+
+原先 `server/dispatch.go` 有三处 `acc.Backend() == "trae"`：在途计数、
+余额上报、用量分组。它们不是处置逻辑，但同样把上游名硬编码进了 server。
+现改为账号可选能力：`StreamLifecycle` / `RemainObserver` / `UsageLabeller` /
+`CreditEstimator`，由 Trae 的账号自己实现（统计实例经 `SetStats` 装配注入）。
+
+**仍然保留的一处**：`server/handler.go:410` 的 `catalogPrefix` 用
+`backend == "trae"` 决定模型 ID 前缀是三段式还是两段式。这是**面向客户端的
+路由协议**（`trae:cn:x` vs `cn:x`），格式由消费方契约决定，不是上游协议差异，
+放在 server 里是合适的。
 
 ---
 
@@ -111,7 +141,7 @@ HTTP 接口（server）
 | 文件 | 内容 |
 |---|---|
 | `account.go` | `Account`（身份 + 三项必备能力）、`QualifiedUID`、`CredentialUnwrapper` |
-| `backend.go` | `Backend`（装载/转换/发送/回程）、`Inbound`、`Outbound`、`StreamStats`、`Usage`、`Credits`、`CheckinResult` |
+| `backend.go` | `Backend`（装载/转换/发送/回程）、`Inbound`、`Outbound`、`StreamStats`（含 `Decision`）、`Usage`、`Credits`、`CheckinResult`，以及观测类可选能力 `StreamLifecycle` / `RemainObserver` / `UsageLabeller` / `CreditEstimator` |
 | `capability.go` | 可选特色能力：`Traveler` / `Blindboxer` / `StreakRunner` / `BlackcatRunner` / `Compensator` / `ActivityReporter` / `Freshener` |
 | `catalog.go` | `CatalogModel` / `Cataloger` / `ModelRate` |
 | `decision.go` | `Decision` / `Action` / `Policy` / `Failure` / 控制流哨兵错误 |
@@ -232,18 +262,23 @@ POST /v1/chat/completions
        ├─ 选号：粘性号优先（PickByUIDForBackend），否则 PickForBackend
        │        跨域回退（裸名 + 配置开启时）
        ├─ dispatchViaBackend(acc, ...)
+       │    ├─ beginStreamStat(acc)          ← StreamLifecycle 可选能力（在途计数）
        │    ├─ Acquire 在途租约
        │    ├─ Freshener 预刷新（可选能力）
        │    ├─ be := backendFor(acc)         ← 注册表按 acc.Backend() 反查
        │    ├─ be.Chat(ctx, acc, in)         ← Inbound.Raw 只读
        │    │    └─ 失败 → *gateway.Failure（已带 Decision，调用方不二次分类）
        │    ├─ out.Convert(emit)             ← 各上游自己的 SSE 规范化
+       │    │    └─ 流内错误 → StreamStats.Decision（**由 backend 填**）
        │    └─ Release 租约
        │
        └─ 按 Decision：
             ├─ Rotate=false → backendStop（换号无意义，例如请求体畸形）
             └─ Rotate=true  → backendRetry（applyFailure 处置账号后继续）
 ```
+
+HTTP 层失败与流内错误走**同一个** `applyFailure`：两者都产出 `gateway.Decision`，
+server 不需要知道错误来自哪一层、哪个上游。
 
 **`Inbound` 字段的责任划分**（`backend.go` 有逐字段注释）：
 - 公共：`Raw` / `Ref` / `Stream` / `ClientIP` / `SessionKey` / `ChatID`
@@ -321,26 +356,44 @@ global 1 小时 / Trae 30 分钟），三份 TTL 不同，于是「面板显示�
 按顺序，**pool 与 scheduler 原则上零改动**：
 
 1. `internal/backend/<name>/` 新建包：
-   - `backend.go` 实现 `gateway.Backend`（`Name` / `Aliases` / `Enabled` / `Chat` / `RetryHook`）
+   - `backend.go` 实现 `gateway.Backend`（`Name` / `Aliases` / `Enabled` / `Chat` / `RetryHook`）；
+     `Convert` 里遇到流内错误必须填 `StreamStats.Decision`
    - `account.go` 实现 `gateway.Account`；有特色能力就实现对应可选接口
    - `decision.go` 实现错误分类，**每个 Decision 标 `Policy`**
    - `catalog.go` 实现 `Cataloger` / `ModelRate`（如果上游能列模型）
-2. `cmd/server/main.go`：构造 backend、`backends.Register(...)`、把账号 `p.SyncToDir` 或 `p.Add` 入池
+   - `placeholder.go` 提供 `Placeholder(uid)`（池从 state.json 恢复时用）
+2. `cmd/server/main.go`：
+   - 构造 backend、`backends.Register(...)`
+   - 把账号 `p.SyncToDir` 或 `p.Add` 入池
+   - **在 `RestoreFromSnapshot` 之前**调 `SetPlaceholderFactory`，让新上游的占位账号可构造
+   - 若面板要展示该上游的统计，装配期把统计实例注入账号（`SetStats` 之类），
+     不要往 `server`/`panel` 里加 `if backend == "<新上游>"`
 3. 配置：`trae.json` 这类独立配置文件（含开关、排程、base URL）
 4. 文档：本页「已知例外」若有变化，同步更新
 
 **不需要改的**：`pool/gate.go` 的判据、`pool/capabilities.go` 的批量调度、
-`scheduler/*`、`server` 的轮转循环。
+`scheduler/*`、`server` 的轮转循环、`panel/*`。
 
 ### 新上游的检查清单
 
-- [ ] `gateway` 零 internal 依赖未被破坏（`go list -deps internal/gateway` 里无 internal 包）
-- [ ] `pool` 里没有新增对 `backend/*` 的 import
-- [ ] `pool` 里没有新增 `acc.Backend() == "<新上游>"` 分支
+```bash
+# 全部应输出 0（最后一条是 server 的合理依赖，见「已知例外③」）
+go list -deps ./internal/gateway | grep -c 'workbuddy2api-panel/internal/'
+go list -f '{{join .Imports "\n"}}' ./internal/pool      | grep -c 'internal/auth'
+go list -f '{{join .Imports "\n"}}' ./internal/pool      | grep -c 'internal/backend'
+go list -f '{{join .Imports "\n"}}' ./internal/panel     | grep -c 'internal/backend'
+go list -f '{{join .Imports "\n"}}' ./internal/scheduler | grep -c 'internal/backend'
+```
+
+- [ ] 上面五条依赖断言仍成立
+- [ ] `pool`/`server`/`scheduler`/`panel` 里没有新增 `acc.Backend() == "<新上游>"`
 - [ ] `Chat` 不改写 `in.Raw`
 - [ ] 每个 `Decision` 都标了 `Policy`
+- [ ] `Convert` 在流内错误时填了 `StreamStats.Decision`
 - [ ] 占位账号经 `SetPlaceholderFactory` 注入（不是在 `pool` 里加 import）
 - [ ] `Realm()` 返回非空（缺省 `"cn"`）
+- [ ] 上游专属观测（在途/余额/用量分组/积分估算）走可选能力接口，
+      没有在 `server` 里加分支
 
 ---
 

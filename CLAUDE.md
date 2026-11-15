@@ -3,15 +3,20 @@
 **架构约束必读：[`docs/architecture.md`](docs/architecture.md)**
 
 改动本项目前先读那一页。它规定了依赖方向、分层职责、可选能力的扩展流程，
-以及三处已知的分层例外。代码与那页冲突时以那页为准。
+以及历史上那几处分层例外的成因与修法（避免再用同样的方式绕）。
+代码与那页冲突时以那页为准。
 
 ## 最容易漂移的几条（摘要，完整内容见 architecture.md）
 
 - **池认识能力，不认识上游。** `internal/pool` 里不许出现
-  `acc.Backend() == "trae"` 这类分支、不许 import `backend/*`。
+  `acc.Backend() == "trae"` 这类分支、不许 import `backend/*` 或 `internal/auth`。
   判断「能不能做某事」用类型断言到 `gateway` 的可选接口。
 - **`gateway` 零 internal 依赖。** 加新抽象放这里，加具体实现放 `backend/*`。
-- **可用性判据只在 `pool/gate.go` 的 `gateLocked` 组合一次。**
+- **流内错误由 backend 填 `StreamStats.Decision`。** server 侧不再按上游名
+  分流分类器；缺 `Decision` 会 WARN 且不罚号（契约违约要可观测）。
+- **上游专属的观测也走可选能力**：`StreamLifecycle` / `RemainObserver` /
+  `UsageLabeller` / `CreditEstimator`，不要写成 `if acc.Backend() == ...`。
+- **能用性判据只在 `pool/gate.go` 的 `gateLocked` 组合一次。**
   新增选号入口必须调它，不要自己拼条件。
 - **模型目录是上游级数据**（每上游挑一个号拉一次），
   **特色能力是账号级数据**（逐号执行）。两者的缓存与失败语义相反。
