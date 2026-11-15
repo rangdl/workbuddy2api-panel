@@ -28,30 +28,86 @@ auths/                         账号凭证（每账号一文件，权限 0600�
 
 ## 上游配置按文件分离
 
-**每个上游的独特配置各占一个 JSON 文件**，`config.json` 只放与上游无关的东西
-（监听、密钥、账号池策略、排程）。
+**每个上游的独特配置各占一个 JSON 文件**，`config.json` 只放与上游无关的东西。
 
 | 文件 | 归谁 | 内容 |
 |---|---|---|
-| `codebuddy.json` | CodeBuddy | `cn` / `global` 两域 base、超时、UA、版本、设备令牌、指纹脱敏 |
+| `config.json` | 与上游无关 | 监听、密钥、账号池策略、排程、提示词、日志 |
+| `codebuddy.json` | CodeBuddy | `cn`/`global` 两域 base、UA、版本、设备令牌、指纹脱敏 |
 | `trae.json` | Trae | `cn` 域 base、IDE 版本、签到 UA、OAuth 常量、签到链路可调项 |
 
-为什么这样分：
+### 判定规则（加新配置时照这个走）
 
-- **加上游 = 加一个文件**，`config.json` 一行不动；
-- **删上游 = 删一个文件**，不留没人敢删的死字段；
-- **字段归属看得见**，不用猜 `user_agent` 是给谁的。
+问自己**一个问题**：
+
+> **这个字段只对某一个上游有意义吗？**
+
+- **是** → 放进该上游的文件（`codebuddy.json` / `trae.json`）
+- **否** → 放进 `config.json`，且**不要**写成 `codebuddy.xxx` / `trae.xxx` 这类
+  带上游名的嵌套
+
+三个必须避开的错觉：
+
+| 错觉 | 为什么错 | 反例 |
+|---|---|---|
+| 「目前只有 A 在用，所以归 A」 | 用**当前实现**代替**语义归属**。B 以后接上时会缺失，且没人会想起来补 | Trae 的首字节超时曾是硬编码常量、流中空闲**完全没有监控**，就是因为"这是 CodeBuddy 的参数" |
+| 「A 和 B 取值不同，所以要分两份」 | 除非**语义**本身不同，否则只是运维偏好，共用一份即可 | 两个上游的 SSE 超时语义完全相同：一条长连接该等多久 |
+| 「放主配置更简单」 | 简单的是这一次，代价是 `config.json` 逐渐变成各上游字段的大杂烩，删上游时没人敢删 | 旧 `cn`/`global`/`upstream`/`features` 四段混在主配置里 |
+
+### 逐项归属（2026-11 全面审视结果）
+
+下面这张表是**当前所有配置项**的归属判定，新增配置时先看它落在哪一类。
+
+**`config.json` —— 与上游无关**
+
+| 段 | 为什么与上游无关 |
+|---|---|
+| `listen` / `api_key` / `auth_dir` / `state_file` | 进程与存储的位置，不涉及任何上游协议 |
+| `server.read_timeout` | 网关自身对外服务，入口侧 |
+| `upstream.timeout_seconds` / `header_timeout_seconds` / `idle_timeout_seconds` | **传输层**：一条 SSE 长连接该等多久。两个上游的对话都是流式长连接 |
+| `pool.*`（策略/并发/熔断/降级/保底/权重） | 账号池的调度策略。分域字段（`strategy.domestic` / `max_in_flight_global`）是**路由维度**，不是上游维度 |
+| `cooldown.soft_rate*` | 上游无关的通用退避时长 |
+| `schedule.*` | 排程是所有上游共用的（见「排程是单点的」）。`checkin_backends` 按上游开关，但表本身是通用机制 |
+| `prompt.*` | 网关注入的提示词，与上游协议无关 |
+| `models.hidden` | 对外暴露哪些模型，是网关的展示策略 |
+| `session_sticky.*` | 会话粘性，跨上游统一 |
+| `logging.*` / `panel.*` | 可观测性与面板展示 |
+| `upstash.*` | 状态镜像存储 |
+
+**`codebuddy.json` —— CodeBuddy 专有**
+
+| 字段 | 为什么专有 |
+|---|---|
+| `cn.chat_base` / `global.chat_base` / `global.billing_base` | 该上游的端点地址 |
+| `global.enabled` | CodeBuddy 域开关（Trae 目前只有单域） |
+| `user_agent` / `client_version` / `cli_version` / `client_name` | 模拟该上游的客户端身份。Trae 的是另一套（`trae.json` 的 `checkin_user_agent`） |
+| `device_token` / `device_token_file` | 该上游的风控令牌机制 |
+| `passthrough_ip` | 该上游对客户端 IP 的处理要求 |
+| `sanitize_blacklist_fingerprints` | 该上游按**逐字精确匹配**审核客户端模板句，改一字即可绕过。Trae 没有这套审核 |
+
+**`trae.json` —— Trae 专有**
+
+| 字段 | 为什么专有 |
+|---|---|
+| `cn.chat_base` / `cn.api_base` | 该上游的端点（对话与签到是**不同域名**） |
+| `ide_version` / `ide_version_code` / `app_id` | 该上游的出站头族 |
+| `checkin_user_agent` | 该上游签到链路的 UA（与对话 UA 形态不同） |
+| `oauth_client_id` / `oauth_client_secret` / `oauth_host` / `oauth_callback_url` | 该上游的 OAuth 常量与回调 |
+| `verify_claim` / `refresh_before_checkin` / `checkin_req_source` | 该上游签到链路的特有坑（假成功回查、签到前续期、req_source 变体） |
+
+### 域维度与传输层
 
 文件内**保留域维度**（`cn` / `global` 各一段）：域隔离是硬约束（见
 `docs/architecture.md` 的「域隔离失效」历史事故）。Trae 目前只有 `cn`，
 将来加 global 只加一段、不改结构。
 
-**超时与 SSE 的两个上限（首字节 / 流空闲）属于 `config.json` 的 `upstream` 段，
-不在任何上游文件里**。原因：它们描述的是**传输层行为**，与上游协议无关——
-WorkBuddy 与 Trae 的对话都是 SSE 流式长连接，两个上限对两者语义完全相同。
+**但传输层参数不按域拆**：`timeout_seconds` / `header_timeout_seconds` /
+`idle_timeout_seconds` 是 HTTP client 的属性，所有上游、所有域共用一份。
+按域各配一份会诱使人以为能给不同域设不同超时，实则要维护两套 transport，
+收益为零、复杂度翻倍。
 
-> 曾经 Trae 的首字节超时是硬编码常量、流中空闲完全没有监控，正是因为它被当成
-> "CodeBuddy 的东西"。放进上游文件会继续强化这种误解。
+> 曾经的教训：Trae 的首字节超时是硬编码常量、流中空闲**完全没有监控**。
+> 根因是这些参数被当成"CodeBuddy 的东西"——恰恰是判定规则里第一条错觉。
 
 ### 缺字段的行为
 
@@ -62,7 +118,7 @@ WorkBuddy 与 Trae 的对话都是 SSE 流式长连接，两个上限对两者�
 | 文件不存在 | 用内置默认（`codebuddy.json` 首次启动会自动生成） |
 | 整个 `cn` 段缺失 | 该域用内置 base |
 | `user_agent` 为空串 | 用内置三段式 UA |
-| `timeout_seconds` 为 0 | 回落 120 |
+| `upstream.timeout_seconds` 为 0（主配置） | 回落 120 |
 
 ### 从旧版升级（自动迁移）
 
