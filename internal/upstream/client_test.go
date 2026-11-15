@@ -38,6 +38,20 @@ func TestClassify(t *testing.T) {
 		{403, `{"code":"11-128","msg":"request illegal"}`, ErrChannelRefused},
 		{400, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
 		{403, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
+		// 11140 的中文与变体文案：同样是账号被限制，不得落到 ErrClient。
+		//
+		// 回归点：旧实现只认英文 "request illegal"，中文形态的**真封禁**会落到
+		// ErrClient——那里不禁用、不冷却，只喂连败计数（5 次才降权 10 分钟），
+		// 于是受限账号每 10 分钟被放回来再打一遍，正是社区实测中「封号后反复
+		// 重试、风控越滚越重」的成因。
+		{403, `{"code":11140,"msg":"账号存在异常行为，已被限制使用"}`, ErrAccountFault},
+		{403, `{"code":11140,"msg":"Account restricted due to abnormal activity"}`, ErrAccountFault},
+		// 语义在 displayTips 里、msg 只有通用文案：必须解出 displayTips 才能判。
+		{403, `{"code":11140,"msg":"system error","displayTips":{"zh":"账号存在异常行为，已被限制使用"}}`, ErrAccountFault},
+		// 同一个 11140 的**内容审核**语义：请求级问题，换号/禁用都无意义。
+		// 误判成账号受限会硬禁用健康账号（与 issue 1849 的 11-128 误伤同类）。
+		{403, `{"code":11140,"msg":"内容未通过安全审核，请调整后重试"}`, ErrContentBlocked},
+		{200, `{"code":11140,"msg":"blocked by security policy"}`, ErrContentBlocked},
 		// 无 code 的裸 "request illegal" 不归属任何账号级判定（宁可走通用 4xx 兜底，
 		// 也不能凭一句文案硬禁用账号）。
 		{400, `{"msg":"request illegal"}`, ErrClient},

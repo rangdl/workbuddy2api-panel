@@ -170,23 +170,124 @@ var accountFaultMarkers = []string{
 	"trial version is not yet activated",
 }
 
-// accountRestrictedMsg 是 WorkBuddy 11140 账号限制的正文关键词。
-const accountRestrictedMsg = "request illegal"
+// accountRestrictedMarkers 11140「账号被限制」的文案词表（小写子串匹配）。
+//
+// 为什么需要一张表而不是只认 "request illegal"：11140 是**一个码承载多语义**的
+// 复合错误码（2026-11 社区实测梳理）：
+//
+//	账号被限制   "request illegal" / "账号存在异常行为，已被限制使用"
+//	内容审核    "内容未通过安全审核，请调整后重试" / "blocked by security policy"
+//	模型级限流  "The model provider is rate-limiting requests."
+//
+// 只认英文 "request illegal" 会让中文形态的**真封禁**落到 ErrClient：那里既不
+// 冷却也不禁用，只喂连败计数（5 次才降权 10 分钟），受限账号于是每 10 分钟被
+// 放回来再打一遍——正是社区里「封号后反复重试加重风控」的成因。
+//
+// 词表只收**明确指向账号本身被限制**的措辞；内容审核类走 restrictedContentMarkers
+// （不罚号），模型级限流走 softRateMarkers（短冷却），三者不可混判。
+var accountRestrictedMarkers = []string{
+	"request illegal",
+	"abnormal activity",
+	"abnormal behavior",
+	"account restricted",
+	"account has been restricted",
+	"account is restricted",
+	"账号存在异常行为",
+	"异常行为",
+	"已被限制使用",
+	"账号已被限制",
+	"账号被限制",
+}
 
-// IsAccountRestricted 报告上游 body 是否为 WorkBuddy 的账号级限制（11140
-// "request illegal"）。必须 code + 文案双条件：
-//   - 只看文案："request illegal" 也出现在 11128 通道校验失败里（健康账号）；
-//   - 只看 code：11140 也承载模型级限流文案（应归 ErrSoftRate）。
+// restrictedContentMarkers 11140 携带**内容审核**语义时的文案词表。
+//
+// 与 accountRestrictedMarkers 互斥且必须**先判**：同一个 11140 既可能是「账号
+// 被限制」也可能是「这条内容没过审核」。后者是请求级问题——换号、禁用都无意义，
+// 用户改内容即可。把它误判成账号受限会硬禁用健康账号（与 issue 1849 的 11-128
+// 误伤同类）。判定顺序：内容审核 → 账号受限 → 其他。
+var restrictedContentMarkers = []string{
+	"内容未通过安全审核",
+	"安全审核",
+	"内容审核",
+	"content moderation",
+	"content policy",
+	"blocked by security policy",
+}
+
+// errorTextOf 拼出「用于语义判定」的全部文本：原文 + displayTips 各语言值。
+//
+// 为什么不直接用原文：上游信封里 msg 常是通用文案，真正面向用户的说明放在
+// displayTips.zh / displayTips.en 里。原文虽包含 displayTips，但其中的非 ASCII
+// 可能以 \uXXXX 转义形式出现，直接子串匹配会漏。这里把各语言值解出来单独比对。
+func errorTextOf(body string) string {
+	lower := strings.ToLower(body)
+	var env struct {
+		DisplayTips map[string]string `json:"displayTips"`
+	}
+	if err := json.Unmarshal([]byte(body), &env); err != nil || len(env.DisplayTips) == 0 {
+		return lower
+	}
+	var sb strings.Builder
+	sb.WriteString(lower)
+	for _, v := range env.DisplayTips {
+		if v != "" {
+			sb.WriteString("\n")
+			sb.WriteString(strings.ToLower(v))
+		}
+	}
+	return sb.String()
+}
+
+// containsAny 报告 haystack 是否命中词表中任一条（词表须已小写）。
+func containsAny(haystack string, markers []string) bool {
+	for _, m := range markers {
+		if strings.Contains(haystack, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsAccountRestricted 报告上游 body 是否为 WorkBuddy 的账号级限制（11140）。
+//
+// 三个条件缺一不可：
+//  1. 业务码 11140——11-128 的 "request illegal" 是通道校验失败（账号健康），
+//     只看文案会硬禁用正常账号；
+//  2. 命中 accountRestrictedMarkers——11140 也承载模型级限流（应归 ErrSoftRate）
+//     与内容审核（应归 ErrContentBlocked），只看码会一刀切；
+//  3. **不**命中 restrictedContentMarkers——同上，内容审核优先。
+//
+// 判定扫描的文本范围包含 displayTips（见 errorTextOf）。
 func IsAccountRestricted(body string) bool {
-	if !strings.Contains(strings.ToLower(body), accountRestrictedMsg) {
+	if !hasBusinessCode(body, "11140") {
 		return false
 	}
-	return hasBusinessCode(body, "11140")
+	haystack := errorTextOf(body)
+	if containsAny(haystack, restrictedContentMarkers) {
+		return false // 内容审核语义：请求级问题，不是账号问题
+	}
+	return containsAny(haystack, accountRestrictedMarkers)
 }
 
 // isChannelRefused 报告上游 body 是否为 WorkBuddy 的通道校验失败（11128
 // "request illegal"）。11128 还承载内容审核变体（"blocked by security policy"，
 // 归 ErrContentBlocked），故必须 code + 文案双条件，不能按 code 一刀切。
+// accountRestrictedMsg 是 11-128 通道校验失败与 11140 账号限制**共有**的正文关键词。
+//
+// 它的唯一职责是让 isChannelRefused 认出「request illegal」这一族文案，再按业务码
+// 分流。11140 侧的判定已改用 accountRestrictedMarkers（覆盖中文与变体文案），
+// 不再依赖本常量。
+const accountRestrictedMsg = "request illegal"
+
+// isRestrictedContent 报告 upstream body 是否为 11140 携带的**内容审核**语义。
+//
+// 与 IsAccountRestricted 互斥：同一个 11140 既可能是「账号被限制」也可能是
+// 「这条内容没过审核」。后者换号、禁用都无意义（用户改内容即可），必须归
+// ErrContentBlocked（不罚号 + 降级重试），不能按账号受限硬禁用健康账号。
+func isRestrictedContent(body string) bool {
+	return containsAny(errorTextOf(body), restrictedContentMarkers)
+}
+
 func isChannelRefused(body string) bool {
 	if !strings.Contains(strings.ToLower(body), accountRestrictedMsg) {
 		return false
@@ -607,6 +708,13 @@ func Classify(status int, body string) ErrKind {
 	}
 	if IsAccountRestricted(body) {
 		return ErrAccountFault
+	}
+	// 11140 的**内容审核**语义（"内容未通过安全审核" 等）：请求级问题，不是账号
+	// 问题。必须单独分流——不判就会落到 ErrClient（只换号不罚却白烧健康号）或
+	// 更糟：被误判成账号受限而硬禁用。内容审核由降级重试处理，与 ErrContentBlocked
+	// 同待遇。
+	if isRestrictedContent(body) {
+		return ErrContentBlocked
 	}
 	for _, m := range accountFaultMarkers {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {

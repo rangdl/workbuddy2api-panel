@@ -140,9 +140,10 @@ type Handler struct {
 	// degrade 降级状态机。可由 Config.DegradeGate 注入（main 需要与 backend
 	// 的 RetryHook 共享同一实例——两者不同步会让「降级期直达 Degraded」失效）。
 	degrade *degradeGate
-	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
-	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
-	wafIP wafIPGate
+	// wafIP 平台级异常判定状态机（fail-fast，wafip.go）：短窗内多个不同账号
+	// 接连撞上同类问题（WAF 403 / 11140 账号受限）→ 激活期内直接终止轮转，
+	// 不再把请求放大 MaxRotate 倍去撞同一堵墙。进程内状态、重启清零。
+	wafIP multiAcctGate
 	// traeCfg Trae 上游配置（运行期可原子替换，供 backend 读）。
 	traeCfg atomic.Pointer[trae.Config]
 	// 说明：Trae 的冷却与运行期计数都不在 Handler 上持有。
@@ -790,6 +791,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if isWafFailure(derr) && h.wafIP.noteWaf(acc.UID()) {
 					break
 				}
+				// 平台级账号受限 fail-fast（同 WAF 思路，封号 wave 场景）：
+				// 短时间内多个**不同**账号接连被上游标记 11140 受限，说明这是
+				// 平台侧批量动作而非各账号各自坏掉（社区实测：4 个号同一分钟
+				// 全部 403+11140，而凭据与积分查询均正常）。此时继续换号等于
+				// 把剩下还健康的号挨个送去撞风控，故立即终止轮转。
+				// 账号级处置（Disable）已在 applyFailure 里照常完成，这里只管
+				// 「是否还要继续轮转」。
+				if isAccountRestrictedFailure(derr) && h.wafIP.noteRestricted(acc.UID()) {
+					break
+				}
 				if !rotateBackoff(i, r.Context()) {
 					break
 				}
@@ -919,6 +930,28 @@ func isWafFailure(err error) bool {
 	}
 	return f.Decision.Kind == upstream.ErrWafBlock.String() ||
 		upstream.ErrKindOf(f.Decision.Kind) == upstream.ErrWafBlock
+}
+
+// isAccountRestrictedFailure 报告这次失败是否为「账号被上游限制」（11140）。
+//
+// 只认 ErrAccountFault 中**真封禁**那一支：ErrAccountFault 还包含 14017
+// （trial not activated，补完 register 可自愈），那种情况不该触发平台级判定
+// ——它不是封号 wave 的信号，凑进去会让一次普通的注册未完成误判成平台动作。
+// 判据是上游原文：handler 的处置分支用的就是 upstream.IsAccountRestricted(body)，
+// 这里保持同一口径，避免「禁用判据」与「平台级判据」两套标准打架。
+func isAccountRestrictedFailure(err error) bool {
+	var f *gateway.Failure
+	if !errors.As(err, &f) {
+		return false
+	}
+	if upstream.ErrKindOf(f.Decision.Kind) != upstream.ErrAccountFault {
+		return false
+	}
+	body := string(f.Body)
+	if body == "" {
+		body = f.Message
+	}
+	return upstream.IsAccountRestricted(body)
 }
 
 // asUpstreamError 把 backend 回传的 *gateway.Failure 还原成 *upstream.Error。
