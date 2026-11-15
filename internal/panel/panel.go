@@ -86,6 +86,18 @@ type Config struct {
 	// TraeStats Trae 账号运行期计数（成功/失败/在途/用量展示用）。
 	// 与 server 侧共用同一实例；nil = 不展示运行期统计。
 	TraeStats *trae.Stats
+
+	// ── 装配期注入的上游包装/凭证访问（面板不 import 具体 backend）──
+
+	// WrapAccount 把 CodeBuddy 账号包装成带能力的池账号（登录/导入后入池用）。
+	// nil = 不入池（测试裸用；调用方自行 pool.Add）。
+	WrapAccount func(a *auth.Auth) []gateway.Account
+	// CredentialFor 按 uid 取 CodeBuddy 原始凭证（成长任务/余额/积分包接口）。
+	// nil = 这些接口视为账号不存在。
+	CredentialFor func(uid string) *auth.Auth
+	// TraeCredential 从池账号取 Trae 原始凭证（签到/积分查询/补签）。
+	// nil = 视为不是 Trae 账号。
+	TraeCredential func(acc gateway.Account) any
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -802,7 +814,7 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 		if err := trae.RemoveAccount(p.traeAuthDir(), acc.UID()); err != nil {
 			fileMsg = err.Error()
 		}
-	} else if a := pool.UnwrapAuth(acc); a != nil && a.FilePath != "" {
+	} else if a := p.codeBuddyCredential(acc.UID()); a != nil && a.FilePath != "" {
 		if err := os.Remove(a.FilePath); err != nil && !os.IsNotExist(err) {
 			fileMsg = err.Error()
 		}
@@ -994,7 +1006,7 @@ func b2i(b bool) int {
 // 失败只记日志不返回：领取本身已经成功并落到上游，余额刷新失败只是展示滞后，
 // 前端紧接着还会拉一次 overview。静默吞掉会让「积分没变」看起来像没领到。
 func (p *Panel) refreshCreditsQuiet(uid string) {
-	a := p.cfg.Pool.AuthByUID(uid)
+	a := p.codeBuddyCredential(uid)
 	if a == nil {
 		return
 	}
@@ -1022,7 +1034,7 @@ func (p *Panel) syncNicknames() {
 		if st.Disabled {
 			continue
 		}
-		if a := p.cfg.Pool.AuthByUID(st.UID); a != nil && a.AccessTokenValue() != "" {
+		if a := p.codeBuddyCredential(st.UID); a != nil && a.AccessTokenValue() != "" {
 			jobs = append(jobs, job{uid: st.UID, a: a})
 		}
 	}
@@ -1174,7 +1186,7 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 				out[i] = it
 				return
 			}
-			a := p.cfg.Pool.AuthByUID(s.UID)
+			a := p.codeBuddyCredential(s.UID)
 			if a == nil {
 				it.Error = "account not loaded"
 				out[i] = it

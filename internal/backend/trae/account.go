@@ -28,6 +28,17 @@ type Account struct {
 	// 统一方法即可，不需要认识 Trae 协议。
 	client   *traepkg.Client
 	ConfigFn func() *traepkg.Config
+	// stats 运行期计数（面板的「成功/失败/在途」与积分展示用）。
+	//
+	// 由 cmd/server 在入池前注入（与 ConfigFn 同一手法）：面板与 handler 必须
+	// 共用同一实例，而那个实例的构造属于装配层。
+	stats *traepkg.Stats
+}
+
+// SetStats 注入运行期计数实例（装配期调用；nil = 不统计）。
+func (x Account) SetStats(s *traepkg.Stats) Account {
+	x.stats = s
+	return x
 }
 
 func (x Account) UID() string      { return x.A.UID }
@@ -44,6 +55,60 @@ func (x Account) Credential() any {
 		return nil
 	}
 	return x.A
+}
+
+// UsageLabel 实现 gateway.UsageLabeller：Trae 的用量在账本里单独分组。
+//
+// 理由：Trae 的积分消耗与 CodeBuddy 的套餐额度是两套体系，混进同一个域会
+// 让「这个域花了多少」失去意义。标签固定 "trae" 而不是 Realm()——Trae 的
+// 域是 base 域名推出来的（cn/global），但用量分账要按上游分。
+func (x Account) UsageLabel() string { return Name }
+
+// ObserveRemain 实现 gateway.RemainObserver：接收 notify_usage 上报的两份积分。
+//
+// Trae 面板的签到区块要分别展示 IDE 与 Work 积分，所以这里必须把两份都存下来
+// （池的 credits 只用 Available，那是对外选号口径）。
+func (x Account) ObserveRemain(r *gateway.Remain) {
+	if x.stats == nil || x.A == nil || r == nil {
+		return
+	}
+	x.stats.NoteRemain(x.A.UID, r.Available, r.Work)
+}
+
+// BeginStream 实现 gateway.StreamLifecycle：面板的「成功/失败/在途」三列。
+//
+// 返回的 finish 必须被调用（成功与否都调），否则在途计数永不归零。
+func (x Account) BeginStream() func(ok bool) {
+	if x.stats == nil || x.A == nil {
+		return func(bool) {}
+	}
+	finish := x.stats.Begin(x.A.UID)
+	return func(ok bool) {
+		// token/延迟字段由 server 的 recordBackendUsage 另行落池，
+		// 这里只结算在途与成功/失败。
+		finish(ok, traepkg.UsageDelta{})
+	}
+}
+
+// 编译期断言。
+var (
+	_ gateway.UsageLabeller   = Account{}
+	_ gateway.RemainObserver  = Account{}
+	_ gateway.StreamLifecycle = Account{}
+	_ gateway.CreditEstimator = Account{}
+)
+
+// EstimateCredits 实现 gateway.CreditEstimator：Trae 的 chat 流不含扣费字段
+// （实测），只能按 token × 模型倍率推算。
+//
+// 公式本体在 internal/trae/credit_estimate.go（缓存读/写的权重各不相同），
+// 这里只做适配。估算值不参与选号成本分层，只作面板的数量级参考。
+func (x Account) EstimateCredits(u *gateway.Usage, rate float64) (float64, bool) {
+	if u == nil || rate <= 0 {
+		return 0, false
+	}
+	return traepkg.EstimateCreditsFromUsage(
+		u.PromptTokens, u.CacheRead, u.CacheCreation, u.CompletionTokens, rate)
 }
 
 // Unwrap 取出原始账号。

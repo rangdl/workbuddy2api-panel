@@ -61,16 +61,17 @@ func saveTraeAccountFunc(dir string) func(*trae.Account) error {
 // 只增不删的取舍：池的 SyncToDir 是「本次扫描到的全集」，混两个上游时不能直接
 // 用它（会把另一个上游的账号当成"已删除"）。所以这里用 Add 逐个加入——
 // 状态保留由 pool.upsertLocked 保证，禁用态由 trae.json 的 Disabled 字段驱动。
-func syncTraeAccountsToPool(p *pool.Pool, cfg *trae.Config, client *trae.Client, configFn func() *trae.Config) int {
+func syncTraeAccountsToPool(p *pool.Pool, cfg *trae.Config, client *trae.Client, configFn func() *trae.Config, stats *trae.Stats) int {
 	if p == nil || cfg == nil || !cfg.Enabled {
 		return 0
 	}
 	accs := backendtrae.Wrap(cfg, client)
-	// 账号对象要能读到**当前**配置（热重载后换 base / 改设备号）。
+	// 账号对象要能读到**当前**配置（热重载后换 base / 改设备号），
+	// 并且要能记运行期计数（面板的「成功/失败/在途」与积分列）。
 	for i := range accs {
 		if a, ok := accs[i].(backendtrae.Account); ok {
 			a.ConfigFn = configFn
-			accs[i] = a
+			accs[i] = a.SetStats(stats)
 		}
 	}
 	for _, a := range accs {

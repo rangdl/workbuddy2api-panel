@@ -18,7 +18,7 @@ const traeSSEForAccounting = "event: output\ndata: {\"response\":\"hi\"}\n\n" +
 	"event: done\ndata: {\"finish_reason\":\"stop\"}\n\n"
 
 // newAccountingHandler 构造带 Trae backend 的 handler（真实发送链路）。
-func newAccountingHandler(t *testing.T) (*Handler, *traepkg.Config, *pool.Pool) {
+func newAccountingHandler(t *testing.T) (*Handler, *traepkg.Config, *pool.Pool, *traepkg.Stats) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -39,7 +39,12 @@ func newAccountingHandler(t *testing.T) (*Handler, *traepkg.Config, *pool.Pool) 
 	reg.Register(backendtrae.New(traepkg.NewClient(), func() *traepkg.Config { return cfg }))
 
 	p := pool.New("")
-	p.Add(backendtrae.Wrap(cfg, traepkg.NewClient())[0])
+	// 运行期计数由装配层注入账号（与 cmd/server 的 syncTraeAccountsToPool 同手法）：
+	// 账号自己实现 gateway.StreamLifecycle / RemainObserver，dispatch 不判断上游名。
+	stats := traepkg.NewStats()
+	if a, ok := backendtrae.Wrap(cfg, traepkg.NewClient())[0].(backendtrae.Account); ok {
+		p.Add(a.SetStats(stats))
+	}
 
 	h := NewHandler(Config{
 		Pool:       p,
@@ -47,7 +52,7 @@ func newAccountingHandler(t *testing.T) (*Handler, *traepkg.Config, *pool.Pool) 
 		Trae:       cfg,
 		TraeClient: traepkg.NewClient(),
 	})
-	return h, cfg, p
+	return h, cfg, p, stats
 }
 
 // TestBackendAccountingNonStream 非流式也要记成功/失败与用量次数。
@@ -55,7 +60,7 @@ func newAccountingHandler(t *testing.T) (*Handler, *traepkg.Config, *pool.Pool) 
 // 回归：dispatch 此前只调 NoteSuccess（清冷却），没调 RecordTokenUsage，
 // 于是 Trae 账号在面板上「成功/失败」「用量·次数」恒为 0。
 func TestBackendAccountingNonStream(t *testing.T) {
-	h, _, p := newAccountingHandler(t)
+	h, _, p, _ := newAccountingHandler(t)
 	body := `{"model":"trae:cn:glm-5.2","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rec := httptest.NewRecorder()
@@ -84,7 +89,7 @@ func TestBackendAccountingNonStream(t *testing.T) {
 
 // TestBackendAccountingStream 流式同样记账。
 func TestBackendAccountingStream(t *testing.T) {
-	h, _, p := newAccountingHandler(t)
+	h, _, p, _ := newAccountingHandler(t)
 	body := `{"model":"trae:cn:glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rec := httptest.NewRecorder()

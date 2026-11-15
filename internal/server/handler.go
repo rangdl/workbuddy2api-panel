@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
@@ -738,7 +739,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.uid = acc.UID()
 		// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
 		st.nick = acc.Nickname()
-		acct := pool.UnwrapAuth(acc)
+		acct := backendcb.Unwrap(acc)
 		// 所有上游统一走 backend 分发：请求体转换、出站头、回程 SSE 全部由
 		// 该上游的 gateway.Backend 实现负责。CodeBuddy 与 Trae 因此是同一段
 		// 调度代码——差异只在 backend 内部（见 backend/codebuddy/backend.go）。

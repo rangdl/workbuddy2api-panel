@@ -67,7 +67,7 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(i int, uid string) {
 			defer wg.Done()
-			a := p.cfg.Pool.AuthByUID(uid)
+			a := p.codeBuddyCredential(uid)
 			if a == nil {
 				return
 			}
@@ -210,7 +210,7 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 		if st.Disabled {
 			continue
 		}
-		a := p.cfg.Pool.AuthByUID(st.UID)
+		a := p.codeBuddyCredential(st.UID)
 		if a == nil {
 			continue
 		}
@@ -499,7 +499,7 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 		if st.Disabled {
 			continue // 未占位，行末统一压掉
 		}
-		a := p.cfg.Pool.AuthByUID(st.UID)
+		a := p.codeBuddyCredential(st.UID)
 		if a == nil {
 			continue
 		}

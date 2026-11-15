@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
@@ -123,7 +124,7 @@ func testPoolWith(auths ...*auth.Auth) *pool.Pool {
 	p := pool.New("")
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	for _, a := range auths {
-		p.Add(pool.WrapAuth(a))
+		p.Add(backendcb.WrapAuth(a))
 		p.SetCredits(a.UID, 1000, 0)
 	}
 	return p
@@ -139,7 +140,7 @@ func testPoolWithCatalog(t *testing.T, up *upstream.Client, auths ...*auth.Auth)
 		if backend != pool.BackendCodeBuddy {
 			return nil, gateway.ErrUnsupported
 		}
-		a := pool.UnwrapAuth(acc)
+		a := backendcb.UnwrapAuth(acc)
 		if a == nil {
 			return nil, gateway.ErrUnsupported
 		}
@@ -493,7 +494,7 @@ func TestApplyErrorPolicySoftRateExponentialBackoff(t *testing.T) {
 	// 跨冷却期的堆加语义由 pool 包 CooldownSoftRate 测试覆盖；此处锚定 handler 侧
 	// 的调用形态：连续 3 次软限流错误 → 首次 600s，后续不延长。
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(backendcb.WrapAuth(&auth.Auth{UID: "u1"}))
 	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
 	for i := 1; i <= 3; i++ {
@@ -516,7 +517,7 @@ func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 	// 的 600s 基数，也不受其配置值影响。Cooldown 重构后 404 是固定时长冷却
 	//（不堆加、不喂熔断），成功后自然到期恢复。
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(backendcb.WrapAuth(&auth.Auth{UID: "u1"}))
 	h := NewHandler(Config{Pool: p, SoftCooldown: 20 * time.Minute}) // soft_rate 配得很大，验证 404 不受其影响
 
 	notFoundSec := int64(notFoundCooldown / time.Second)
@@ -563,7 +564,7 @@ func TestApplyErrorPolicyChannelRefusedDoesNotDisable(t *testing.T) {
 				t.Fatalf("Classify=%v want %v", got, tc.kind)
 			}
 			p := pool.New("")
-			p.Add(pool.WrapAuth(&auth.Auth{UID: "u1"}))
+			p.Add(backendcb.WrapAuth(&auth.Auth{UID: "u1"}))
 			h := NewHandler(Config{Pool: p})
 			h.applyErrorPolicy("u1", tc.kind, tc.body, "glm-5.2", nil)
 			st, _ := p.Status("u1")

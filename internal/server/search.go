@@ -20,6 +20,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 
+	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 )
 
@@ -68,7 +69,7 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 			break
 		}
 		// 搜索是 CodeBuddy 专有能力：非该上游的账号直接跳过（换下一个）。
-		acct := pool.UnwrapAuth(acc)
+		acct := backendcb.Unwrap(acc)
 		if acct == nil {
 			tried[pool.TriedKey(acc)] = true
 			continue

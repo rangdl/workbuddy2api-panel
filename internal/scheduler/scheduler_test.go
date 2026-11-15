@@ -478,7 +478,7 @@ func TestRunBalanceRefreshReplacesExpirySnapshot(t *testing.T) {
 
 func TestSetExpiringSoonWindowClearsSnapshot(t *testing.T) {
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(backendcb.WrapAuth(&auth.Auth{UID: "u1"}))
 	p.SetCreditsDetailed("u1", 100, 100, 50, time.Now().Add(time.Hour), 50)
 	s := New(Config{Pool: p, ExpiringSoonWindow: 7 * 24 * time.Hour})
 

@@ -51,7 +51,7 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 		if ps.Disabled {
 			continue // 禁用账号不参与（与任务中心扫描同口径）
 		}
-		a := p.cfg.Pool.AuthByUID(ps.UID)
+		a := p.codeBuddyCredential(ps.UID)
 		if a == nil || a.IsGlobal() || a.IsEnterprise() {
 			continue // 无个人成长体系：零上游请求
 		}

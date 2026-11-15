@@ -113,6 +113,16 @@ func main() {
 		_ = store.Close()
 	}()
 	p.SetStore(store)
+	// 占位账号工厂：state 恢复时先建条目承载 credits/冷却等数据，真实账号
+	// 要等 SyncToDir 才到位。必须在 RestoreFromSnapshot 之前注入——否则占位
+	// 账号会退化成池里的 bareAccount，backend 分发路径取不到凭证，表现为
+	// 「账号在池里却报 account is not a CodeBuddy auth」。
+	p.SetPlaceholderFactory(func(backend, uid string) gateway.Account {
+		if backend == pool.BackendTrae {
+			return backendtrae.Placeholder(uid)
+		}
+		return backendcb.Placeholder(uid)
+	})
 	// 账号入池推迟到 upstream.Client 构造之后（见下方 syncCodeBuddyAccountsToPool）：
 	// 账号对象要持有 client 才能自己实现 Credits/Checkin/Keepalive。
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
@@ -334,14 +344,15 @@ func main() {
 		tcfg.SaveAccount = saveTraeAccountFunc(tcfg.AuthDir)
 		return tcfg
 	}
+	// Trae 运行期计数：面板展示与 handler 记账必须是同一实例，所以在这里构造，
+	// 并在账号入池前注入（账号自己实现 StreamLifecycle / RemainObserver）。
+	traeStats := trae.NewStats()
 	// Trae 账号合进同一个池：选号时按 backend 维度区分上游。
 	// 必须在 handler 构造之前完成，否则启动初期的请求选不到 Trae 号。
-	if n := syncTraeAccountsToPool(p, traeCfg, traeClient, traeConfigFn); n > 0 {
+	if n := syncTraeAccountsToPool(p, traeCfg, traeClient, traeConfigFn, traeStats); n > 0 {
 		log.Printf("[trae] 已同步 %d 个账号进调度池", n)
 	}
 	traeCool := trae.NewCooldowns()
-	// 运行期计数同样要在 main 构造：面板展示与 handler 记账必须是同一实例。
-	traeStats := trae.NewStats()
 	// handlerRef 供面板热重载闭包引用（panel 先于 handler 构造，闭包在保存时才调用）。
 	var handlerRef *server.Handler
 	// 积分历史：把每次真实查到的余额与上一次比对，变动即留痕（新账号首次只建
@@ -373,6 +384,24 @@ func main() {
 		TraeClient:    traeClient,
 		TraeCooldowns: traeCool,
 		TraeStats:     traeStats,
+		// 装配期注入上游包装/凭证访问：panel 不 import 具体 backend，
+		// 新增一个可登录的上游时只改这里。
+		WrapAccount: func(a *auth.Auth) []gateway.Account {
+			// expiringSoon 用闭包读调度器当前窗口：配置热改后立即生效，
+			// 不能在构造时取一次快照。
+			return backendcb.WrapWithClient([]*auth.Auth{a}, up, func() time.Duration {
+				return sch.ExpiringSoonWindow()
+			})
+		},
+		CredentialFor: func(uid string) *auth.Auth {
+			return backendcb.UnwrapAuth(p.Account(uid))
+		},
+		TraeCredential: func(acc gateway.Account) any {
+			if a := backendtrae.Unwrap(acc); a != nil {
+				return a
+			}
+			return nil
+		},
 		ReloadTrae: func() error {
 			if handlerRef == nil {
 				return nil
@@ -381,7 +410,7 @@ func main() {
 			handlerRef.SetTraeConfig(tcfg)
 			// 账号变化（登录/删除/禁用）要反映到池里，否则新号选不到、
 			// 删掉的号还会被选中。
-			syncTraeAccountsToPool(p, tcfg, traeClient, traeConfigFn)
+			syncTraeAccountsToPool(p, tcfg, traeClient, traeConfigFn, traeStats)
 			removeStaleTraeAccounts(p, tcfg, traeClient)
 			return nil
 		},
@@ -525,7 +554,7 @@ func warmModelRates(ctx context.Context, up *upstream.Client, p *pool.Pool) {
 	}
 	// CN：有可用 CN 账号才拉（与面板 models 同口径，避免无谓上游调用）。
 	if uids := p.AvailableUIDsForRealm("cn"); len(uids) > 0 {
-		if a := p.AuthByUID(uids[0]); a != nil {
+		if a := backendcb.UnwrapAuth(p.Account(uids[0])); a != nil {
 			if _, err := up.FetchModels(a); err != nil {
 				log.Printf("WARN: [upstream] warm model rates (cn): %v", err)
 			} else {
@@ -536,7 +565,7 @@ func warmModelRates(ctx context.Context, up *upstream.Client, p *pool.Pool) {
 	// global：独立目录端点（workbuddy.ai），倍率按 "global" 域键存储。
 	if up.GlobalEnabled && ctx.Err() == nil {
 		if uids := p.AvailableUIDsForRealm("global"); len(uids) > 0 {
-			if a := p.AuthByUID(uids[0]); a != nil {
+			if a := backendcb.UnwrapAuth(p.Account(uids[0])); a != nil {
 				// FetchGlobalModelInfos 无错误返回（内部负缓存自行节流），
 				// 仅按结果条数判断是否拿到目录。
 				if infos := up.FetchGlobalModelInfos(a); len(infos) == 0 {

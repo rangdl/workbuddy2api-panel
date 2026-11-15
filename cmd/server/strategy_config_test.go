@@ -2,6 +2,7 @@ package main
 
 import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
@@ -44,8 +45,8 @@ func TestSaveRegionSchedulingHotAppliesAndRejectsInvalid(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := pool.New("")
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "a"}))
-	p.Add(pool.WrapAuth(&auth.Auth{UID: "b"}))
+	p.Add(backendcb.WrapAuth(&auth.Auth{UID: "a"}))
+	p.Add(backendcb.WrapAuth(&auth.Auth{UID: "b"}))
 	live := livecfg.New(livecfg.Snapshot{})
 	up := upstream.New()
 	sch := scheduler.New(scheduler.Config{})
