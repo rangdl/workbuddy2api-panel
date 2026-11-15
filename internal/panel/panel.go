@@ -25,6 +25,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -477,59 +478,34 @@ func (p *Panel) nicknames() map[string]string {
 	return nicks
 }
 
-// models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
-// 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
-// 与 /v1/models 同口径的多上游输出：CN 域加 "cn:" 前缀、global 域加 "global:"
-// 前缀、Trae 加 "trae:cn:" 前缀（gateway 路由协议，前端显示的 id 就是调用时要填的
-// 完整 model 值）。每条都带 upstream 字段标明所属上游。
-// 各上游独立探测、独立容错：无可用账号则整段跳过；全部为空时才报错
-// （有错误明细回 502，一个账号都没有回 503）。
+// models 拉取所有上游的模型目录与常 reasoning 档位。
+//
+// 数据来自池的 CatalogAll（gateway.Cataloger 可选能力），本函数只做两件事：
+// 给裸 ID 加路由前缀、把条目摊平成前端认的字段名。**不再直连任何上游**——
+// 改造前三段各自 FetchModels / FetchGlobalModelInfos / FetchRemoteModels，
+// 每段自己挑账号、自己缓存，于是面板与 /v1/models 机制上就允许不一致。
+//
+// 前缀规则即路由协议：CN 加 "cn:"、global 加 "global:"、Trae 加 "trae:cn:"
+// （前端显示的 id 就是调用时要填的完整 model 值）。每条都带 upstream 字段
+// 标明所属上游，前端据此做徽标与筛选。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
-	out := make([]map[string]any, 0)
+	results := p.cfg.Pool.CatalogAll(r.Context())
+	out := make([]map[string]any, 0, 64)
 	var fetchErrs []string
-
-	// CN 域：有可用 CN 账号才查（此前无条件 Pool.Pick()+FetchModels——选中 global
-	// 账号时打 CN 端点必然失败，混合池表现为偶发 502，纯 global 池必炸）。
-	if uids := p.cfg.Pool.AvailableUIDsForRealm("cn"); len(uids) > 0 {
-		if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
-			infos, err := p.cfg.Upstream.FetchModels(acct)
-			if err != nil {
-				fetchErrs = append(fetchErrs, "cn: "+err.Error())
-			} else {
-				for _, mi := range infos {
-					out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
-				}
+	for _, res := range results {
+		if res.Err != nil {
+			// ErrUnsupported = 该上游不提供目录（未启用 Trae 等），不是失败，
+			// 不该让整页 502；只有真的拉取报错才进错误明细。
+			if !errors.Is(res.Err, gateway.ErrUnsupported) {
+				fetchErrs = append(fetchErrs, res.Backend+": "+res.Err.Error())
 			}
+			continue
+		}
+		prefix := panelPrefixFor(res.Backend, res.Realm)
+		for _, m := range res.Models {
+			out = append(out, panelCatalogEntry(res.Backend, prefix, m))
 		}
 	}
-
-	// global 域：路由开关开且有可用 global 账号才查（独立目录端点，FetchGlobalModelInfos；
-	// Upstream.GlobalEnabled 是探测侧同一道闸，与 main 装配的 config global.enabled 一致）。
-	if p.cfg.Upstream.GlobalEnabled {
-		if uids := p.cfg.Pool.AvailableUIDsForRealm("global"); len(uids) > 0 {
-			if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
-				infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
-				if len(infos) == 0 {
-					fetchErrs = append(fetchErrs, "global: 上游未返回可用模型")
-				} else {
-					efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
-					for _, mi := range infos {
-						out = append(out, panelModelEntry("global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
-					}
-				}
-			}
-		}
-	}
-
-	// Trae 上游：与 CN/global 并列的第三条上游，模型名前缀是 "trae:cn:"。
-	//
-	// 为什么不并进 CN 分支：Trae 的目录、倍率与能力旗标来自完全不同的上游
-	// （get_detail_param + /api/remote/v1/models），混在一起会让「这个模型走哪个
-	// 上游」无从判断。条目标注 upstream 字段，前端据此显示上游徽标与筛选项。
-	//
-	// 未启用 / 无账号**不算失败**：那是配置事实，只有当 CN、global、Trae 全都
-	// 拿不到模型时才需要报错，此时错误明细里带上「未启用」才有解释力。
-	out = append(out, p.traeModelEntries()...)
 
 	if len(out) == 0 {
 		if len(fetchErrs) > 0 {
@@ -542,53 +518,94 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
 }
 
-// panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），
-// context_length / max_output_tokens 走四级查找链，effort 档位按 realm 域取
-// EffortListing（远端权威 ∪ 静态兜底表）——与 /v1/models 同一口径，两侧不再漂移。
-func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string, remoteDefault string, httpc *http.Client) map[string]any {
+// panelPrefixFor 该条目在面板上的 ID 前缀（即客户端调用时要填的 model 值前缀）。
+//
+// Trae 的 ID 形态是 "trae:cn:<模型>"（三段），CodeBuddy 是 "<realm>:<模型>"。
+// 两者的域段位置不同，所以前缀不能一套规则套到底。
+func panelPrefixFor(backend, realm string) string {
+	if backend == panelUpstreamTrae {
+		return panelUpstreamTrae + ":" + panelTraeRealm + ":"
+	}
+	if realm == "" {
+		realm = panelTraeRealm // CodeBuddy 单域部署时的合理缺省
+	}
+	return realm + ":"
+}
+
+// panelCatalogEntry 统一目录条目 → 面板 JSON。
+//
+// 字段名与改造前保持一致（context_length / supported_efforts / default_effort /
+// supports_*），前端无需改动。
+func panelCatalogEntry(backend, prefix string, m gateway.CatalogModel) map[string]any {
 	entry := map[string]any{
-		"id":                   realm + ":" + mi.ID,
-		"upstream":             panelUpstreamCodeBuddy,
-		"name":                 mi.Name,
-		"default_effort":       mi.DefaultEffort,
-		"supported_efforts":    mi.Efforts,
-		"can_disable_thinking": mi.CanDisableThinking,
-		"supports_reasoning":   mi.SupportsReasoning,
-		"supports_images":      mi.SupportsImages,
-		"credits":              mi.Credits,
-		"description":          mi.Description,
-		"tags":                 mi.Tags,
-		"vendor":               mi.Vendor,
-		"is_default":           mi.IsDefault,
-		"supports_tool_call":   mi.SupportsToolCall,
-		"only_reasoning":       mi.OnlyReasoning,
-		"reasoning_effort":     mi.ReasoningEffort,
-		"reasoning_summary":    mi.ReasoningSummary,
+		"id":       prefix + m.ID,
+		"upstream": backend,
+		"name":     m.Name,
 	}
-	// 限时优惠（modelPromotions）：credits 是牌价，promo_* 是当前生效折扣
-	//（WorkBuddy 客户端显示的就是这个生效价）。前端据此显示「生效价+标签+划线牌价」。
-	if mi.PromoFactor != nil {
-		entry["promo_factor"] = *mi.PromoFactor
-		entry["promo_credits"] = mi.PromoCredits
+	if m.ContextLength > 0 {
+		entry["context_length"] = m.ContextLength
 	}
-	if mi.PromoLabel != "" {
-		entry["promo_label"] = mi.PromoLabel
+	if m.ContextLengthBase > 0 {
+		entry["context_length_base"] = m.ContextLengthBase
 	}
-	if mi.PromoNote != "" {
-		entry["promo_note"] = mi.PromoNote
+	if m.MaxOutputTokens > 0 {
+		entry["max_output_tokens"] = m.MaxOutputTokens
 	}
-	if mi.MaxAllowedSize > 0 {
-		entry["max_allowed_size"] = mi.MaxAllowedSize
+	if len(m.Efforts) > 0 {
+		entry["supported_efforts"] = m.Efforts
 	}
-	entry["context_length"] = upstream.ContextWindowListingV4(mi.ID, mi.ContextWindow, httpc)
-	if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, httpc); ok {
-		entry["max_output_tokens"] = mo
+	if m.DefaultEffort != "" {
+		entry["default_effort"] = m.DefaultEffort
 	}
-	if efforts, def := upstream.EffortListing(realm, mi.ID, remoteEfforts, remoteDefault); efforts != nil {
-		entry["supported_efforts"] = efforts
-		if def != "" {
-			entry["default_effort"] = def
-		}
+	if m.SupportsReasoning {
+		entry["supports_reasoning"] = true
+	}
+	if m.CanDisableThinking {
+		entry["can_disable_thinking"] = true
+	}
+	if m.SupportsImages {
+		entry["supports_images"] = true
+	}
+	if m.SupportsToolCall {
+		entry["supports_tool_call"] = true
+	}
+	if m.IsDefault {
+		entry["is_default"] = true
+	}
+	if m.Credits != "" {
+		entry["credits"] = m.Credits
+	}
+	if m.Description != "" {
+		entry["description"] = m.Description
+	}
+	if m.Vendor != "" {
+		entry["vendor"] = m.Vendor
+	}
+	if len(m.Tags) > 0 {
+		entry["tags"] = m.Tags
+	}
+	if m.OnlyReasoning {
+		entry["only_reasoning"] = true
+	}
+	if m.ReasoningEffort != "" {
+		entry["reasoning_effort"] = m.ReasoningEffort
+	}
+	if m.ReasoningSummary != "" {
+		entry["reasoning_summary"] = m.ReasoningSummary
+	}
+	if m.MaxAllowedSize > 0 {
+		entry["max_allowed_size"] = m.MaxAllowedSize
+	}
+	// 限时优惠：credits 是牌价，promo_* 是当前生效折扣。
+	if m.PromoFactor != nil {
+		entry["promo_factor"] = *m.PromoFactor
+		entry["promo_credits"] = m.PromoCredits
+	}
+	if m.PromoLabel != "" {
+		entry["promo_label"] = m.PromoLabel
+	}
+	if m.PromoNote != "" {
+		entry["promo_note"] = m.PromoNote
 	}
 	return entry
 }
@@ -599,92 +616,8 @@ const (
 	panelUpstreamTrae      = "trae"
 )
 
-// traeModelEntries 生成 Trae 上游的模型条目（供「模型与档位」页展示）。
-//
-// 与 server 侧 traeModelEntries 的口径差异：那边给客户端列 id，这里给面板展示，
-// 所以多带 upstream/name/credits 等展示字段，且**只列显式前缀形态**
-// （"trae:cn:<模型>"）——裸名会与 CodeBuddy 同名模型混淆，面板要的是
-// 「这个模型属于哪个上游」的确定答案。
-//
-// 返回 nil 表示没有可列的内容（未启用 / 无账号 / 上游未给目录）。失败不报错：
-// 目录是展示增强，不该让整页 502。
-func (p *Panel) traeModelEntries() []map[string]any {
-	if p.cfg.TraeClient == nil || p.cfg.TraePath == "" {
-		return nil
-	}
-	cfg, err := trae.Load(p.cfg.TraePath, p.cfg.AuthDir)
-	if err != nil || cfg == nil || !cfg.Enabled {
-		return nil
-	}
-	acc := firstEnabledTraeAccount(cfg)
-	if acc == nil {
-		return nil
-	}
-	// remote 目录给展示名、上下文窗口与倍率；拉不到时回落内置模型表
-	// （至少让用户知道有哪些模型，只是没有定价）。
-	remote := p.cfg.TraeClient.FetchRemoteModels(context.Background(), cfg, acc, false)
-
-	ids := make([]string, 0, len(remote))
-	if len(remote) > 0 {
-		for id, row := range remote {
-			if !trae.IsCallableModel(row) {
-				continue
-			}
-			ids = append(ids, id)
-		}
-	} else {
-		ids = trae.KnownModels()
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	sort.Strings(ids)
-
-	out := make([]map[string]any, 0, len(ids))
-	for _, id := range ids {
-		row := remote[id]
-		display := row.DisplayName
-		if display == "" {
-			display = id
-		}
-		entry := map[string]any{
-			"id":       "trae:" + panelTraeRealm + ":" + id,
-			"upstream": panelUpstreamTrae,
-			"name":     display,
-		}
-		if row.ContextWindow > 0 {
-			entry["context_length"] = row.ContextWindow
-		}
-		if row.Multimodal {
-			entry["supports_images"] = true
-		}
-		// 倍率：与 CodeBuddy 同格式（"x0.15"）。只有上游明示才写——缺失表示未知，
-		// 不能当成免费（dsh account-pool.ts 的教训）。
-		if row.RateText != "" {
-			entry["credits"] = row.RateText
-		}
-		out = append(out, entry)
-	}
-	return out
-}
-
 // panelTraeRealm Trae 当前只实现 CN 域（与 server 侧 defaultTraeRealm 一致）。
 const panelTraeRealm = "cn"
-
-// firstEnabledTraeAccount 取一个可用的 Trae 账号（拉目录只需任意一个）。
-func firstEnabledTraeAccount(cfg *trae.Config) *trae.Account {
-	if cfg == nil {
-		return nil
-	}
-	for i := range cfg.Accounts {
-		a := &cfg.Accounts[i]
-		if a.Disabled || a.AccessToken == "" {
-			continue
-		}
-		return a
-	}
-	return nil
-}
 
 // modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out
 // 写入的契约文件），供前端在「模型与档位」的实测列做风险标注。

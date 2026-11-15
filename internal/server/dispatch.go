@@ -479,7 +479,7 @@ func (h *Handler) recordBackendUsage(acc gateway.Account, model, modelRate strin
 	// 积分估算：Trae 的 chat 流不含扣费字段（实测），只能按 token × 模型倍率推算。
 	// 标成估算——它不参与选号成本分层，只作数量级参考。
 	if res.Usage != nil && !st.hasCredit {
-		if rate, ok := h.traeRateFor(acc, model); ok {
+		if rate, ok := h.traeRateFor(context.Background(), acc, model); ok {
 			if est, ok2 := trae.EstimateCreditsFromUsage(
 				res.Usage.PromptTokens, res.Usage.CacheRead,
 				res.Usage.CacheCreation, res.Usage.CompletionTokens, rate); ok2 {
@@ -608,32 +608,17 @@ func InitTraeRawDump() {
 
 // traeRateFor 取该模型在 Trae 目录里的积分倍率。
 //
+// 走池的 ModelRateFor → 账号自己的 gateway.ModelRate 实现（Trae 读 remote 目录
+// 的 30 分钟缓存），**不再在这里重新挑账号、重新拉目录**：改造前这里为一次
+// 估算又发一遍 HTTPS，既慢又绕过了池的健康判据。
+//
 // 目录拉不到或该模型无倍率信息时返回 false——不估算未知倍率，
 // 否则会把「未知」写成 0 被误读成免费。
-func (h *Handler) traeRateFor(acc gateway.Account, model string) (float64, bool) {
+func (h *Handler) traeRateFor(ctx context.Context, acc gateway.Account, model string) (float64, bool) {
 	if acc == nil || acc.Backend() != "trae" || model == "" {
 		return 0, false
 	}
-	if h.cfg.TraeClient == nil {
-		return 0, false
-	}
-	cfg := h.traeConfig()
-	if cfg == nil {
-		return 0, false
-	}
-	a := backendtrae.Unwrap(acc)
-	if a == nil {
-		return 0, false
-	}
-	cat := h.cfg.TraeClient.FetchRemoteModels(context.Background(), cfg, a, false)
-	if cat == nil {
-		return 0, false
-	}
-	row, ok := cat[model]
-	if !ok || row.CreditMultiplier == nil || *row.CreditMultiplier <= 0 {
-		return 0, false
-	}
-	return *row.CreditMultiplier, true
+	return h.cfg.Pool.ModelRateFor(ctx, acc, model)
 }
 
 // noteBackendRemain 记录上游流内上报的余额（并更新选号用的 credits）。

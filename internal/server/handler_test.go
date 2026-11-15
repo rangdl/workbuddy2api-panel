@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
@@ -103,6 +105,16 @@ func (b *bindStore) lastUID(key string) (string, bool) {
 	return u, ok
 }
 
+// resetCatalogCache 清空池的模型目录缓存（每个模型相关测试开头调用）。
+//
+// 缓存已从 server 侧（dynamicModelsCache）收进池：改造前 server 与 panel 各维护
+// 一份 TTL 不同的缓存，是「面板列表 ≠ API 列表」的结构性来源。
+func resetCatalogCache(p *pool.Pool) {
+	if p != nil {
+		p.InvalidateCatalog()
+	}
+}
+
 // testPoolWith 构建一个所有账号 credits=1000 的池，并注入确定性随机源：
 // randInt64N 恒返回 0 → pickWeighted 必选候选集中积分最高者（第一个）。
 // 这让依赖"bad 先被选中"的轮转测试（如 TestChatRotatesOnHardCredit）完全确定，
@@ -114,6 +126,39 @@ func testPoolWith(auths ...*auth.Auth) *pool.Pool {
 		p.Add(pool.WrapAuth(a))
 		p.SetCredits(a.UID, 1000, 0)
 	}
+	return p
+}
+
+// testPoolWithCatalog 同 testPoolWith，但注入目录兜底——pool.WrapAuth 产生的是
+// 最小适配器（不实现 gateway.Cataloger），生产路径的账号经 backend 包装才带目录
+// 能力。模型相关测试必须显式接上兜底，否则 /v1/models 会整片为空。
+func testPoolWithCatalog(t *testing.T, up *upstream.Client, auths ...*auth.Auth) *pool.Pool {
+	t.Helper()
+	p := testPoolWith(auths...)
+	p.SetCatalogFallback(func(ctx context.Context, backend string, acc gateway.Account) ([]gateway.CatalogModel, error) {
+		if backend != pool.BackendCodeBuddy {
+			return nil, gateway.ErrUnsupported
+		}
+		a := pool.UnwrapAuth(acc)
+		if a == nil {
+			return nil, gateway.ErrUnsupported
+		}
+		infos, err := up.FetchModels(a)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]gateway.CatalogModel, 0, len(infos))
+		for _, mi := range infos {
+			m := gateway.CatalogModel{ID: mi.ID, Name: mi.Name, SupportsImages: mi.SupportsImages}
+			m.ContextLength = mi.ContextWindow
+			m.MaxOutputTokens = mi.MaxTokens
+			if e, d := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); len(e) > 0 {
+				m.Efforts, m.DefaultEffort = e, d
+			}
+			out = append(out, m)
+		}
+		return out, nil
+	})
 	return p
 }
 
@@ -976,7 +1021,9 @@ func TestChatModelForbiddenByAccountTypeReturns400(t *testing.T) {
 }
 
 func TestModelsEndpoint(t *testing.T) {
-	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
+	up := upstream.New()
+	p := testPoolWithCatalog(t, up, &auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
 	req := httptest.NewRequest("GET", "/v1/models", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -1005,17 +1052,13 @@ func TestModelsEndpoint(t *testing.T) {
 
 func TestModelsDynamic(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	// 缓存清空由 resetCatalogCache(p) 在池构造后完成。
 
 	// 假上游返回动态模型（含 agents + maxInputTokens/maxOutputTokens + reasoning 档位）
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 200, `{"code":0,"data":{"models":[{"id":"dyn-model-a","maxInputTokens":65536,"maxOutputTokens":8192,"reasoning":{"effort":"medium","supportedEfforts":["low","medium","high"]}},{"id":"dyn-model-b","maxInputTokens":131072,"maxOutputTokens":16384},{"id":"glm-9.9","maxInputTokens":262144,"maxOutputTokens":32768}],"agents":[{"name":"cli","models":["dyn-model-a","dyn-model-b","glm-9.9"]}]}}`, false
 	})
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p := testPoolWithCatalog(t, up, &auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
@@ -1074,9 +1117,7 @@ func TestModelsDynamic(t *testing.T) {
 	}
 
 	// 第二次调用走缓存（把上游关掉也成功）
-	dynamicModelsCache.RLock()
-	cached := len(dynamicModelsCache.ids)
-	dynamicModelsCache.RUnlock()
+	cached := len(p.CachedCatalog("codebuddy"))
 	if cached != 3 {
 		t.Errorf("cache not populated: %d", cached)
 	}
@@ -1085,16 +1126,11 @@ func TestModelsDynamic(t *testing.T) {
 func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 	// 纯动态化（产品决策）：上游失败 → 空列表（200），不再回落静态表——
 	// 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型。
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
-
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 500, `boom`, false
 	})
+	p := testPoolWithCatalog(t, up, &auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	resetCatalogCache(p)
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
@@ -1112,17 +1148,12 @@ func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 	// 吸收上游 9832283：models 拉取失败只进负缓存，不 NoteError——
 	// NoteError 喂的是 chat 熔断器，models 端点 5xx 跨界惩罚 chat 通道健康号。
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
-
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：若仍罚号，一次 fetch 失败即熔断
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 500, `boom`, false
 	})
+	p := testPoolWithCatalog(t, up, &auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	resetCatalogCache(p)
+	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：若仍罚号，一次 fetch 失败即熔断
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
@@ -1136,18 +1167,16 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 }
 
 func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
-
 	var calls atomic.Int32 // FetchModels 企业/v3 两路并发探测回调，计数须原子
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls.Add(1)
 		return 500, `boom`, false
 	})
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p := testPoolWithCatalog(t, up, &auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	resetCatalogCache(p)
+	// 可注入时钟：负缓存按池的 now() 判定，拨表比 sleep 5 分钟现实。
+	now := time.Now()
+	p.SetCatalogClock(func() time.Time { return now })
 	h := NewHandler(Config{Pool: p, Upstream: up})
 
 	// 连续 3 次请求，上游持续 500 → 只应触发 1 次 fetch（负缓存生效），
@@ -1164,10 +1193,8 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 		t.Errorf("want 2 probes (console + v3), got %d", got)
 	}
 
-	// 冷却期结束（把失败时间戳拨回 10 分钟前）→ 应重新 fetch。
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.lastFail = time.Now().Add(-10 * time.Minute)
-	dynamicModelsCache.Unlock()
+	// 冷却期结束（把时钟拨到 10 分钟后）→ 应重新 fetch。
+	now = now.Add(10 * time.Minute)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
 	if rec.Code != 200 {
@@ -2015,24 +2042,15 @@ func TestChatHiddenModelRejected(t *testing.T) {
 }
 
 // TestModelsHiddenFiltered models.hidden 黑名单：/v1/models 列表里过滤掉隐藏模型。
-// 用包级 dynamicModelsCache 预置目录，避免联网拉取。
+// 用池的目录兜底直接给固定清单，避免联网拉取。
 func TestModelsHiddenFiltered(t *testing.T) {
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = []upstream.ModelInfo{{ID: "glm-5.2"}, {ID: "deepseek-v3"}}
-	dynamicModelsCache.fetched = time.Now()
-	dynamicModelsCache.Unlock()
-	defer func() {
-		dynamicModelsCache.Lock()
-		dynamicModelsCache.ids = nil
-		dynamicModelsCache.fetched = time.Time{}
-		dynamicModelsCache.lastFail = time.Time{}
-		dynamicModelsCache.Unlock()
-	}()
-
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 200, `{"data":[]}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.SetCatalogFallback(func(context.Context, string, gateway.Account) ([]gateway.CatalogModel, error) {
+		return []gateway.CatalogModel{{ID: "glm-5.2"}, {ID: "deepseek-v3"}}, nil
+	})
 	h := NewHandler(Config{Pool: p, Upstream: up, ModelsHidden: []string{"deepseek-v3"}})
 
 	rec := httptest.NewRecorder()

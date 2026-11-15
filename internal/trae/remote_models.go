@@ -47,6 +47,11 @@ type RemoteModel struct {
 	DisplayName string
 	// ContextWindow 上下文窗口（context_window_tokens.dev）。
 	ContextWindow int64
+	// MaxContextWindow 上游开启 max_mode 时的扩展上下文（context_window_tokens.max）。
+	//
+	// 只在 max_mode=true 时才有意义——上游对多数模型都下发 max 数值，但只有
+	// 开了 max_mode 才真正按它服务（dsh model-metadata.ts 的判定）。0 = 无扩展档。
+	MaxContextWindow int64
 	// Multimodal 是否支持图片输入。
 	Multimodal bool
 	// CreditMultiplier 积分倍率（每 token 的积分倍率）。
@@ -70,6 +75,17 @@ type RemoteModel struct {
 	ConfigSource int64
 	// Invisible 上游在其模型选择器里是否隐藏该 config。
 	Invisible bool
+
+	// ReasoningSupported 上游是否对该模型开启思考（features.reasoning.enable）。
+	//
+	// 这是**能力开关**，与下面两档位列表不同：上游可能 enable=true 却不下发
+	// 档位（此时用网关的默认档），也可能 enable=false 却仍带 options。
+	ReasoningSupported bool
+	// ReasoningEfforts 上游公布的可用思考档位，已归一成网关的档位名
+	// （low/medium/high/xhigh/max）。空 = 上游未公布，不代表不支持。
+	ReasoningEfforts []string
+	// ReasoningDefault 上游公布的默认档位（已归一）。空 = 未公布。
+	ReasoningDefault string
 }
 
 // remoteCache 进程内缓存。
@@ -216,6 +232,11 @@ func parseRemoteModels(body map[string]any) map[string]RemoteModel {
 		}
 		if cw, ok := m["context_window_tokens"].(map[string]any); ok {
 			row.ContextWindow = intOf(cw["dev"])
+			// 扩展上下文只在 max_mode=true 时生效：上游对多数模型都下发 max 数值，
+			// 但不开 max_mode 时不按它服务（dsh model-metadata.ts 实测结论）。
+			if m["max_mode"] == true {
+				row.MaxContextWindow = intOf(cw["max"])
+			}
 		}
 		row.Multimodal = m["multimodal"] == true
 		// 可调用性信号（dsh isPromotableWireModel 的三个判据）：
@@ -231,6 +252,9 @@ func parseRemoteModels(body map[string]any) map[string]RemoteModel {
 			row.CreditMultiplier = rate
 			row.RateText = text
 		}
+		// 思考能力与档位：reasoning_effort_config 是对象（与 features 不同，
+		// 这个字段不需要二次解析 JSON 字符串）。
+		row.ReasoningSupported, row.ReasoningEfforts, row.ReasoningDefault = parseReasoning(m)
 		// 去重：同一模型可能在多个 function 分组下重复出现，
 		// 已存在的保留（首个即可，字段内容一致）。
 		if _, exists := out[id]; !exists {
@@ -238,6 +262,103 @@ func parseRemoteModels(body map[string]any) map[string]RemoteModel {
 		}
 	}
 	return out
+}
+
+// wireEffortToGateway Trae 原生档位 → 网关档位名，**只含能真正送达的档位**。
+//
+// 与 payload.go 的 reasoningEffortMap 是互逆的两半：那边把客户端发来的网关
+// 档位翻成上游 wire 名，这里把上游公布的名字翻回来给面板展示。
+//
+// 只收**往返一致**的档位（gw → wire → gw 为恒等）。payload 当前的映射是
+// 多对一，medium 会被发成 high、max 会被发成 extra_high——这两个档位即使上游
+// 公布，也送不出去。把它们标成「支持」等于骗用户：面板说选了 max，实际按
+// extra_high 计费出答案，既不报错也不留痕。
+//
+// 代价是上游若哪天公布 medium/max，面板不会列出来。这是刻意选择：**不展示
+// 一个做不到的选项** 比展示了再静默降级好。要放开就得先修 payload 的映射，
+// 让它成为 dsh WIRE_EFFORT_MAP 那样的精确双射。
+//
+// 实测（dsh 2026-10-25，98 行目录）：上游只公布 light/high/extra_high 及其
+// 组合，medium/max 目前根本不会出现，所以这个限制当下没有损失。
+var wireEffortToGateway = map[string]string{
+	"light":      "low",
+	"high":       "high",
+	"extra_high": "xhigh",
+}
+
+// parseReasoning 解析 wire 的思考能力与档位。
+//
+// 数据形态（dsh model-metadata.ts 实测）：
+//
+//	"reasoning_effort_config": {"options":["light","high","extra_high"],
+//	                            "default_level":"high"}
+//	"features": "{\"reasoning\":{\"enable\":true}}"
+//
+// 三个返回值各自独立：
+//   - supported 取 features.reasoning.enable（能力开关）
+//   - efforts 取 options 里能识别的档位（未知名字丢弃，不臆造）
+//   - def 只在「已识别且确实在 options 里」时给出，避免展示一个发不出去的默认档
+//
+// 上游未公布档位是常态：实测 2026-10-25 只给了 light/high/extra_high 三档，
+// 且不少模型的 reasoning_effort_config 整个缺失。这时 efforts 为空、由调用方
+// 回落到网关的静态档位表，而不是假装「不支持思考」。
+func parseReasoning(m map[string]any) (supported bool, efforts []string, def string) {
+	if feats, ok := parseFeaturesObj(m["features"]); ok {
+		if r, ok := feats["reasoning"].(map[string]any); ok {
+			supported = r["enable"] == true
+		}
+	}
+	cfg, ok := m["reasoning_effort_config"].(map[string]any)
+	if !ok {
+		return supported, nil, ""
+	}
+	opts, ok := cfg["options"].([]any)
+	if !ok {
+		return supported, nil, ""
+	}
+	seen := make(map[string]bool, len(opts))
+	for _, o := range opts {
+		name, ok := o.(string)
+		if !ok {
+			continue
+		}
+		gw, hit := wireEffortToGateway[strings.ToLower(strings.TrimSpace(name))]
+		if !hit || seen[gw] {
+			continue
+		}
+		seen[gw] = true
+		efforts = append(efforts, gw)
+	}
+	if len(efforts) == 0 {
+		return supported, nil, ""
+	}
+	if raw, ok := cfg["default_level"].(string); ok {
+		if gw, hit := wireEffortToGateway[strings.ToLower(strings.TrimSpace(raw))]; hit && seen[gw] {
+			def = gw
+		}
+	}
+	return supported, efforts, def
+}
+
+// parseFeaturesObj 把 features 字段解析成对象。
+//
+// features 是 JSON **字符串**（不是对象）——上游把它当转义后的配置块下发。
+// 少数历史响应直接给对象，两种都接受。
+func parseFeaturesObj(v any) (map[string]any, bool) {
+	switch f := v.(type) {
+	case map[string]any:
+		return f, true
+	case string:
+		if f == "" {
+			return nil, false
+		}
+		var out map[string]any
+		if err := json.Unmarshal([]byte(f), &out); err != nil {
+			return nil, false
+		}
+		return out, true
+	}
+	return nil, false
 }
 
 // parseConsumptionRate 从 features 里提取积分倍率。
@@ -250,12 +371,8 @@ func parseRemoteModels(body map[string]any) map[string]RemoteModel {
 // 有限正数才给出倍率；其余一律返回 nil（未知）。rate=0 也要如实返回，
 // 那是上游明示的免费模型。
 func parseConsumptionRate(features any) (*float64, string) {
-	s, ok := features.(string)
-	if !ok || s == "" {
-		return nil, ""
-	}
-	var parsed map[string]any
-	if err := json.Unmarshal([]byte(s), &parsed); err != nil {
+	parsed, ok := parseFeaturesObj(features)
+	if !ok {
 		return nil, ""
 	}
 	cr, ok := parsed["consumption_rate"].(map[string]any)

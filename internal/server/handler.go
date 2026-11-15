@@ -13,11 +13,10 @@ import (
 	"os"
 	"strings"
 
-	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -27,8 +26,6 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
-
-	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 )
 
 // Config handler 依赖。
@@ -346,28 +343,16 @@ func countsMapFrom(total, healthy, cooling, disabled, inFlightFull int) map[stri
 	}
 }
 
-// dynamicModelsCache 动态模型缓存。
-var dynamicModelsCache struct {
-	sync.RWMutex
-	ids      []upstream.ModelInfo
-	fetched  time.Time // 最近一次成功拉取时间
-	lastFail time.Time // 最近一次拉取失败时间（负缓存）
-}
-
-const (
-	// dynamicModelsTTL 模型目录缓存时长。曾是 1h；缩到 10min 对齐「面板实时、
-	// API 缓存」的漂移痛点（PR #38 报告）：目录新增模型时面板立即可见，公开
-	// /v1/models 最多滞后一个 TTL。再短就不值得——每次失效都是 2 次上游探测。
-	dynamicModelsTTL        = 10 * time.Minute
-	modelsFetchFailCooldown = 5 * time.Minute
-)
+// 模型目录缓存已收进池（pool.CachedCatalog / pool.CatalogAll，成功 10 分钟 +
+// 失败负缓存 5 分钟）。server 侧原来那份 dynamicModelsCache 与 panel 各维护一份
+// TTL 还不同，是「面板列表 ≠ API 列表」的结构性来源。
 
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   h.modelList(r.Context()),
 	})
 }
 
@@ -384,237 +369,150 @@ func fmtCreditsPrefix(raw string) string {
 	return "[" + s + " credit]"
 }
 
-// applyModelInfoFields 把上游模型对象全字段（ModelInfo）按「空值省略」写出规则
-// 合入 /v1/models 条目：name/description/credits/tags/vendor/能力旗标/
-// max_allowed_size/reasoning_effort/reasoning_summary。CN 动态分支与 global
-// 探测命中分支共用（两域模型对象同构），保证输出字段集一致。
-// 不覆盖 id/object/created/owned_by 及调用方先前写好的基础字段；上游未下发的
-// 字段（零值）整体省略——不编造。
-func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[string]any {
-	if mi.Name != "" {
-		entry["name"] = mi.Name
-	}
-	if mi.Description != "" {
-		// 积分倍率前缀：从 "x0.05 credits" / "x0.29" 等格式提取纯数字，
-		// 统一为 "[x0.05 credit]" 前缀拼入 description，方便下游面板直接展示。
-		if mi.Credits != "" {
-			entry["description"] = fmtCreditsPrefix(mi.Credits) + " " + mi.Description
-		} else {
-			entry["description"] = mi.Description // descriptionZh 中文描述
+// modelList 模型列表：CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel
+// 对称）；global 域加 "global:"、Trae 加 "trae:cn:"。
+//
+// 数据源是池的 CatalogAll（gateway.Cataloger 可选能力），本函数只做字段名映射：
+// 客户端契约用的是 reasoning_supported_efforts / reasoning_default_effort，
+// 与面板的 supported_efforts / default_effort 不同名，所以两侧各保留自己的
+// 映射层，但**共用同一份数据与同一个选号逻辑**。
+//
+// 缓存完全在池里（pool.catalogCached：成功 10 分钟 / 失败负缓存 5 分钟），
+// 本函数不做任何缓存判断，也不重复拉取——改造前 server 与 panel 各维护一份
+// TTL 不同的缓存，导致两侧列表机制上允许不一致。
+func (h *Handler) modelList(ctx context.Context) []map[string]any {
+	out := make([]map[string]any, 0)
+	// models.hidden 黑名单：快照外提，避免逐条目重复 Load。
+	hidden := h.loadLive().HiddenModels
+	for _, res := range h.cfg.Pool.CatalogAll(ctx) {
+		realm := res.Realm
+		if realm == "" {
+			realm = "cn"
+		}
+		prefix := catalogPrefix(res.Backend, realm)
+		for _, m := range res.Models {
+			id := prefix + m.ID
+			if _, ok := hidden[id]; ok {
+				continue
+			}
+			out = append(out, catalogEntry(id, res.Backend, m))
 		}
 	}
-	if mi.Credits != "" {
-		entry["credits"] = mi.Credits // 积分倍率原文（如 "x0.05"），仅展示
+	return out
+}
+
+// catalogPrefix 模型 ID 的路由前缀（客户端调用时要填的完整值）。
+//
+// Trae 是三段式 "trae:cn:"，其余上游是 "<realm>:"。这个差异来自路由协议本身：
+// trae: 前缀显式指定上游，realm 段仍要保留以便将来 Trae 有多域。
+func catalogPrefix(backend, realm string) string {
+	if backend == "trae" {
+		return "trae:" + realm + ":"
 	}
-	if len(mi.Tags) > 0 {
-		entry["tags"] = mi.Tags
+	return realm + ":"
+}
+
+// catalogEntry 统一目录条目 → /v1/models 的 OpenAI 风格条目。
+//
+// owned_by 保留上游名，客户端据此区分来源（改造前 CodeBuddy 固定写
+// "workbuddy"、Trae 写 "trae"，现在统一为上游名，语义更直接）。
+func catalogEntry(id, backend string, m gateway.CatalogModel) map[string]any {
+	entry := map[string]any{
+		"id":       id,
+		"object":   "model",
+		"created":  1753600000,
+		"owned_by": backend,
 	}
-	if mi.Vendor != "" {
-		entry["vendor"] = mi.Vendor
+	if m.Name != "" {
+		entry["name"] = m.Name
 	}
-	if mi.IsDefault {
-		entry["is_default"] = true
+	if m.ContextLength > 0 {
+		entry["context_length"] = m.ContextLength
 	}
-	if mi.SupportsImages {
-		entry["supports_images"] = true // 多模态能力透出
+	if m.ContextLengthBase > 0 {
+		entry["context_length_base"] = m.ContextLengthBase
 	}
-	if mi.SupportsReasoning {
+	if m.MaxOutputTokens > 0 {
+		entry["max_output_tokens"] = m.MaxOutputTokens
+	}
+	// effort 能力透出（客户端契约名带 reasoning_ 前缀）。
+	if len(m.Efforts) > 0 {
+		entry["reasoning_supported_efforts"] = m.Efforts
+		if m.DefaultEffort != "" {
+			entry["reasoning_default_effort"] = m.DefaultEffort
+		}
+	}
+	if m.SupportsReasoning {
 		entry["supports_reasoning"] = true
-		if mi.CanDisableThinking {
-			entry["can_disable_thinking"] = true
-		}
 	}
-	if mi.SupportsToolCall {
+	if m.CanDisableThinking {
+		entry["can_disable_thinking"] = true
+	}
+	if m.SupportsImages {
+		entry["supports_images"] = true
+	}
+	if m.SupportsToolCall {
 		entry["supports_tool_call"] = true
 	}
-	if mi.OnlyReasoning {
+	if m.IsDefault {
+		entry["is_default"] = true
+	}
+	if m.OnlyReasoning {
 		entry["only_reasoning"] = true
 	}
-	if mi.MaxAllowedSize > 0 {
-		entry["max_allowed_size"] = mi.MaxAllowedSize
+	if m.ReasoningEffort != "" {
+		entry["reasoning_effort"] = m.ReasoningEffort
 	}
-	if mi.ReasoningEffort != "" {
-		entry["reasoning_effort"] = mi.ReasoningEffort
+	if m.ReasoningSummary != "" {
+		entry["reasoning_summary"] = m.ReasoningSummary
 	}
-	if mi.ReasoningSummary != "" {
-		entry["reasoning_summary"] = mi.ReasoningSummary
+	if m.MaxAllowedSize > 0 {
+		entry["max_allowed_size"] = m.MaxAllowedSize
+	}
+	// 倍率：统一放 credits（"x0.15"），两个上游同格式，客户端不必区分。
+	if m.Credits != "" {
+		entry["credits"] = m.Credits
+	}
+	// 积分倍率前缀拼进 description，方便只看描述的下游面板。
+	if m.Description != "" {
+		if m.Credits != "" {
+			entry["description"] = fmtCreditsPrefix(m.Credits) + " " + m.Description
+		} else {
+			entry["description"] = m.Description
+		}
+	}
+	if m.Vendor != "" {
+		entry["vendor"] = m.Vendor
+	}
+	if len(m.Tags) > 0 {
+		entry["tags"] = m.Tags
+	}
+	// 限时优惠：credits 是牌价，promo_* 是当前生效折扣。
+	if m.PromoFactor != nil {
+		entry["promo_factor"] = *m.PromoFactor
+		entry["promo_credits"] = m.PromoCredits
+	}
+	if m.PromoLabel != "" {
+		entry["promo_label"] = m.PromoLabel
+	}
+	if m.PromoNote != "" {
+		entry["promo_note"] = m.PromoNote
 	}
 	return entry
 }
 
-// modelList 模型列表：CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel
-// 对称）；global.enabled=true 时追加 global: 前缀的国际版名单。
-// 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
-func (h *Handler) modelList() []map[string]any {
-	out := make([]map[string]any, 0)
-	// models.hidden 黑名单：快照外提，避免逐条目重复 Load。
-	hidden := h.loadLive().HiddenModels
-	for _, mi := range h.fetchDynamicModels() {
-		if _, ok := hidden["cn:"+mi.ID]; ok {
-			continue
-		}
-		entry := map[string]any{
-			"id":       "cn:" + mi.ID,
-			"object":   "model",
-			"created":  1753600000,
-			"owned_by": "workbuddy",
-		}
-		// context_length / max_output_tokens 四级查找（upstream.model_catalog）：
-		// 上游动态值（maxInputTokens/maxOutputTokens）权威 → 静态种子表 →
-		// model.json 本地缓存 → models.dev 按需拉取（异步不阻塞本次响应，拉到后
-		// 写 model.json 供下次命中）→ 1M 兜底 / max_output_tokens 省略。
-		// 上游零值不再透出假 131072（误导 Codex/ZCode 等按 context_length 提前
-		// 截断、白白丢上下文）。
-		entry["context_length"] = upstream.ContextWindowListingV4(mi.ID, mi.ContextWindow, h.cfg.Upstream.HTTP)
-		if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, h.cfg.Upstream.HTTP); ok {
-			entry["max_output_tokens"] = mo
-		}
-		// 上游模型对象全字段透出（name/描述/标签/倍率/能力旗标等，空值省略）。
-		entry = applyModelInfoFields(entry, mi)
-		// effort 能力透出——远端 supportedEfforts 权威，缺失落到 CN 静态兜底表
-		// （客户端可发现档位，不再盲传）。无档位 → 省略字段。
-		if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
-			entry["reasoning_supported_efforts"] = efforts
-			if def != "" {
-				entry["reasoning_default_effort"] = def
-			}
-		}
-		out = append(out, entry)
-	}
-	// global 模型名单：仅 GlobalEnabled=true 时列出（逃生门）。
-	// 名单 = 纯动态探测结果（fetchGlobalModels，失败/无号 → 空）。
-	if h.cfg.GlobalEnabled {
-		// global 域 effort 能力三级查找：探测下发桶（权威）→ 静态兜底表 → 省略。
-		// 先 fetchGlobalModels（内部探测并落 effort 桶），再按 id 取快照。
-		globalIDs, globalAccount := h.fetchGlobalModels()
-		// 探测对象形态的全字段条目（与 fetchGlobalModels 共享同一次探测缓存）：
-		// 命中 id 才透出富字段；窄表/失败 → nil，按裸 ID 条目输出（不编造字段）。
-		// globalAccount 为 nil（无 global 号）时返回 nil，跳过富字段映射。
-		globalInfos := map[string]upstream.ModelInfo{}
-		for _, mi := range h.cfg.Upstream.FetchGlobalModelInfos(globalAccount) {
-			globalInfos[mi.ID] = mi
-		}
-		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
-		for _, id := range globalIDs {
-			if _, ok := hidden["global:"+id]; ok {
-				continue
-			}
-			entry := map[string]any{
-				"id":       "global:" + id,
-				"object":   "model",
-				"created":  1753600000,
-				"owned_by": "workbuddy",
-			}
-			// context_length / max_output_tokens 四级查找（与 CN 动态分支同口径）。
-			var remoteCtx, remoteOut int64
-			if mi, ok := globalInfos[id]; ok {
-				entry = applyModelInfoFields(entry, mi)
-				remoteCtx, remoteOut = mi.ContextWindow, mi.MaxTokens
-			}
-			entry["context_length"] = upstream.ContextWindowListingV4(id, remoteCtx, h.cfg.Upstream.HTTP)
-			if mo, ok := upstream.MaxOutputTokensListingV4(id, remoteOut, h.cfg.Upstream.HTTP); ok {
-				entry["max_output_tokens"] = mo
-			}
-			if efforts, def := upstream.EffortListing("global", id, globalEfforts[id], globalDefaults[id]); efforts != nil {
-				entry["reasoning_supported_efforts"] = efforts
-				if def != "" {
-					entry["reasoning_default_effort"] = def
-				}
-			}
-			out = append(out, entry)
-		}
-	}
-	// Trae 模型并入同一份列表：倍率走同一个 credits 字段（"x0.15"），
-	// 客户端不需要区分上游就能看到定价。显式前缀形态见 traeModelEntries。
-	out = append(out, h.traeModelEntries()...)
-	return out
-}
-
-// fetchGlobalModels 返回 global 模型名单（纯动态探测结果）及被探测账号。
-// 缓存/失败回落封在 upstream.FetchGlobalModels（内部 1h + 5min 负缓存）。
-// 本方法只负责"何时探测"：池中无 global 账号 → 空名单 + nil 账号（零上游调用）。
-// 返回的 acct 供调用方在同一账号上取富 ModelInfo（FetchGlobalModelInfos 与
-// FetchGlobalModels 共享缓存，不会触发第二次上游探测）。
-// GlobalEnabled=false 时 modelList 已不进入本分支（逃生门在调用方 gate）。
-func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
-	acc := h.cfg.Pool.PickExcludingForRealm(nil, "", "global")
-	if acc == nil {
-		return nil, nil
-	}
-	// 全球模型探测是 CodeBuddy 专有能力。
-	acct := pool.UnwrapAuth(acc)
-	if acct == nil {
-		return nil, nil
-	}
-	return h.cfg.Upstream.FetchGlobalModels(acct), acct
-}
-
-// fetchDynamicModels 从第一个可用 CN 账号拉模型列表（含 contextWindow/maxTokens），
-// 缓存 10min。
-// 选号与 /panel/api/models 完全同口径（AvailableUIDsForRealm("cn") 首个 + AuthByUID），
-// 而非 Pool.Pick()：Pick 无 realm 过滤，混合池里可能选中 global 号去打 CN 端点，
-// 表现为偶发失败/面板与 /v1/models 两套目录（PR #38 报告并给出的选号修复）。
-// 缓存 + 5min 负缓存按既有语义**保留**（#38 原案整体删除缓存被拒）：公开端点逐请求
-// 实时拉取 = 每次 2 个上游探测，客户端周期性刷新模型列表会持续打上游；上游故障时
-// 无冷却窗口，客户端重试即放大请求量——负缓存正是为此设计（见 handler_test 吸收
-// 上游 9832283 的注释）；且 cachedModelsSnapshot（gateway_hint 判定）依赖缓存写入。
-func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
-	dynamicModelsCache.RLock()
-	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
-		out := dynamicModelsCache.ids
-		dynamicModelsCache.RUnlock()
-		return out
-	}
-	// 失败负缓存：冷却期内不再请求上游。
-	if !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
-		dynamicModelsCache.RUnlock()
-		return nil
-	}
-	dynamicModelsCache.RUnlock()
-
-	uids := h.cfg.Pool.AvailableUIDsForRealm("cn")
-	if len(uids) == 0 {
-		return nil
-	}
-	acct := h.cfg.Pool.AuthByUID(uids[0])
-	if acct == nil {
-		return nil
-	}
-	infos, err := h.cfg.Upstream.FetchModels(acct)
-	if err != nil || len(infos) == 0 {
-		// 拉取失败只进负缓存（5min lastFail），不 NoteError：NoteError 喂的是 chat
-		// 熔断器，models 端点偶发 5xx 跨界惩罚 chat 通道健康的账号；
-		// models 拉取失败 ≠ 账号 chat 不可用。
-		// 只在真正打上游失败时记一行（负缓存期内前面已直接 return，不会刷屏）：
-		// 此前这里静默，CN 域不可达时 /v1/models 只剩 global 模型却毫无线索。
-		if err == nil {
-			err = fmt.Errorf("models api returned empty list")
-		}
-		log.Printf("WARN: [server] /v1/models: CN 模型目录拉取失败（%s 内不再重试，cn: 模型暂不列出）: %v",
-			modelsFetchFailCooldown, err)
-		dynamicModelsCache.Lock()
-		dynamicModelsCache.lastFail = time.Now()
-		dynamicModelsCache.Unlock()
-		return nil
-	}
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = infos
-	dynamicModelsCache.fetched = time.Now()
-	dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
-	dynamicModelsCache.Unlock()
-	return infos
-}
-
-// cachedModelsSnapshot 只读模型目录缓存（TTL 内快照）；缓存冷/空 → nil。
-// 不发起任何上游调用（hint 判定用：错误路径加一次 FetchModels 网络调用既拖慢
-// 错误响应、又污染上游调用语义）。
-func cachedModelsSnapshot() []upstream.ModelInfo {
-	dynamicModelsCache.RLock()
-	defer dynamicModelsCache.RUnlock()
-	if len(dynamicModelsCache.ids) == 0 || time.Since(dynamicModelsCache.fetched) >= dynamicModelsTTL {
-		return nil
-	}
-	return dynamicModelsCache.ids
+// 该号冷却/熔断时拉取失败，表现为「模型列表偶尔整片消失」。
+//
+// cachedCatalog 只读池的模型目录缓存（**不触发上游拉取**）。
+//
+// 原先是 server 自己维护一份 dynamicModelsCache（10 分钟 TTL + 5 分钟负缓存）。
+// 那份缓存与 panel 各自维护、TTL 还不同，导致「面板显示的列表」与「API 返回的
+// 列表」机制上允许不一致。现在缓存统一在池里（pool.catalogCached），这里只读。
+//
+// 用途是 gateway_hint 判定（错误路径）：错误路径不能触发网络调用，否则会拖慢
+// 错误响应并在错误风暴时放大上游请求量。
+func (h *Handler) cachedCatalog(ctx context.Context, backend string) []gateway.CatalogModel {
+	return h.cfg.Pool.CachedCatalog(backend)
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -1413,20 +1311,22 @@ func hasImagePart(body []byte) bool {
 // 是否带图 + 模型目录 supports_images 声明（目录未收录 → ModelInCatalog=false，
 // 不做「不支持」判定，防查不到误判）。仅错误路径调用（成功请求零开销）。
 //
-// 目录查询只读既有缓存快照（cachedModelsSnapshot），**不触发上游拉取**：错误路径
-// 加一次 FetchModels 网络调用既拖慢错误响应、又污染上游调用语义（错误风暴时放大
-// 请求量——与 WAF IP fail-fast 的「不放大请求量」哲学相悖）。缓存冷（最近 10min 未
-// 拉过）→ ModelInCatalog=false，11133 退中性 hint（宁缺勿滥，不编造能力事实）。
+// 目录查询只读池的缓存快照（Pool.CachedCatalog），**不触发上游拉取**：错误路径
+// 加一次目录拉取既拖慢错误响应、又污染上游调用语义（错误风暴时放大请求量——
+// 与 WAF IP fail-fast 的「不放大请求量」哲学相悖）。缓存冷（最近 10min 未拉过）
+// → ModelInCatalog=false，11133 退中性 hint（宁缺勿滥，不编造能力事实）。
 func (h *Handler) hintContext(bareModel string, hasImage bool) upstream.HintContext {
 	ctx := upstream.HintContext{Model: bareModel, HasImage: hasImage}
 	if bareModel == "" {
 		return ctx
 	}
-	for _, mi := range cachedModelsSnapshot() {
-		if mi.ID == bareModel {
-			ctx.ModelInCatalog = true
-			ctx.ModelSupportsImages = mi.SupportsImages
-			return ctx
+	for _, backend := range []string{"codebuddy", "trae"} {
+		for _, mi := range h.cfg.Pool.CachedCatalog(backend) {
+			if mi.ID == bareModel {
+				ctx.ModelInCatalog = true
+				ctx.ModelSupportsImages = mi.SupportsImages
+				return ctx
+			}
 		}
 	}
 	return ctx

@@ -24,6 +24,15 @@ type Pool struct {
 	uidIndex map[string][]string
 	// placeholder 占位账号工厂（持久化恢复时构造 entry.acc；nil = 只支持 CodeBuddy）。
 	placeholder func(backend, uid string) gateway.Account
+	// catalogFallback 目录兜底（账号未实现 gateway.Cataloger 时使用；nil = 不兜底）。
+	//
+	// 与 placeholder 同一模式：池不 import 具体上游，由 main 装配时把能力接进来。
+	catalogFallback CatalogFallback
+	// catalogMu / catalogCache 模型目录缓存（按 (上游,域) 分组，见 catalog.go）。
+	catalogMu    sync.Mutex
+	catalogCache map[catalogGroup]catalogCacheEntry
+	// nowFn 时钟注入（测试用；nil = time.Now）。
+	nowFn func() time.Time
 	// expiringSoonWindow 快过期积分窗口（SetExpiringSoonWindow 注入）。
 	//
 	// 为什么放在池里而不是各 backend 的 Credits 里：这是**调度策略**
