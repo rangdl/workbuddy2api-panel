@@ -26,10 +26,13 @@ const CFG_MAP = {
   breaker_cooldown: ['pool', 'breaker_cooldown'], breaker_cooldown_max: ['pool', 'breaker_cooldown_max'],
   idle_weight_per_hour: ['pool', 'idle_weight_per_hour'], idle_weight_max: ['pool', 'idle_weight_max'],
   ttl: ['session_sticky', 'ttl'],
-  timeout_seconds: ['upstream', 'timeout_seconds'], header_timeout_seconds: ['upstream', 'header_timeout_seconds'],
-  idle_timeout_seconds: ['upstream', 'idle_timeout_seconds'], user_agent: ['upstream', 'user_agent'],
+  // 超时属于**传输层**，两个上游共用（对话都是 SSE 长连接），故留在主配置。
+  // UA / 版本 / 域 base / 脱敏是上游专有，走 codebuddy.json（见
+  // collectCodeBuddyConfig / loadCodeBuddyConfig）。
+  timeout_seconds: ['upstream', 'timeout_seconds'],
+  header_timeout_seconds: ['upstream', 'header_timeout_seconds'],
+  idle_timeout_seconds: ['upstream', 'idle_timeout_seconds'],
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
-  sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
 };
@@ -45,6 +48,45 @@ const CFG_MAP = {
  * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
  */
 const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
+
+/* ── 分上游自动签到勾选 ────────────────────────────────────────────────
+   语义（与后端 schedule.checkin_backends 一一对应）：
+   - 总开关 checkin_enabled 关掉时整类任务不跑，本区勾选仍保留（只是无效）；
+   - 每个上游一个勾选，不勾 = 该上游不参与自动签到；
+   - **配置里没有该上游的键 = 启用**。这里把缺省值也渲染成勾选状态，让显示与
+     实际行为一致（否则用户会看到"能签到却显示关着"）。
+
+   上游列表来自后端返回的「账号池里实际存在的上游」，不是硬编码：
+   新增上游、或某上游账号全删光，列表自动跟着变。 */
+const BACKEND_LABEL_CFG = { codebuddy: 'WorkBuddy', trae: 'Trae' };
+let checkinBackendsState = null; // 加载时缓存，collect 时读它
+
+function renderCheckinBackends(backends, enabled) {
+  const box = $('checkinBackends');
+  if (!box) return;
+  const list = backends || [];
+  checkinBackendsState = {};
+  if (!list.length) {
+    box.innerHTML = '<span class="hint">账号池里还没有账号，添加后这里会列出对应上游</span>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const be of list) {
+    // 缺键 = 启用（后端 normalize 已补齐，但前端仍按"未给即启用"兜底，
+    // 保证接口未返回该表时不会把全部上游显示成关闭）。
+    const on = enabled == null || enabled[be] === undefined ? true : !!enabled[be];
+    checkinBackendsState[be] = on;
+    const lb = document.createElement('label');
+    lb.className = 'realm-opt';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = on;
+    cb.onchange = () => { checkinBackendsState[be] = cb.checked; };
+    lb.append(cb, document.createTextNode(' ' + (BACKEND_LABEL_CFG[be] || be)));
+    frag.append(lb);
+  }
+  box.replaceChildren(frag);
+}
 
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
@@ -67,6 +109,11 @@ async function loadConfig() {
       else if (Array.isArray(v)) el.value = v.join(', ');
       else el.value = v == null ? (name.startsWith('strategy_') ? 'weighted_random' : '') : v;
     }
+    // 分上游签到：上游列表由后端给（账号池里实际存在的），勾选状态取自
+    // schedule.checkin_backends（缺键 = 启用，见 renderCheckinBackends）。
+    renderCheckinBackends(
+      d.checkin_backends_available || [],
+      dig(cfgLoaded, ['schedule', 'checkin_backends']) || null);
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
     $('cfgNote').textContent = '';
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
@@ -88,6 +135,11 @@ function collectConfig() {
       else v = raw;
     }
     if (v !== undefined) put(out, path, v);
+  }
+  // 分上游签到勾选：整张表照发。不下发会让"用户取消勾选"这个动作丢失——
+  // 后端见不到键就按缺省启用处理，保存后又被悄悄勾回来。
+  if (checkinBackendsState && Object.keys(checkinBackendsState).length) {
+    put(out, ['schedule', 'checkin_backends'], { ...checkinBackendsState });
   }
   return out;
 }
@@ -139,6 +191,14 @@ $('cfgForm').onsubmit = async ev => {
   btn.disabled = true; btn.textContent = '保存中…';
   try {
     const r = await api('config', { method: 'POST', body: JSON.stringify(collectConfig()) });
+    // Trae 的两个上游特有字段（IDE 版本 / 签到 UA）落在独立的 trae.json 里，
+    // 不能塞进 config.json。配置页既然把它们画出来了，保存时必须一并提交，
+    // 否则用户改完"保存成功"却没生效——这是最难排查的一类假成功。
+    const traeBody = collectTraeConfig();
+    if (Object.keys(traeBody).length) {
+      try { await api('trae_config', { method: 'POST', body: JSON.stringify(traeBody) }); }
+      catch (e) { toast('Trae 配置保存失败：' + e.message, 'err'); }
+    }
     const n = (r.restart_required || []).length;
     toast(n ? '配置已保存，其中 ' + n + ' 项需重启进程生效' : '配置已保存并立即生效', 'ok');
     // 密钥可能已改：本次会话沿用新值，避免下一次轮询被 401。
@@ -150,253 +210,88 @@ $('cfgForm').onsubmit = async ev => {
   finally { btn.disabled = false; btn.textContent = '保存配置'; }
 };
 
-/* ── 上游接入：Trae（独立 trae.json） ─────────────────────────────── */
-/* 账号表与「账号池」同构（9 列）：健康色条 / 账号 / 状态 / 积分 / 成功失败 /
-   在途 / 用量 / 最近成功 / 操作。凭证永不回显（后端只给 has_* 布尔与尾号），
-   故本页只维护"保留哪些账号 / 顺序 / 启用态"。
-
-   与 WorkBuddy 账号池的差异只在数据来源：那边来自 pool（落盘 + Redis），
-   这边来自 trae.Stats（进程内，重启清零）+ 签到状态缓存 + 积分查询。 */
-
-/* traeCreditsHtml 积分列：有上限时画进度条，否则只显示剩余。
-   数据优先级：权威查询（有 limit）> notify_usage 余额 > 未知。 */
-function traeCreditsHtml(st) {
-  if (!st || (!st.credits && !st.credits_limit)) {
-    return '<div class="n" style="color:var(--ink-3)">—</div>';
-  }
-  const limit = st.credits_limit || 0;
-  const remain = st.credits || 0;
-  const pct = limit > 0 ? Math.min(100, Math.round(remain / limit * 100)) : 0;
-  const num = v => Math.round(v).toLocaleString();
-  const tip = '通用 ' + num(st.credits_ide || 0) + ' / Work ' + num(st.credits_work || 0) +
-    (limit > 0 ? '（额度 ' + num(limit) + '，' + pct + '%）' : '（额度未知）') +
-    (st.credits_at ? '\n更新于 ' + ago(st.credits_at) : '');
-  return '<div class="n" title="' + esc(tip) + '">' + num(remain) +
-    (limit > 0 ? '<span class="of">/' + num(limit) + '</span>' : '') + '</div>' +
-    (limit > 0 ? '<div class="bar"><i style="width:' + pct + '%"></i></div>' : '');
-}
-
-/* traeUsageHtml 用量列：与账号池同一套 formatTokenCount / formatLatency / formatRate。 */
-function traeUsageHtml(st) {
-  const tu = (st && st.token_usage) || {};
-  const req = tu.request_count || 0;
-  const totalTok = formatTokenCount(tu.total_tokens);
-  const totalTokUnit = totalTok === '—' ? '' : '<em>tok</em>';
-  const latency = formatLatency(st ? st.last_latency_ms : 0);
-  const rate = formatRate(tu.last_tokens_per_second);
-  const title = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate +
-    (tu.last_model ? '\n模型：' + tu.last_model : '');
-  return '<span class="usage-line" aria-label="' + esc(title) + '">' +
-    '<span class="usage-item usage-count" title="' + esc(title) + '"><b>' + req + '</b><em>次</em></span>' +
-    '<span class="usage-item usage-total"><b>' + totalTok + '</b>' + totalTokUnit + '</span>' +
-    '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
-    '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
-  '</span>';
-}
-
-/* traeStatusHtml 状态列：冷却 > 禁用 > 凭证缺失 > 可用；附签到状态。
-   返回的是内层容器：不能把 display:flex 直接设在 <td> 上——那会让单元格脱离
-   表格布局（变成普通 flex 容器），整行列宽错位。账号池的 rate-limits 同理。 */
-function traeStatusHtml(a, cool) {
-  const parts = [];
-  if (a.disabled) parts.push('<span class="tag bad">已禁用</span>');
-  else if (cool) {
-    const rem = Math.max(1, Math.round(cool.remaining_sec / 60));
-    parts.push('<span class="tag warn" title="' + esc(cool.reason || '') + '">冷却 · ' + rem + ' 分钟</span>');
-  } else if (!a.has_token) parts.push('<span class="tag bad">无 token</span>');
-  else parts.push('<span class="tag ok">可用</span>');
-
-  if (!a.has_refresh) parts.push('<span class="tag warn">无 refresh</span>');
-  if (!a.has_device_key) parts.push('<span class="tag warn" title="设备私钥缺失：token 续期需 DeviceProof 签名">无设备密钥</span>');
-  if (a.has_token && a.token_tail) {
-    parts.push('<span class="tag mute" title="access token 尾号（仅用于核对是哪一份凭证）">token ' + esc(a.token_tail) + '</span>');
-  }
-
-  // 签到状态：Done=账号已签；DeviceAlready=该设备已签（限额按设备算）。
-  const done = a.checkin_done === true;
-  const devDone = a.checkin_device_already === true;
-  if (done) parts.push('<span class="tag ok">今日已签</span>');
-  else if (devDone) parts.push('<span class="tag mute" title="签到限额按设备算，本账号今日无法再签">设备已签</span>');
-  else if (a.checkin_error) {
-    parts.push('<span class="tag warn" title="' + esc(a.checkin_error) + '">签到状态未知</span>');
-  }
-  return parts.join('');
-}
-
-function traeAccountRow(a, cool) {
-  const tr = document.createElement('tr');
-  tr.dataset.uid = a.uid;
-  const st = a.stats || {};
-
-  // 1. 健康色条：与账号池同色系（禁用/冷却=warn-bad）。
-  const tdMark = document.createElement('td');
-  tdMark.className = 'mark';
-  tdMark.setAttribute('aria-hidden', 'true');
-  const bar = document.createElement('i');
-  tdMark.append(bar);
-
-  // 2. 账号列：轮转状态（只读）+ uid + 名称。
-  // 启用/禁用统一在账号池页操作——这里只读展示，避免两个入口各自改状态。
-  const tdWho = document.createElement('td');
-  tdWho.className = 'who';
-  const nm = document.createElement('div');
-  nm.className = 'nm';
-  const on = document.createElement('span');
-  on.className = 'trae-acc-on';
-  on.textContent = a.disabled ? '○' : '●';
-  on.title = a.disabled ? '未参与轮转（在账号池页启用）' : '参与轮转';
-  on.style.cssText = 'margin-right:6px;vertical-align:middle;color:' +
-    (a.disabled ? 'var(--ink-3)' : 'var(--ok, #22a06b)');
-  const nmText = document.createElement('span');
-  nmText.className = 'mid';
-  nmText.textContent = a.name || '未命名';
-  nm.append(on, nmText);
-  const id = document.createElement('div');
-  id.className = 'id';
-  id.title = 'uid: ' + a.uid;
-  id.textContent = a.uid;
-  tdWho.append(nm, id);
-
-  // 3. 状态列：flex 设在**内层 div** 上，<td> 保持表格单元格语义。
-  const tdStatus = document.createElement('td');
-  tdStatus.innerHTML = '<div class="trae-tags">' + traeStatusHtml(a, cool) + '</div>';
-
-  // 4. 积分列。
-  const tdCred = document.createElement('td');
-  tdCred.className = 'cred';
-  tdCred.innerHTML = traeCreditsHtml(st);
-
-  // 5. 成功 / 失败。
-  const tdOk = document.createElement('td');
-  tdOk.className = 'num';
-  tdOk.innerHTML = (st.success_count || 0) +
-    ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (st.err_total || 0) + '</span>';
-
-  // 6. 在途。
-  const tdFlight = document.createElement('td');
-  tdFlight.className = 'num';
-  tdFlight.textContent = String(st.in_flight || 0);
-
-  // 7. 用量。
-  const tdUsage = document.createElement('td');
-  tdUsage.className = 'num usage-cell';
-  tdUsage.innerHTML = traeUsageHtml(st);
-
-  // 8. 最近成功。
-  const tdLast = document.createElement('td');
-  tdLast.className = 'num';
-  tdLast.style.color = 'var(--ink-3)';
-  tdLast.textContent = ago(st.last_success);
-
-  // 9. 操作。
-  const tdActs = document.createElement('td');
-  tdActs.className = 'acts';
-
-  // 这里只保留「看」的能力（签到状态与积分是只读查询）；签到/删除等写操作
-  // 统一在账号池页——一个账号只在池里被改一次，避免两个入口状态漂移。
-  const ck = document.createElement('button');
-  ck.type = 'button';
-  ck.className = 'xs ghost';
-  const done = a.checkin_done === true;
-  const devDone = a.checkin_device_already === true;
-  ck.textContent = done ? '已签' : (devDone ? '设备已签' : '查询签到');
-  if (done) ck.title = '今日已签到（只读查询，不会发起签到）';
-  else if (devDone) ck.title = '该设备今日已签（签到限额按设备算，本账号今日无法再签）';
-  else if (a.checkin_error) ck.title = '签到状态查询失败：' + a.checkin_error;
-  ck.onclick = async () => {
-    ck.disabled = true;
-    try {
-      await api('trae_config');            // 重新查上游刷新本表
-      loadTraeConfig();
-    } catch (e) { toast('查询失败：' + e.message, 'err'); }
-    finally { ck.disabled = false; }
-  };
-
-  const cr = document.createElement('button');
-  cr.type = 'button';
-  cr.className = 'xs ghost';
-  cr.textContent = '积分';
-  cr.onclick = async () => {
-    cr.disabled = true;
-    cr.textContent = '查询中…';
-    try {
-      const d = await api('trae/accounts/' + encodeURIComponent(a.uid) + '/credits', { method: 'POST' });
-      if (d.ok && d.credits) {
-        // 后端字段是小写（general/work/total/limit）；用 num() 兜底，
-        // 避免任何缺失字段把整个提示变成 NaN。
-        const c = d.credits;
-        const num = v => (typeof v === 'number' && isFinite(v)) ? Math.round(v).toLocaleString() : '—';
-        toast('通用 ' + num(c.general) + ' / Work ' + num(c.work) +
-          '（合计 ' + num(c.total) + '，额度 ' + num(c.limit) + '）', 'ok');
-      } else {
-        toast('积分查询失败：' + (d.message || '未知错误'), 'err');
-      }
-      loadTraeConfig();
-    } catch (e) { toast('积分查询失败：' + e.message, 'err'); }
-    finally { cr.disabled = false; cr.textContent = '积分'; }
-  };
-
-  // 删除是写操作，统一在账号池页（那里同时删池条目与凭证文件）。
-  const del = document.createElement('button');
-  del.type = 'button';
-  del.className = 'xs ghost';
-  del.textContent = '在池中管理';
-  del.title = '增删与启停统一在账号池页操作';
-  del.onclick = () => { location.hash = '#accounts'; };
-
-  tdActs.append(ck, cr, del);
-  tr.append(tdMark, tdWho, tdStatus, tdCred, tdOk, tdFlight, tdUsage, tdLast, tdActs);
-  return tr;
-}
-
-function renderTraeAccounts(list, cooldowns) {
-  const tb = $('traeAccBody');
-  if (!tb) return;
-  const coolMap = {};
-  for (const c of (cooldowns || [])) coolMap[c.uid] = c;
-  if (!list || !list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty">还没有 Trae 账号 —— 用下方的「生成授权链接」完成一次 OAuth 登录</div></td></tr>';
-    return;
-  }
-  // 先建片段再一次性替换：逐个 append 会让浏览器多次重排，账号多时可见抖动。
-  const frag = document.createDocumentFragment();
-  for (const a of list) frag.append(traeAccountRow(a, coolMap[a.uid]));
-  tb.replaceChildren(frag);
-}
 function collectTraeConfig() {
   // 账号列表**不在这里提交**：Trae 账号与 CodeBuddy 同在账号池，增删/启停由池
   // 管理。省略 accounts 字段（而非传空数组）才会走后端的「保留全部账号」分支；
   // 传 [] 会删除全部账号的文件。
-  return {
-    enabled: $('traeEnabled').checked,
-    chat_base: $('traeChatBase').value.trim(),
-    ide_version: $('traeIdeVersion').value.trim(),
-    timeout_seconds: 120,
-    schedule: {
-      checkin_enabled: $('traeCheckinEnabled').checked,
-      checkin_hours: parseHours($('traeCheckinHours').value),
-    },
-  };
+  //
+  // 「上游接入」页删除后，这里只剩搬到配置页的两个字段（IDE 版本 / 签到 UA）。
+  // 对话 base 不再暴露配置：它是上游路径，一个上游不该有可配的路径。
+  const ideVer = ($('traeIdeVersion') ? $('traeIdeVersion').value || '' : '').trim();
+  const ua = ($('traeUserAgent') ? $('traeUserAgent').value || '' : '').trim();
+  const out = {};
+  if (ideVer) out.ide_version = ideVer;
+  if (ua) out.checkin_user_agent = ua;
+  return out;
 }
 /* parseHours 解析 "9, 21" → [9,21]（非法项丢弃；空串 → []）。 */
 function parseHours(s) {
   return String(s || '').split(',').map(x => parseInt(x.trim(), 10))
     .filter(n => Number.isInteger(n) && n >= 0 && n <= 23);
 }
+/* ── WorkBuddy 上游（codebuddy.json）─────────────────────────────────
+   上游专有配置各自独立成文件，本区块只读写 CodeBuddy 那一份。
+   面板按文件分区展示，字段归属不会看错——这是「一上游一文件」的直接收益。
+
+   这里不做"空串 = 清除"的特殊处理：user_agent 空串本来就是有意义的
+   （= 用内置三段式默认），照发即可。 */
+async function loadCodeBuddyConfig() {
+  try {
+    const d = await api('codebuddy_config');
+    const c = d.config || {};
+    const set = (id, v) => { const el = $(id); if (el) el.value = v == null ? '' : v; };
+    const chk = (id, v) => { const el = $(id); if (el) el.checked = !!v; };
+    set('cbUserAgent', c.user_agent || '');
+    set('cbClientVersion', c.client_version || '');
+    set('cbCliVersion', c.cli_version || '');
+    set('cbChatBase', (c.cn || {}).chat_base || '');
+    set('cbGlobalChatBase', (c.global || {}).chat_base || '');
+    chk('cbGlobalEnabled', (c.global || {}).enabled);
+    chk('cbSanitize', c.sanitize_blacklist_fingerprints);
+  } catch (e) { /* 后端未提供该接口时静默 */ }
+}
+
+function collectCodeBuddyConfig() {
+  const num = id => {
+    const el = $(id);
+    if (!el) return undefined;
+    const v = el.value.trim();
+    return v === '' ? undefined : Number(v);
+  };
+  const str = id => { const el = $(id); return el ? el.value.trim() : undefined; };
+  const bool = id => { const el = $(id); return el ? el.checked : undefined; };
+
+  const out = {};
+  const cnBase = str('cbChatBase');
+  if (cnBase !== undefined) out.cn = { chat_base: cnBase };
+  const gl = {};
+  const glBase = str('cbGlobalChatBase');
+  if (glBase !== undefined) gl.chat_base = glBase;
+  if (bool('cbGlobalEnabled') !== undefined) gl.enabled = bool('cbGlobalEnabled');
+  if (Object.keys(gl).length) out.global = gl;
+  for (const [k, id] of [
+    ['user_agent', 'cbUserAgent'], ['client_version', 'cbClientVersion'],
+    ['cli_version', 'cbCliVersion'],
+  ]) {
+    const v = str(id);
+    if (v !== undefined) out[k] = v;
+  }
+  const san = bool('cbSanitize');
+  if (san !== undefined) out.sanitize_blacklist_fingerprints = san;
+  return out;
+}
+
+/* loadTraeConfig 把 Trae 上游的两个可配项填进配置页（IDE 版本 / 签到 UA）。
+   上游接入页删除后，其余字段（对话 base / 启用开关 / 签到排程）都不再暴露：
+   - base 是上游路径，不该可配；
+   - 启用开关随「平权」移除——加了账号就启用；
+   - 签到排程并入 config.json 的 schedule（总开关 + 按上游勾选）。 */
 async function loadTraeConfig() {
   try {
     const d = await api('trae_config');
     const c = d.config || {};
-    $('traePath').textContent = d.path || '';
-    $('traeEnabled').checked = !!c.enabled;
-    $('traeChatBase').value = c.chat_base || '';
-    $('traeIdeVersion').value = c.ide_version || '';
-    renderTraeAccounts(c.accounts || [], c.cooldowns || []);
-    $('traeUsable').textContent = '可参与轮转：' + (c.usable || 0) + ' / ' + ((c.accounts || []).length) + ' 个账号';
-    const sch = c.schedule || {};
-    $('traeCheckinEnabled').checked = !!sch.checkin_enabled;
-    $('traeCheckinHours').value = (sch.checkin_hours || []).join(', ');
-    $('traeNote').textContent = '';
+    if ($('traeIdeVersion')) $('traeIdeVersion').value = c.ide_version || '';
+    if ($('traeUserAgent')) $('traeUserAgent').value = c.checkin_user_agent || '';
   } catch (e) { /* 后端未提供该接口时静默 */ }
 }
 /* syncTraeNicknames 从上游 GetUserInfo 拉昵称（账号池页与 Trae 页共用）。 */
@@ -422,21 +317,7 @@ async function showTraeCheckinStatus() {
 }
 if ($('btnTraeSyncProfiles')) $('btnTraeSyncProfiles').onclick = () =>
   syncTraeNicknames($('btnTraeSyncProfiles'), 'Trae 昵称');
-if ($('btnTraeSyncProfiles2')) $('btnTraeSyncProfiles2').onclick = () =>
-  syncTraeNicknames($('btnTraeSyncProfiles2'), '同步昵称');
 if ($('btnTraeCheckinStatus')) $('btnTraeCheckinStatus').onclick = showTraeCheckinStatus;
-$('btnTraeReload').onclick = loadTraeConfig;
-$('btnTraeSave').onclick = async () => {
-  const btn = $('btnTraeSave');
-  btn.disabled = true;
-  btn.textContent = '保存中…';
-  try {
-    await api('trae_config', { method: 'POST', body: JSON.stringify(collectTraeConfig()) });
-    toast('Trae 配置已保存并立即生效', 'ok');
-    loadTraeConfig();
-  } catch (e) { toast('保存失败：' + e.message, 'err'); }
-  finally { btn.disabled = false; btn.textContent = '保存 Trae 配置'; }
-};
 /* traeLoginBody 收集登录发起参数：storage.json 优先（它自带设备号）。
    Trae 登录入口已并入「添加账号」弹窗，这里读的是弹窗里的字段。 */
 function traeLoginBody() {
@@ -447,39 +328,6 @@ function traeLoginBody() {
   if (devId) body.device_id = devId;
   return body;
 }
-$('btnTraeImport').onclick = async () => {
-  const raw = $('traeStorage').value.trim();
-  const uid = $('traeStorageUid').value.trim();
-  if (!raw) { toast('请粘贴 storage.json 内容或单条 icube 密文', 'err'); return; }
-  // 两种形态：整文件（{ 开头）或单条 "deviceId:密文"。
-  let body;
-  if (raw.startsWith('{')) {
-    body = { uid: uid, storage_json: raw };
-  } else if (raw.indexOf(':') > 0) {
-    const i = raw.indexOf(':');
-    body = { uid: uid, device_id: raw.slice(0, i).trim(), icube_value: raw.slice(i + 1).trim() };
-  } else {
-    toast('单条模式请按 deviceId:密文 格式粘贴，或直接粘贴整个 storage.json', 'err');
-    return;
-  }
-  const btn = $('btnTraeImport');
-  btn.disabled = true;
-  try {
-    const d = await api('trae/import', { method: 'POST', body: JSON.stringify(body) });
-    if (d.matched_uids && !d.uid) {
-      // 未能自动确定账号：把候选展示出来让人确认（但不自动写入）。
-      const ids = (d.device_ids || []).join('、');
-      const cand = (d.matched_uids || []).join('、');
-      toast('已解析设备 ' + (ids || '?') + '；' + (cand ? '可绑定账号：' + cand : '没有可匹配的账号') +
-        '。请填写 uid 后重试', 'warn');
-      return;
-    }
-    toast(d.message || '设备凭证已导入', 'ok');
-    $('traeStorage').value = '';
-    loadTraeConfig();
-  } catch (e) { toast('导入失败：' + e.message, 'err'); }
-  finally { btn.disabled = false; }
-};
 /* renderTraeCheckinNote 把逐账号签到结果压成一行摘要（失败项直接列出原因）。 */
 function renderTraeCheckinNote(results, lastRun) {
   const parts = [];
@@ -495,9 +343,13 @@ function renderTraeCheckinNote(results, lastRun) {
     if (r.status === 'fail' || r.status === 'unverified') s += ' ' + (r.message || '');
     parts.push(s);
   }
-  $('traeCheckinNote').textContent = (lastRun ? '[' + lastRun + '] ' : '') + parts.join('　');
+  const line = (lastRun ? '[' + lastRun + '] ' : '') + parts.join('　');
+  // 上游接入页删除后没有常驻的展示位了：签到结果改用 toast 弹出。
+  // 账号池页的「Trae 签到结果」按钮仍会调到这里，不能让它抛空引用。
+  const el = $('traeCheckinNote');
+  if (el) el.textContent = line;
+  else toast(line, '');
 }
-$('btnTraeCheckinStatus2').onclick = showTraeCheckinStatus;
 
 /* ══ 账号备注（只写本机 localStorage；账号池 / 用量两个视图共用同一份映射）══════
    键取 uid 前 8 位——与 renderUsageDim 账号维度的 key 和积分扣除表的 uid 前缀同源，

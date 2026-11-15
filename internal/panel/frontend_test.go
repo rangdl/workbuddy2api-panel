@@ -905,21 +905,36 @@ const mk = v => ({ type: 'text', value: v });
 const cfgForm = { elements: {
   listen: mk(''),
   api_key: mk('secret'),
-  user_agent: mk(''),
   prompt_file: mk(''),
   checkin_hours: mk(''),
 }};
+// user_agent 已迁到 codebuddy.json（上游配置独立成文件），由 collectCodeBuddyConfig
+// 处理；它对"空串 = 恢复内置默认"的语义与 collectConfig 的覆盖型字段一致。
+const cbEls = {
+  cbTimeout: mk(''), cbHeaderTimeout: mk(''), cbIdleTimeout: mk(''),
+  cbUserAgent: mk(''), cbClientVersion: mk(''), cbCliVersion: mk(''),
+  cbChatBase: mk(''), cbGlobalChatBase: mk(''),
+  cbGlobalEnabled: { type: 'checkbox', checked: true },
+  cbSanitize: { type: 'checkbox', checked: false },
+};
 const ctx = {
   Date, Number, String, Math, Map, Array, Object, isNaN, URLSearchParams, Set,
   document: { getElementById: id => (id === 'cfgForm' ? cfgForm : null) },
-  $: id => (id === 'cfgForm' ? cfgForm : null),
+  $: id => (id === 'cfgForm' ? cfgForm : (cbEls[id] || null)),
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.collectConfig = collectConfig;', ctx);
+// collectCodeBuddyConfig 定义在 CFG_MAP 区间之外（它属于上游配置区块），
+// 单独按函数名截出来一起求值。
+const cbStart = src.indexOf('function collectCodeBuddyConfig()');
+const cbEnd = src.indexOf('/* loadTraeConfig', cbStart);
+if (cbStart < 0 || cbEnd < 0) throw new Error('collectCodeBuddyConfig region not found');
+vm.runInContext(src.slice(start, end) + '\n' + src.slice(cbStart, cbEnd) +
+  '\nthis.collectConfig = collectConfig; this.collectCodeBuddyConfig = collectCodeBuddyConfig;', ctx);
 const out = ctx.collectConfig();
+const cb = ctx.collectCodeBuddyConfig();
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
 process.stdout.write(JSON.stringify([
-  has(out.upstream, 'user_agent'), (out.upstream || {}).user_agent,
+  has(cb, 'user_agent'), (cb || {}).user_agent,
   has(out.prompt, 'file'), (out.prompt || {}).file,
   has(out, 'listen'),
   has(out.schedule, 'checkin_hours'),

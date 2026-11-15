@@ -23,6 +23,24 @@
 - **目录缓存只许有一份，在池里。** 任何消费方都不要再加缓存。
 - **失败处置只认 `Decision`。** 跨层分流用 `Decision.Policy`，
   绝不用 `Kind` 字符串反查（不同上游撞名）。
+- **一个错误码可能承载多语义**（如 11140 = 封禁 / 内容审核 / 限流），
+  必须逐语义分流；判定范围要含 `displayTips`，不能只读 `msg`。
+- **多个不同账号短窗内接连出同类问题 = 平台级信号**，走 `server/wafip.go`
+  的 `multiAcctGate` fail-fast 终止轮转，别继续换号撞风控。
+- **排程是单点的。** 任何上游都不许有自己的定时器；签到只在
+  `config.json` 的 `schedule.checkin_enabled`(总开关) + `checkin_backends`(按上游，
+  缺键=启用) 里配。加了上游专属的 schedule/enabled 就会重新分裂。
+- **上游平权，没有「启用某个上游」这回事。** 池里有该上游账号即参与调度。
+  不要新增 `enabled` / 上游专属 base URL 这类字段。
+- **上游配置一上游一文件**（`codebuddy.json` / `trae.json`），`config.json`
+  只放与上游无关的东西。文件内保留 `cn` / `global` 域维度。判断标准：这个字段
+  只对某个上游有意义吗？是 → 进它的文件。升级时旧 `config.json` 的
+  `cn`/`global`/`upstream`/`features` 四段里的**上游专有字段**会自动迁移并删除。
+- **传输层超时（timeout/header/idle）在 `config.json`，不进上游文件。**
+  它们描述「一条 SSE 长连接该等多久」，与上游协议无关——两个上游的对话都是
+  流式长连接。别因为"目前只有某个上游在用"就把它归给那个上游。
+- **定时任务都带抖动**（`scheduler/jitter.go`）：整点类只向后 0~10 分钟，
+  周期类 ±15%。抖加在 `nextWake` 结果上，同小时多任务共享同一偏移。
 
 ## 验证口径
 

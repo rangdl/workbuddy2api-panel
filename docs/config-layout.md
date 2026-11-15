@@ -4,8 +4,9 @@
 
 ```
 config/                        用户会手改的配置
-├── config.json                主配置（监听、api_key、池参数、排程…）
-├── trae.json                  Trae 上游
+├── config.json                主配置（监听、api_key、池参数、排程…）—— 与上游无关
+├── codebuddy.json             CodeBuddy 上游（cn / global 两域）
+├── trae.json                  Trae 上游（cn 域）
 ├── model.json                 模型上下文/输出上限缓存（可手改）
 └── .migrated                  迁移标记（自动生成，勿手动创建）
 
@@ -25,6 +26,56 @@ auths/                         账号凭证（每账号一文件，权限 0600�
 可以直接丢弃重建；`auths/` 含明文 token 与设备私钥，权限单独收紧且**绝不入库**。
 分成三个目录后，备份策略和挂载权限可以分别设置。
 
+## 上游配置按文件分离
+
+**每个上游的独特配置各占一个 JSON 文件**，`config.json` 只放与上游无关的东西
+（监听、密钥、账号池策略、排程）。
+
+| 文件 | 归谁 | 内容 |
+|---|---|---|
+| `codebuddy.json` | CodeBuddy | `cn` / `global` 两域 base、超时、UA、版本、设备令牌、指纹脱敏 |
+| `trae.json` | Trae | `cn` 域 base、IDE 版本、签到 UA、OAuth 常量、签到链路可调项 |
+
+为什么这样分：
+
+- **加上游 = 加一个文件**，`config.json` 一行不动；
+- **删上游 = 删一个文件**，不留没人敢删的死字段；
+- **字段归属看得见**，不用猜 `user_agent` 是给谁的。
+
+文件内**保留域维度**（`cn` / `global` 各一段）：域隔离是硬约束（见
+`docs/architecture.md` 的「域隔离失效」历史事故）。Trae 目前只有 `cn`，
+将来加 global 只加一段、不改结构。
+
+**超时与 SSE 的两个上限（首字节 / 流空闲）属于 `config.json` 的 `upstream` 段，
+不在任何上游文件里**。原因：它们描述的是**传输层行为**，与上游协议无关——
+WorkBuddy 与 Trae 的对话都是 SSE 流式长连接，两个上限对两者语义完全相同。
+
+> 曾经 Trae 的首字节超时是硬编码常量、流中空闲完全没有监控，正是因为它被当成
+> "CodeBuddy 的东西"。放进上游文件会继续强化这种误解。
+
+### 缺字段的行为
+
+`codebuddy.json` / `trae.json` 缺失或字段为空时**全部回落内置默认**，不会启动失败：
+
+| 情况 | 行为 |
+|---|---|
+| 文件不存在 | 用内置默认（`codebuddy.json` 首次启动会自动生成） |
+| 整个 `cn` 段缺失 | 该域用内置 base |
+| `user_agent` 为空串 | 用内置三段式 UA |
+| `timeout_seconds` 为 0 | 回落 120 |
+
+### 从旧版升级（自动迁移）
+
+旧版把上游字段放在 `config.json` 的 `cn` / `global` / `upstream` / `features`
+四段里。启动时若发现 `codebuddy.json` 不存在而这些段还在，会：
+
+1. 把字段搬进 `codebuddy.json`；
+2. 从 `config.json` 删掉这四个键（保证**配置单一来源**，避免改旧键不生效）；
+3. 打一条日志说明。
+
+迁移只在 `codebuddy.json` **不存在**时执行——已存在的文件是当前事实来源，
+不会被旧配置覆盖。
+
 ## Trae 账号存储（一账号一文件）
 
 Trae 账号**不再内嵌在 `trae.json` 里**，改为 `auths/trae-<uid>.json`，
@@ -37,6 +88,18 @@ Trae 账号**不再内嵌在 `trae.json` 里**，改为 `auths/trae-<uid>.json`�
   `trae.json`，后写者会覆盖先写者刚更新的另一个账号。分文件后各写各的。
 - **权限最小化**：账号文件含明文 refreshToken 与设备私钥，单独 `0600`。
 - **心智一致**：备份 / 手工编辑 / 导入导出的方式与 CodeBuddy 相同。
+
+`trae.json` 现在只剩**上游协议+凭证**类字段（OAuth 客户端常量、设备私钥策略、
+IDE 版本、签到 UA、`verify_claim` 等），**不再是"上游开关"的载体**：
+
+- 没有 `enabled` 开关了——上游平权，加了账号即启用（WorkBuddy 也一样）。
+- 没有 `chat_base` 可配项——上游路径不该由用户改。
+- 没有 `schedule` 生效语义——签到排程统一在 `config.json` 的
+  `schedule.checkin_enabled`（总开关）+ `schedule.checkin_backends`（按上游）。
+  文件里的 `schedule` 键仍会被反序列化，但**不参与任何决策**。
+
+因此 `trae.json` 仍然需要保留：去掉它就得把这些上游协议常量硬编码进代码，
+反而失去"上游改版时不发版就能覆盖"的能力。
 
 `trae.json` 的 `auth_dir` 指定账号目录；**留空时用主配置 `config.json` 的
 `auth_dir`**（缺省 `./auths`，相对启动目录），从而与 workbuddy 账号落在同一目录，
@@ -55,8 +118,8 @@ Trae 账号**不再内嵌在 `trae.json` 里**，改为 `auths/trae-<uid>.json`�
 - 两个目录不存在时自动创建。
 - `config/config.json` 不存在时，生成一份含随机 `api_key` 的推荐配置，并把
   `api_key` 打印到日志（只打印这一次）。
-- `trae.json` 不存在时写一份默认文件，`enabled: false`——写默认值不会替用户
-  开启一个没配过的上游。（`responses.json` / `anthropic.json` / `third_party.json`
+- `trae.json` 不存在时写一份默认文件。注意：**没有 `enabled` 开关**（上游平权，
+  加了账号即启用），文件存在与否不代表上游启用与否，真正的判据是有没有账号。（`responses.json` / `anthropic.json` / `third_party.json`
   已随对应功能移除，不再生成，也不再从旧目录迁移。）
 
 ## 从旧版升级

@@ -650,9 +650,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型与档位</a></li>
-      <li><a href="#upstream" data-view="upstream">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="m5.6 7 1.5 1.5L10.4 5.9"/></svg>
-        Trae 上游</a></li>
       <li><a href="#config" data-view="config">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
         配置</a></li>
@@ -994,6 +991,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                   <input type="checkbox" name="checkin_enabled"></div>
                 <label class="fld"><span class="lb">签到时点（小时，逗号分隔）</span>
                   <input name="checkin_hours" placeholder="9, 21"></label>
+                <!-- 分上游勾选：由前端按「账号池里实际存在的上游」动态渲染
+                     （见 config.js 的 renderCheckinBackends）。总开关关掉时不隐藏，
+                     改为禁用——让用户看到「关的是总闸，各上游的勾选还记着」。 -->
+                <div class="fld" id="checkinBackendsWrap">
+                  <span class="lb">各上游自动签到</span>
+                  <div id="checkinBackends" style="display:flex;flex-wrap:wrap;gap:12px;margin-top:4px"></div>
+                  <span class="hint">总开关控制定时任务跑不跑；这里控制跑的时候签哪些上游。
+                    账号池里出现过的上游都会列出，未配置默认为启用。</span>
+                </div>
               </div>
               <div>
                 <div class="switch"><span class="lb">Token 保活</span>
@@ -1136,8 +1142,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </div>
         </div>
 
+        <!-- 上游配置：每个上游一个独立文件（codebuddy.json / trae.json）。
+             面板按上游分区展示，字段归属不会看错；加减上游只动一个文件。 -->
+        <!-- 传输层超时：两个上游共用（对话都是 SSE 长连接）。 -->
         <div class="box">
-          <header><h3>上游与高级</h3></header>
+          <header><h3>传输层超时<span class="realm-tag">所有上游</span></h3></header>
           <div class="pad">
             <div class="grid3">
               <label class="fld"><span class="lb">短请求超时</span>
@@ -1145,18 +1154,69 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <span class="hint">需重启</span></label>
               <label class="fld"><span class="lb">聊天首字节超时</span>
                 <input name="header_timeout_seconds" type="number" min="1" placeholder="120">
-                <span class="hint">需重启</span></label>
+                <span class="hint">留空 = 跟随短请求超时；需重启</span></label>
               <label class="fld"><span class="lb">流空闲超时</span>
                 <input name="idle_timeout_seconds" type="number" min="1" placeholder="300">
                 <span class="hint">需重启</span></label>
             </div>
-            <div class="hr"></div>
+            <div class="hint">两项 SSE 上限对<b>所有上游</b>同时生效（WorkBuddy 与 Trae 的对话都是流式长连接），
+              故只有一份配置。首字节超时约束"多久没响应头就放弃"，流空闲超时约束"流中途多久没吐数据就断"。</div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>上游配置<span class="realm-tag">WorkBuddy</span></h3>
+            <span class="grow"></span><span class="note">codebuddy.json</span></header>
+          <div class="pad">
             <div class="grid2">
               <label class="fld"><span class="lb">出站 User-Agent</span>
-                <input name="user_agent" placeholder="留空 = CLI/2.63.2 CodeBuddy/2.63.2">
+                <input id="cbUserAgent" placeholder="留空 = 内置三段式默认">
                 <span class="hint">影响官网积分记录「使用端」显示；需重启</span></label>
+              <label class="fld"><span class="lb">客户端版本</span>
+                <input id="cbClientVersion" placeholder="留空 = 内置默认">
+                <span class="hint">出站 UA 的 WorkBuddy 段与 X-IDE-Version；需重启</span></label>
+            </div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">CLI 版本</span>
+                <input id="cbCliVersion" placeholder="留空 = 内置默认">
+                <span class="hint">出站 UA 的 CLI 段；需重启</span></label>
+              <label class="fld"><span class="lb">国内版对话 base<span class="realm-tag">CN</span></span>
+                <input id="cbChatBase" placeholder="留空 = 内置默认">
+                <span class="hint">需重启</span></label>
+            </div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">国际版对话 base<span class="realm-tag">Global</span></span>
+                <input id="cbGlobalChatBase" placeholder="留空 = 内置默认">
+                <span class="hint">需重启</span></label>
+              <div class="switch" style="align-self:center"><span class="lb">启用国际版路由<span class="realm-tag">Global</span></span>
+                <input type="checkbox" id="cbGlobalEnabled"></div>
             </div>
             <div class="hr"></div>
+            <div class="switch"><span class="lb">出站请求指纹脱敏</span>
+              <input type="checkbox" id="cbSanitize"></div>
+            <div class="hint">上游按逐字精确匹配拦截客户端模板句（"You are Claude Code" 等），改一字即可绕过。
+              这是 <b>WorkBuddy 专有</b>的概念——Trae 没有这套审核，所以该开关属于本区块而不是通用配置。</div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>上游配置<span class="realm-tag">Trae</span></h3>
+            <span class="grow"></span><span class="note">trae.json</span></header>
+          <div class="pad">
+            <div class="grid2">
+              <label class="fld"><span class="lb">出站 User-Agent</span>
+                <input id="traeUserAgent" placeholder="留空 = Trae/0.1.52（新版合并客户端形态）">
+                <span class="hint">Trae 签到/积分接口的 UA；上游改版时可回退旧形态</span></label>
+              <label class="fld"><span class="lb">IDE 版本</span>
+                <input id="traeIdeVersion" placeholder="0.1.50">
+                <span class="hint">出站 X-Ide-Version；上游版本变化时可覆盖</span></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>高级</h3></header>
+          <div class="pad">
             <div class="grid2">
               <label class="fld"><span class="lb">系统提示词模式</span>
                 <select name="prompt_mode">
@@ -1170,8 +1230,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <span class="hint">需重启</span></label>
             </div>
             <div class="hr"></div>
-            <div class="switch"><span class="lb">出站请求指纹脱敏</span>
-              <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
             <div class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"></div>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
@@ -1196,74 +1254,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button type="submit" class="primary" id="btnCfgSave">保存配置</button>
         </div>
       </form>
-    </section>
-
-    <!-- Trae 上游：配置与凭证管理（账号本身在账号池页统一管理） -->
-    <section class="view" id="view-upstream" hidden>
-      <div class="box">
-        <header><h3>Trae 上游</h3><span class="grow"></span><span class="note" id="traePath"></span></header>
-        <div class="pad">
-          <div class="switch"><span class="lb">启用 Trae 上游</span>
-            <input type="checkbox" id="traeEnabled"></div>
-          <div class="hint">启用后 Trae 账号参与调度。**没有独立前缀**——对话仍走 <code>/v1/*</code>，
-            用模型名前缀 <code>trae:</code> 指定上游（如 <code>trae:cn:glm-5.3</code>）。</div>
-          <div class="grid2">
-            <label class="fld"><span class="lb">对话上游 base</span>
-              <input id="traeChatBase" placeholder="https://trae-api-cn.mchost.guru"></label>
-            <label class="fld"><span class="lb">IDE 版本</span>
-              <input id="traeIdeVersion" placeholder="0.1.50">
-              <span class="hint">出站 X-Ide-Version；上游版本变化时可覆盖</span></label>
-          </div>
-          <div class="hr"></div>
-          <div class="fld"><span class="lb">账号</span>
-            <div class="hint" style="margin-bottom:6px">Trae 账号与 CodeBuddy 在同一个账号池里——
-              增删、签到、余额、昵称、暂停/禁用都在<a href="#accounts">账号池</a>页操作，
-              这里只管 Trae 上游的配置与凭证。</div>
-            <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
-              <button type="button" class="xs" id="btnTraeCheckinStatus2">上次签到结果</button>
-              <button type="button" class="xs" id="btnTraeSyncProfiles2" title="从上游 GetUserInfo 拉取昵称（JWT 里没有用户名字段）">同步昵称</button>
-              <span class="hint" id="traeCheckinNote"></span>
-            </div>
-            <div class="tbl-wrap">
-              <table class="acc trae-acc-tbl">
-                <thead><tr>
-                  <th class="mark" aria-hidden="true"></th>
-                  <th>账号</th><th>状态</th><th>积分</th>
-                  <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
-                </tr></thead>
-                <tbody id="traeAccBody"></tbody>
-              </table>
-            </div>
-            <span class="hint" id="traeUsable"></span></div>
-          <div class="hr"></div>
-          <div class="grid2">
-            <div class="switch"><span class="lb">每日自动签到</span>
-              <input type="checkbox" id="traeCheckinEnabled"></div>
-            <label class="fld"><span class="lb">签到时点（小时，逗号分隔）</span>
-              <input id="traeCheckinHours" placeholder="9">
-              <span class="hint">到点对全部可用账号签到一轮（账号间限速 800ms）</span></label>
-          </div>
-          <div class="hr"></div>
-          <div class="fld"><span class="lb">添加账号</span>
-            <span class="hint">统一走右上角<a href="#accounts" onclick="document.getElementById('btnAdd').click()">添加账号</a>，
-              在弹窗里把「上游」选成 Trae 即可（支持粘贴 storage.json）。</span></div>
-          <div class="fld"><span class="lb">给已有账号补设备凭证（可选）</span>
-            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-              <input id="traeStorage" placeholder="粘贴 Trae 客户端 storage.json 内容，或单条 icube 密文" style="flex:1;min-width:240px">
-              <input id="traeStorageUid" placeholder="绑定到 uid" style="width:150px">
-              <button type="button" class="xs" id="btnTraeImport">导入</button>
-            </div>
-            <span class="hint">uid 是<b>已存在账号</b>的标识，在上方账号列表每行最左边（等宽字体）。新账号请用上面的登录流程，那里可以直接带 storage.json。</span>
-            <span class="hint">设备私钥用于 token 续期签名（DeviceProof）。未导入时续期走无签名兜底变体，可能被上游拒绝。</span></div>
-          <div class="hint" style="margin-top:10px">保存后立即生效（启用开关 / 对话 base / 签到排程热重载，无需重启）。保存不会改动账号列表。</div>
-        </div>
-        <div class="savebar">
-          <span class="grow"></span>
-          <span class="restart-note" id="traeNote"></span>
-          <button type="button" id="btnTraeReload">放弃修改</button>
-          <button type="button" class="primary" id="btnTraeSave">保存 Trae 配置</button>
-        </div>
-      </div>
     </section>
 
     <!-- 日志 -->

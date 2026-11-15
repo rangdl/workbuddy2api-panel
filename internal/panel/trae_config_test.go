@@ -127,7 +127,8 @@ func TestTraeConfigNeverLeaksCredentials(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if !got.Config.Enabled || len(got.Config.Accounts) != 1 {
+	// enabled 字段已随「上游平权」删除（加了账号即启用），这里只校验账号视图。
+	if len(got.Config.Accounts) != 1 {
 		t.Fatalf("配置视图不符: %s", body)
 	}
 	a := got.Config.Accounts[0]
@@ -177,7 +178,8 @@ func TestTraeConfigSaveOnlyTouchesConfig(t *testing.T) {
 	// 保存前先记下 authDir 里的文件集合，保存后必须完全一致。
 	before := traeAuthFiles(t, dir)
 
-	// 故意带上 accounts（只含 u-2）与 disabled：都应被忽略。
+	// 故意带上已废弃的 accounts/disabled/enabled/chat_base：都应被忽略。
+	// 只认 ide_version（配置页仍暴露的字段）。
 	body := `{"enabled":true,"chat_base":"https://custom.example","ide_version":"9.9.9","accounts":["u-2"],"disabled":["u-2"]}`
 	rec := traeDo(p, http.MethodPost, "/panel/api/trae_config", body)
 	if rec.Code != http.StatusOK {
@@ -187,8 +189,13 @@ func TestTraeConfigSaveOnlyTouchesConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !saved.Enabled || saved.ChatBase != "https://custom.example" || saved.IDEVersion != "9.9.9" {
-		t.Fatalf("非敏感字段未生效: %+v", saved)
+	// ide_version 是配置页仍暴露的字段，必须生效。
+	if saved.IDEVersion != "9.9.9" {
+		t.Fatalf("ide_version 未生效: %+v", saved)
+	}
+	// chat_base 不再是可配项：上游路径不该由用户改，请求里带了也必须忽略。
+	if saved.ChatBase == "https://custom.example" {
+		t.Fatalf("chat_base 已不可配，请求值不应生效: %+v", saved)
 	}
 	// 账号必须原样保留（含被排除的 u-1），且启用状态不受 disabled 影响。
 	if len(saved.Accounts) != 2 {
@@ -205,16 +212,27 @@ func TestTraeConfigSaveOnlyTouchesConfig(t *testing.T) {
 }
 
 // TestTraeConfigSaveRejectsInvalid 非法配置拒绝且不落盘。
-func TestTraeConfigSaveRejectsInvalid(t *testing.T) {
+// TestTraeConfigSaveIgnoresDeprecatedFields 已废弃字段被忽略而不是报 400。
+//
+// 回归点：chat_base / enabled / accounts / disabled / schedule 都不再是配置项
+// （上游路径不该可配、上游平权、账号生命周期归账号池、签到排程归 config.json）。
+// 旧前端或旧脚本仍可能带着它们提交——**必须静默忽略**，不能因为升级就返回 400
+// 把用户的正常保存打挂。这条锁死"废弃字段是忽略而非拒绝"。
+func TestTraeConfigSaveIgnoresDeprecatedFields(t *testing.T) {
 	dir := t.TempDir()
 	p, path := newTraePanel(t, dir)
 	rec := traeDo(p, http.MethodPost, "/panel/api/trae_config",
-		`{"enabled":true,"chat_base":"no-scheme","accounts":[]}`)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
+		`{"enabled":true,"chat_base":"no-scheme","accounts":[],"disabled":["x"],"schedule":{"enabled":true,"hours":[9]}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200（废弃字段应被忽略而非拒绝）: %s", rec.Code, rec.Body)
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Error("非法配置不应落盘")
+	saved, err := trae.Load(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// chat_base 非法值不得被采纳：它是上游路径，不是配置项。
+	if saved.ChatBase == "no-scheme" {
+		t.Fatalf("chat_base 不应被请求改写: %+v", saved)
 	}
 }
 

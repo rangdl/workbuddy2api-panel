@@ -67,15 +67,14 @@ type traeScheduleView struct {
 }
 
 // traeConfigView GET 响应体。
+//
+// 上游接入页删除后，前端只用其中两项（IDEVersion / CheckinUserAgent），
+// 但 Accounts/Cooldowns/Usable 保留：它们是**诊断数据**，排查"账号在池里却调
+// 不通"时仍需一眼看到上游视角的账号集合，且不会因为前端页面删了就失去来源。
 type traeConfigView struct {
-	Enabled        bool              `json:"enabled"`
-	ChatBase       string            `json:"chat_base"`
-	IDEVersion     string            `json:"ide_version"`
-	OAuthCallback  string            `json:"oauth_callback_url"`
-	TimeoutSeconds int               `json:"timeout_seconds"`
-	Accounts       []traeAccountView `json:"accounts"`
-	// Schedule 签到排程。
-	Schedule traeScheduleView `json:"schedule"`
+	IDEVersion       string            `json:"ide_version"`
+	CheckinUserAgent string            `json:"checkin_user_agent"`
+	Accounts         []traeAccountView `json:"accounts"`
 	// Cooldowns 冷却中的账号（来自运行期 handler 的快照）。
 	Cooldowns []trae.CoolInfo `json:"cooldowns"`
 	// Usable 当前可参与轮转的账号数（扣掉 disabled 与冷却中）。
@@ -95,25 +94,12 @@ func (p *Panel) getTraeConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view := traeConfigView{
-		Enabled:        false,
-		ChatBase:       trae.DefaultChatBase,
-		IDEVersion:     trae.DefaultIDEVersion,
-		OAuthCallback:  trae.DefaultRedirectURI,
-		TimeoutSeconds: trae.DefaultTimeoutSeconds,
-		Accounts:       []traeAccountView{},
+		IDEVersion: trae.DefaultIDEVersion,
+		Accounts:   []traeAccountView{},
 	}
 	if cfg != nil {
-		view.Enabled = cfg.Enabled
-		view.ChatBase = cfg.ChatBase
 		view.IDEVersion = cfg.IDEVersion
-		view.TimeoutSeconds = cfg.TimeoutSeconds
-		view.Schedule = traeScheduleView{
-			Enabled: cfg.Schedule.Enabled,
-			Hours:   cfg.Schedule.Hours,
-		}
-		if cfg.OAuthCallbackURL != "" {
-			view.OAuthCallback = cfg.OAuthCallbackURL
-		}
+		view.CheckinUserAgent = cfg.CheckinUserAgent
 		for _, a := range cfg.Accounts {
 			// 只展示池里的账号：池是权威列表。凭证文件残留（例如手工塞进
 			// auths/ 但未进池）不该出现在这里，否则用户会以为它在参与调度。
@@ -176,14 +162,18 @@ func (p *Panel) getTraeConfig(w http.ResponseWriter, r *http.Request) {
 // 账号的增删与启停一律走账号池接口（/panel/api/accounts/*）。这里保留
 // Accounts/Disabled 两个字段只为兼容旧前端请求，**服务端完全忽略**——
 // 它们曾经能删除账号文件，那是不该由"保存配置"触发的能力。
+// 只保留**用户在配置页能改的两个字段**：
+//   - IDEVersion     出站 X-Ide-Version（上游改版时可覆盖）
+//   - CheckinUserAgent 签到/积分接口的 UA（上游改版时可回退旧形态）
+//
+// 刻意不再接受的字段（收到也忽略，不报错——旧前端/旧脚本不该因升级而报 400）：
+//   - enabled      ：上游平权后没有"禁用某个上游"这回事，加了账号即启用
+//   - chat_base    ：上游路径不该是配置项（见 docs 的「上游级 vs 账号级」）
+//   - schedule     ：签到排程统一在 config.json（总开关 + 按上游勾选）
+//   - accounts/disabled：账号生命周期只由账号池接口管理
 type traeSaveRequest struct {
-	Enabled        bool             `json:"enabled"`
-	ChatBase       string           `json:"chat_base"`
-	IDEVersion     string           `json:"ide_version"`
-	TimeoutSeconds int              `json:"timeout_seconds"`
-	Accounts       []string         `json:"accounts"` // 已废弃：忽略
-	Disabled       []string         `json:"disabled"` // 已废弃：忽略
-	Schedule       traeScheduleView `json:"schedule"`
+	IDEVersion       string `json:"ide_version"`
+	CheckinUserAgent string `json:"checkin_user_agent"`
 }
 
 // saveTraeConfig 保存**纯配置**：启用开关 / 对话 base / IDE 版本 / 签到排程。
@@ -219,8 +209,8 @@ func (p *Panel) saveTraeConfig(w http.ResponseWriter, r *http.Request) {
 		old = &trae.Config{}
 	}
 	next := &trae.Config{
-		Enabled:           req.Enabled,
-		ChatBase:          req.ChatBase,
+		Enabled:           old.Enabled,
+		ChatBase:          old.ChatBase,
 		IDEVersion:        old.IDEVersion,
 		IDEVersionCode:    old.IDEVersionCode,
 		AppID:             old.AppID,
@@ -228,7 +218,7 @@ func (p *Panel) saveTraeConfig(w http.ResponseWriter, r *http.Request) {
 		OAuthClientSecret: old.OAuthClientSecret,
 		OAuthHost:         old.OAuthHost,
 		OAuthCallbackURL:  old.OAuthCallbackURL,
-		TimeoutSeconds:    req.TimeoutSeconds,
+		TimeoutSeconds:    old.TimeoutSeconds,
 		AuthDir:           old.AuthDir,
 		APITraeBase:       old.APITraeBase,
 		// 签到链路可调项：面板不编辑，但保存时必须原样带过去，
@@ -237,11 +227,8 @@ func (p *Panel) saveTraeConfig(w http.ResponseWriter, r *http.Request) {
 		RefreshBeforeCheckin: old.RefreshBeforeCheckin,
 		CheckinUserAgent:     old.CheckinUserAgent,
 		CheckinReqSource:     old.CheckinReqSource,
-		Schedule: trae.CheckinSchedule{
-			Enabled: req.Schedule.Enabled,
-			Hours:   req.Schedule.Hours,
-			GapMS:   old.Schedule.GapMS,
-		},
+		// 签到排程字段原样带过（已成为遗留字段，不参与调度，见 trae.Config）。
+		Schedule: old.Schedule,
 		// 账号原样带过（凭证随对象一起），仅用于让 Load/Validate 与热重载看到
 		// 同一份列表——**不写回任何账号文件**（trae.json 里账号是 json:"-"）。
 		Accounts: append([]trae.Account(nil), old.Accounts...),
@@ -249,6 +236,10 @@ func (p *Panel) saveTraeConfig(w http.ResponseWriter, r *http.Request) {
 	if req.IDEVersion != "" {
 		next.IDEVersion = req.IDEVersion
 	}
+	// 签到 UA 传空串是**有意义的**（= 回到内置默认），所以不用 `if != ""` 判断。
+	// 无法区分"没提交该字段"与"提交了空串"是 JSON 的固有限制；这里选择尊重空串
+	// ——用户清空输入框的意图就是恢复默认，而"没提交"在前端总会带全字段。
+	next.CheckinUserAgent = req.CheckinUserAgent
 	if err := next.Validate(); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return

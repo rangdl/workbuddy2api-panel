@@ -74,7 +74,10 @@ type Config struct {
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
 
-	// TraePath trae.json 路径（面板「上游接入」页的 Trae 区块读写用；空 = 不提供该接口）。
+	// CodeBuddyPath codebuddy.json 路径（配置页的 WorkBuddy 上游区块读写用；
+	// 空 = 不提供该接口）。
+	CodeBuddyPath string
+	// TraePath trae.json 路径（配置页的 Trae 上游区块读写用；空 = 不提供该接口）。
 	TraePath string
 	// ReloadTrae 保存 trae.json 后触发热重载（由 main 注入）。
 	ReloadTrae func() error
@@ -229,6 +232,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	p.mux.HandleFunc("GET /panel/api/codebuddy_config", p.withAuth(p.getCodeBuddyConfig))
+	p.mux.HandleFunc("POST /panel/api/codebuddy_config", p.withAuth(p.saveCodeBuddyConfig))
 	p.mux.HandleFunc("GET /panel/api/trae_config", p.withAuth(p.getTraeConfig))
 	p.mux.HandleFunc("POST /panel/api/trae_config", p.withAuth(p.saveTraeConfig))
 	p.mux.HandleFunc("POST /panel/api/trae/import", p.withAuth(p.importTraeDevice))

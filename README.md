@@ -404,6 +404,7 @@ curl -s http://localhost:7863/v1/search/messages \
 | `schedule.keepalive_hours` | `[22]` | 每日本地时区整点刷新 token 保活 |
 | `schedule.blackcat_hours` | `[23]` | 每日本地时区整点夜猫子补足（23:00–08:00 计数窗口） |
 | `schedule.checkin_enabled` | `true` | 签到总开关；`false` 真正关闭 |
+| `schedule.checkin_backends` | 全部 `true` | 自动签到**按上游**的开关，如 `{"codebuddy": true, "trae": false}`。总开关控制任务跑不跑，这张表控制跑的时候签哪些上游；**键缺席 = 启用** |
 | `schedule.travel_blindbox_enabled` | `false` | Buddy 能量盲盒自动开盒（猫 `idle` 时消耗 energy）；消耗不可逆故缺省关闭 |
 | `schedule.travel_blindbox_max_per_run` | `5` | 单趟开盒次数上限（1-20），实际取 `min(affordable, max_open_count, 本值)` |
 | `schedule.travel_enabled` | `true` | 猫猫旅行总开关（独立于签到） |
@@ -413,15 +414,13 @@ curl -s http://localhost:7863/v1/search/messages \
 | `schedule.growth_hours` | `[1]` | 每日本地时区整点执行成长任务（自动接受 + 自动完成可达项） |
 | `schedule.growth_enabled` | `true` | 成长任务总开关 |
 | `schedule.balance_refresh_enabled` | `true` | 余额后台刷新总开关 |
+| `schedule.balance_refresh_minutes` | `5` | 刷新间隔（分钟）。实际每轮间隔带 ±15% 随机抖动 |
+| `schedule.task_sweep_minutes` | `15` | 任务补领清扫间隔（分钟）。实际每轮间隔带 ±15% 随机抖动 |
 | `schedule.balance_refresh_minutes` | `5` | 余额后台刷新周期（分钟）；两次签到时点之间保持 credits 新鲜 |
 | `schedule.task_sweep_enabled` | `true` | 任务补领清扫开关（接受 / 领奖未落账的自动重试） |
 | `schedule.task_sweep_minutes` | `15` | 任务补领清扫周期（分钟） |
 | `schedule.include_disabled_in_tasks` | `false` | 让**保号类**四任务（签到 / 活跃上报 / token 保活 / 余额刷新）对**已禁用**账号也执行——「禁用」只关选号，不停保号。`false`（默认）保持「禁用的跳过」 |
-| `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
-| `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
-| `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
-| `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
-| `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
+| `cn.chat_base` / `global.chat_base` | 空 | **已迁到 `codebuddy.json`**（见「上游配置」一节） |
 | `models.hidden` | `[]` | 模型黑名单：不对外暴露的模型。裸名=两域都藏；`"cn:xxx"`/`"global:xxx"`=只藏该域。`GET /v1/models` 列表过滤 + `POST /v1/chat/completions` 点名拒绝（400 `model_unavailable`）。面板保存后热生效 |
 | `prompt.mode` | `passthrough` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
@@ -461,7 +460,9 @@ curl -s http://localhost:7863/v1/search/messages \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+
+上游专有变量加 `WB2A_CODEBUDDY_` 前缀：`WB2A_CODEBUDDY_TIMEOUT_SECONDS` · `WB2A_CODEBUDDY_HEADER_TIMEOUT_SECONDS` · `WB2A_CODEBUDDY_IDLE_TIMEOUT_SECONDS` · `WB2A_CODEBUDDY_USER_AGENT` · `WB2A_CODEBUDDY_SANITIZE_FINGERPRINTS`(bool) 等（旧名仍生效，见「上游配置 → 环境变量」）
 
 ## 核心行为语义
 
@@ -568,13 +569,70 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 - TTL 滚动续期（默认 30m），GC 周期 5m；绑定可镜像到 Redis（7 天 TTL）防重启丢失
 - 请求失败自动解绑；成功后绑定跟随最终成功账号
 
+### 上游配置（`config/codebuddy.json` · `config/trae.json`）
+
+**每个上游的独特配置各占一个文件**，`config.json` 只放与上游无关的东西。
+加上游 = 加一个文件，删上游 = 删一个文件，字段归属不用猜。
+
+```json
+// config/codebuddy.json
+{
+  "cn":     { "chat_base": "", "billing_base": "" },
+  "global": { "enabled": true, "chat_base": "", "billing_base": "" },
+  "user_agent": "",
+  "client_version": "",
+  "cli_version": "",
+  "sanitize_blacklist_fingerprints": true
+}
+```
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `cn` / `global` | — | **两域各自独立的 base**。空 = 内置默认。域隔离是硬约束，不要合并 |
+| `global.enabled` | `true` | 国际版路由开关（逃生门：关掉则纯 CN 锁定） |
+| `user_agent` | 空 | 出站 UA 覆盖（空 = 内置三段式默认）。影响官网「使用端」归因 |
+| `client_version` / `cli_version` | 空 | 出站 UA 的 `WorkBuddy/<ver>` 与 `CLI/<ver>` 段 |
+| `sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏（**CodeBuddy 专有**：Trae 没有逐字审核） |
+
+Trae 的那份见下方「Trae 上游 → 配置」一节。
+
+**超时与 SSE 两个上限在 `config.json` 的 `upstream` 段**，不在上游文件里——
+它们描述的是传输层行为，WorkBuddy 与 Trae 的对话都是流式长连接，语义完全相同：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `upstream.timeout_seconds` | `120` | 短 RPC（刷新/签到/余额/模型列表）总时长上限 |
+| `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前上限（多久没响应头就放弃） |
+| `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（流中途多久没吐数据就断） |
+
+> **从旧版升级**：旧 `config.json` 里的 `cn` / `global` / `upstream` / `features`
+> 四段会在启动时自动搬进 `codebuddy.json` 并从主配置删除（保证配置单一来源）。
+
+#### 环境变量
+
+上游专有变量统一加 `WB2A_CODEBUDDY_` 前缀：`WB2A_CODEBUDDY_USER_AGENT`、
+`WB2A_CODEBUDDY_TIMEOUT_SECONDS`、`WB2A_CODEBUDDY_CLIENT_VERSION` 等。
+
+旧名（`WB2A_USER_AGENT` 等）**仍生效**并打一条 WARN——部署脚本里用得广，
+直接删会让升级后的部署静默失去覆盖。
+
 ### 定时任务
 
 五类任务各自独立排程、各有开关，互不影响。容器时区由 `TZ` 控制（compose 默认 `Asia/Shanghai`）。
 
+**所有定时触发都带随机抖动**，不是毫秒精确的整点：
+
+- 整点类任务（签到/旅行/活跃/保活/夜猫子/成长）：在实际时刻上**只向后**加 0~10 分钟随机延迟。
+  同一小时的多类任务共享同一个偏移，仍是一批。只向后是为了不让「21 点签到」在 20:59 发出
+  （跨日边界、上游额度刷新时刻都可能没到）。
+- 周期类任务（余额刷新/任务清扫）：每轮间隔带 ±15% 抖动。
+
+原因：每天 9:00:00.000 准点打同一批请求是最强的机器特征之一，与真实用户的使用形态完全不同。
+抖动窗口刻意取小——防的是「毫秒级精确」，不是要把任务打散到小时级。
+
 | 任务 | 开关（默认 true） | 时刻（默认） | 行为 |
 |---|---|---|---|
-| 签到 | `schedule.checkin_enabled` | `checkin_hours` `[9, 21]` 整点 | 签到 + 余额查询；余额恢复则解冻冷却账号。**末尾追加连登管家**（见下） |
+| 签到 | `schedule.checkin_enabled` | `checkin_hours` `[9, 21]` 整点 | 签到 + 余额查询；余额恢复则解冻冷却账号。**末尾追加连登管家**（见下）。可按上游分别开关，见 `schedule.checkin_backends` |
 | 活跃上报 | `schedule.activity_enabled` | `activity_hours` `[10]` 整点 | 对话活跃上报（`chat_request_send` 事件，必须含 `userId`）；点亮连登 + 解锁 `first_buddy`；每号每天 1 次 |
 | 猫猫旅行 | `schedule.travel_enabled` | `travel_hours` `[9, 21]` 整点 + 到站定时器 | 独立排程：无猫领养 / `idle` 派出 / `arrived` 领奖；到站定时器按 `arrive_at` 精确唤醒 |
 | 保活 | `schedule.keepalive_enabled` | `keepalive_hours` `[22]` 整点 | 全账号刷新 token；session 失效**连续 3 次**才自动禁用 |
@@ -890,7 +948,7 @@ http://127.0.0.1:7863/panel/
 | `activity/growth/tasks/accept` | POST | 接受任务（`{"task_codes":[...]}`） |
 | `activity/growth/tasks/<task_code>/claim` | POST | **领取任务奖励**（任务码在路径、无 body；**Web 域 `www.workbuddy.cn`**，非 CLI 域——这是领奖能成功的关键） |
 
-出站请求统一携带 `CLI/2.63.2 CodeBuddy/2.63.2` UA（可被 `upstream.user_agent` 覆盖）；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。领奖请求额外带 `x-client-platform: web` 与 workbuddy.cn 的 Origin/Referer。
+出站请求统一携带 `CLI/2.63.2 CodeBuddy/2.63.2` UA（可被 `codebuddy.json` 的 `user_agent` 覆盖）；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。领奖请求额外带 `x-client-platform: web` 与 workbuddy.cn 的 Origin/Referer。
 
 ## 🚂 Trae 上游（协议层已实现）
 
@@ -903,17 +961,25 @@ Trae **没有独立前缀**：对话统一走 `/v1/*`，用模型名前缀 `trae
 
 ### 配置（`config/trae.json`，与 `config/config.json` 同目录）
 
-`trae.json` **只放全局配置**，账号一账号一文件放在 `auths/`（与 CodeBuddy 一致）：
+`trae.json` **只放上游协议常量与凭证策略**，账号一账号一文件放在 `auths/`
+（与 CodeBuddy 一致）：
 
 ```json
 {
-  "enabled": false,
-  "chat_base": "https://trae-api-cn.mchost.guru",
   "api_trae_base": "https://api.trae.cn",
   "auth_dir": "",
-  "schedule": { "checkin_enabled": false, "checkin_hours": [9] }
+  "ide_version": "0.1.50",
+  "checkin_user_agent": "",
+  "verify_claim": true
 }
 ```
+
+**没有 `enabled` 开关**：上游平权，加了账号即启用（与 WorkBuddy 完全一致）。
+**没有 `chat_base`**：上游路径不是配置项。
+**没有生效的 `schedule`**：签到排程统一在 `config.json`，见下节。
+
+> 大多数情况下**不需要手改这个文件**：IDE 版本与签到 UA 在面板「配置 →
+> 上游与高级」里改。保留文件是为了上游改版时能覆盖协议常量而不必发版。
 
 ```
 auths/
@@ -930,7 +996,8 @@ auths/
 > 为什么分文件：refreshToken 是轮换链，两个账号并发续期时共写一个 `trae.json`
 > 会让后写者覆盖先写者刚更新的另一个账号。分文件后各写各的。
 
-`enabled` 缺省 `false`：未启用时 Trae 账号不参与调度，`trae:` 前缀会解析为未知模型，现有功能完全不受影响。
+Trae 与 WorkBuddy 平权：**只要账号池里有 Trae 账号就参与调度**，没有单独的上游
+启用开关。没有 Trae 账号时，`trae:` 前缀会解析为未知模型，其他功能完全不受影响。
 
 ### 已实现
 
@@ -1241,7 +1308,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config
 
 ### 如何让官网「使用端」列显示为 WorkBuddy？
 
-官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent: "WorkBuddy/2.x.x"`（或环境变量 `WB2A_USER_AGENT`）即可改写全部出站请求的 UA；默认保持 `CLI/2.63.2 CodeBuddy/2.63.2` 现状（指纹净化考虑，可配而非改死）。
+官网「使用端」列按出站请求 UA 服务端归因。配置 `codebuddy.json` 的 `"user_agent": "WorkBuddy/2.x.x"`（或环境变量 `WB2A_CODEBUDDY_USER_AGENT`）即可改写全部出站请求的 UA；默认保持 `CLI/2.63.2 CodeBuddy/2.63.2` 现状（指纹净化考虑，可配而非改死）。
 
 ## 关键断言 ↔ 代码出处
 

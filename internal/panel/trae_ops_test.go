@@ -281,27 +281,42 @@ func TestTraeOpsUnavailable(t *testing.T) {
 }
 
 // TestTraeConfigViewIncludesSchedule 配置视图带出排程字段（面板回显用）。
-func TestTraeConfigViewIncludesSchedule(t *testing.T) {
+// TestTraeConfigViewExposesOnlyConfigurableFields 视图只回显仍在配置页的字段。
+//
+// 上游接入页删除后，GET /panel/api/trae_config 只服务配置页的两个输入框
+// （IDE 版本 / 签到 UA）。签到排程与对话 base 不再是 Trae 的配置项：
+//   - 排程统一在 config.json（schedule.checkin_enabled + checkin_backends）；
+//   - base 是上游路径，不该可配。
+//
+// 这条锁死"视图不再回显排程"，防止有人把它加回来重新制造双份签到定时。
+func TestTraeConfigViewExposesOnlyConfigurableFields(t *testing.T) {
 	srv := newTraeOpsUpstream(t)
 	p, path := newTraeOpsPanel(t, srv.URL)
 	cfg, _ := trae.Load(path, "")
-	cfg.Schedule = trae.CheckinSchedule{Enabled: true, Hours: []int{9, 21}, GapMS: 800}
+	cfg.IDEVersion = "0.9.9"
+	cfg.CheckinUserAgent = "Trae/9.9.9"
 	writeTraeTestConfig(t, path, cfg)
 
 	rec := traeDo(p, http.MethodGet, "/panel/api/trae_config", "")
 	var got struct {
 		Config struct {
-			Schedule struct {
-				Enabled bool  `json:"checkin_enabled"`
-				Hours   []int `json:"checkin_hours"`
-			} `json:"schedule"`
+			IDEVersion       string          `json:"ide_version"`
+			CheckinUserAgent string          `json:"checkin_user_agent"`
+			Schedule         json.RawMessage `json:"schedule"`
+			ChatBase         string          `json:"chat_base"`
 		} `json:"config"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if !got.Config.Schedule.Enabled || len(got.Config.Schedule.Hours) != 2 {
-		t.Fatalf("排程未回显: %s", rec.Body)
+	if got.Config.IDEVersion != "0.9.9" || got.Config.CheckinUserAgent != "Trae/9.9.9" {
+		t.Fatalf("配置页两个可配项未回显: %s", rec.Body)
+	}
+	if len(got.Config.Schedule) != 0 {
+		t.Errorf("排程不应再由 trae.json 回显（已统一到 config.json）: %s", got.Config.Schedule)
+	}
+	if got.Config.ChatBase != "" {
+		t.Errorf("对话 base 不是配置项，不应回显: %q", got.Config.ChatBase)
 	}
 }
 
@@ -338,22 +353,32 @@ func TestTraeConfigSaveNeverTouchesAccountFiles(t *testing.T) {
 }
 
 // TestTraeConfigSaveSchedule 保存排程字段。
-func TestTraeConfigSaveSchedule(t *testing.T) {
+// TestTraeConfigSaveDoesNotPersistSchedule 保存配置不再写签到排程。
+//
+// 排程已统一到 config.json（总开关 + 按上游勾选）。若这里仍接受并落盘
+// trae.json 的 schedule，就会重新出现「两个地方都能设签到时间、谁生效看运气」
+// 的分裂状态——这正是本次改造要消除的问题。
+func TestTraeConfigSaveDoesNotPersistSchedule(t *testing.T) {
 	srv := newTraeOpsUpstream(t)
 	p, path := newTraeOpsPanel(t, srv.URL)
+	before, _ := trae.Load(path, "")
+	prevHours := append([]int(nil), before.Schedule.Hours...)
 
-	body := `{"enabled":true,"chat_base":"` + srv.URL + `","accounts":["u-1"],"disabled":[],
-		"schedule":{"checkin_enabled":true,"checkin_hours":[7,19]}}`
+	body := `{"ide_version":"0.1.99","schedule":{"checkin_enabled":true,"checkin_hours":[7,19]}}`
 	rec := traeDo(p, http.MethodPost, "/panel/api/trae_config", body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
 	}
 	saved, _ := trae.Load(path, "")
-	if !saved.Schedule.Enabled || len(saved.Schedule.Hours) != 2 || saved.Schedule.Hours[0] != 7 {
-		t.Fatalf("排程未保存: %+v", saved.Schedule)
+	if saved.IDEVersion != "0.1.99" {
+		t.Fatalf("ide_version 应保存，得到 %q", saved.IDEVersion)
+	}
+	// 排程请求被忽略：既有值原样保留，不会被请求里的 [7,19] 覆盖。
+	if len(saved.Schedule.Hours) != len(prevHours) || (len(prevHours) > 0 && saved.Schedule.Hours[0] != prevHours[0]) {
+		t.Fatalf("签到排程不应再由本接口改写（已统一到 config.json），得到 %+v", saved.Schedule)
 	}
 	// 账号凭证仍保留
-	if saved.Accounts[0].AccessToken != "tok-1" {
-		t.Errorf("凭证应保留，得到 %q", saved.Accounts[0].AccessToken)
+	if len(saved.Accounts) == 0 || saved.Accounts[0].AccessToken != "tok-1" {
+		t.Errorf("凭证应保留，得到 %+v", saved.Accounts)
 	}
 }
