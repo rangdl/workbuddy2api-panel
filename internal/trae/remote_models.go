@@ -132,6 +132,11 @@ func (c *Client) fetchRemoteModels(ctx context.Context, cfg *Config, acc *Accoun
 	if cfg == nil || acc == nil || acc.AccessTokenHeader() == "" {
 		return nil
 	}
+	// nil ctx 会让 context.WithTimeout panic（"cannot create context from nil
+	// parent"）。调用方忘记传 ctx 时退化为 Background，比崩掉整个进程好。
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ctx, cancel := context.WithTimeout(ctx, catalogFetchTimeout)
 	defer cancel()
 
