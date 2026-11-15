@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -179,6 +180,17 @@ func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 	if elapsed > 2*time.Second {
 		t.Errorf("Run took %v（不应空转/忙等）", elapsed)
 	}
+}
+
+// TestMain 关闭整点抖动，使排程语义断言保持精确。
+//
+// 抖动是**行为**（见 jitter.go），不是**语义**：排程测试要断言的始终是「下一次
+// 唤醒落在哪个档位、该档位有哪些任务」。若让这些断言承受 0..10 分钟的随机偏移，
+// 只能退化成「落在 [9:00, 9:10) 之间」的弱断言——抖动一旦加错方向或算错窗口
+// 也会照样通过。抖动本身由 jitter_test.go 直接测。
+func TestMain(m *testing.M) {
+	fireJitterFn = func() time.Duration { return 0 }
+	os.Exit(m.Run())
 }
 
 func hasKind(kinds []taskKind, k taskKind) bool {

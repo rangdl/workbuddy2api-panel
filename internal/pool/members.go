@@ -112,6 +112,33 @@ func (p *Pool) AccountsByBackend(backend string) []gateway.Account {
 	}))
 }
 
+// Backends 返回池内**实际存在账号**的上游名（去重，顺序稳定）。
+//
+// 为什么由池提供而不是让调用方读配置：调用方（调度器/面板）要的是「现在有
+// 哪些上游需要处理」，配置里列着但没有账号的上游跑一轮是纯空转；反过来，新
+// 加了账号的上游即使配置里没提也必须照常参与（缺键 = 启用）。
+//
+// 顺序按首次出现稳定排序，便于日志与面板展示不跳动。
+func (p *Pool) Backends() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	seen := make(map[string]bool, 4)
+	out := make([]string, 0, 4)
+	for _, e := range p.byUID {
+		if e.acc == nil {
+			continue
+		}
+		be := e.acc.Backend()
+		if be == "" || seen[be] {
+			continue
+		}
+		seen[be] = true
+		out = append(out, be)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // accountsOf 从成员快照里剥出账号对象。
 func accountsOf(ms []Member) []gateway.Account {
 	out := make([]gateway.Account, 0, len(ms))

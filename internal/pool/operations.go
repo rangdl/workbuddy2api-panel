@@ -158,8 +158,13 @@ func (p *Pool) CheckinAll(ctx context.Context, includeDisabled bool) {
 }
 
 // CheckinBackend 只对指定上游的账号执行签到（面板的「Trae 全部签到」等入口）。
+//
+// SkipGlobal 与 CheckinAll 同口径：CN 的签到端点对 global 域账号无效，发起调用
+// 只是白耗风控额度。此前只有 CheckinAll 带这个旗标，而调度器改为按上游分批后
+// 走的是本方法——漏带会让每次自动签到都去撞一遍国际版账号（回归点，见
+// TestCheckinStillSkipsGlobal）。
 func (p *Pool) CheckinBackend(ctx context.Context, backend string, includeDisabled bool) {
-	p.checkinAll(ctx, opOptions{IncludeDisabled: includeDisabled, Backend: backend})
+	p.checkinAll(ctx, opOptions{IncludeDisabled: includeDisabled, SkipGlobal: true, Backend: backend})
 }
 
 func (p *Pool) checkinAll(ctx context.Context, opts opOptions) {

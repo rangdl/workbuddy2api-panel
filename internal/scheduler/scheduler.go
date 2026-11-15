@@ -37,6 +37,15 @@ type Config struct {
 	// CheckinDisabled 显式关闭签到排程（对应 config 的 schedule.checkin_enabled=false）。
 	// 禁用后不再有任何签到时点。旅行不再搭签到便车（已剥离为独立排程）。
 	CheckinDisabled bool
+	// CheckinBackends 自动签到**按上游**的开关（schedule.checkin_backends）。
+	//
+	// 语义是「跑的时候对哪些上游签到」：nil / 缺键 / true 都表示启用，只有显式
+	// false 才跳过该上游。总开关 CheckinDisabled 优先——它关掉时本表完全不被读取。
+	//
+	// 为什么放在调度器而不是各上游自己的配置：签到流程（选哪些号、并发、限速、
+	// 记账、失败分类）对两个上游完全一致，只有"调哪个端点的 Checkin"不同，而那是
+	// 账号对象自己的事。把开关留给上游就等于把同一套流程复制两遍。
+	CheckinBackends map[string]bool
 	// TravelDisabled 显式关闭猫猫旅行排程（schedule.travel_enabled=false）。
 	TravelDisabled bool
 	// ActivityDisabled 显式关闭活跃上报排程（schedule.activity_enabled=false）。
@@ -231,6 +240,17 @@ func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepal
 	poke(s.rearmTravel)
 }
 
+// SetCheckinBackends 热更新「按上游的自动签到开关」（schedule.checkin_backends）。
+//
+// 用独立 setter 而不是并入 Reconfigure：后者已有 12 个位置参数，再追加一个
+// map 会让唯一 call site 难以校对（同 SetTravelBlindbox 的理由）。
+func (s *Scheduler) SetCheckinBackends(backends map[string]bool) {
+	s.schedMu.Lock()
+	s.cfg.CheckinBackends = backends
+	s.schedMu.Unlock()
+	poke(s.rearmSchedule)
+}
+
 // SetTravelBlindbox 热更新能量盲盒配置（schedule.travel_blindbox_enabled /
 // travel_blindbox_max_per_run）。用独立 setter 而非并入 Reconfigure：后者已有
 // 12 个位置参数，继续追加会让唯一 call site 难以校对。
@@ -347,6 +367,13 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 			kinds = append(kinds, sl.kind)
 		}
 	}
+	// 整点触发加向后抖动（见 jitter.go）：每天 9:00:00.000 准点打同一批请求是
+	// 最强的机器特征。加在**最终结果**上而不是 nextFire 内部——同一小时的多类
+	// 任务（如签到与旅行都配 9 点）必须共享同一个抖动值，否则会在同一档里被
+	// 打散成多次唤醒，等于把一批请求拆成几批更零散但同样规律的请求。
+	// 只向后加：提前会让「21 点签到」在 20:59 发出，跨日边界与上游额度刷新
+	// 时刻都可能没到。
+	earliest = earliest.Add(fireJitterFn())
 	return earliest, kinds
 }
 
@@ -527,9 +554,36 @@ func (s *Scheduler) RunCheckinNow() {
 	// 签到与余额刷新都交给池：池遍历账号对象、逐个调它自己的 Checkin/Credits。
 	// 调度器不认识任何上游协议，也不再有 backend 分支。
 	includeDisabled := s.includeDisabledInTasks()
-	s.cfg.Pool.CheckinAll(ctx, includeDisabled)
+	// 按上游分批签到（schedule.checkin_backends）。上游名从**池里的实际账号**取，
+	// 而不是从配置的键取：配置里列着但没有账号的上游跑一轮是纯空转，而「加了
+	// 账号却没出现在配置里」的新上游必须照常签到（缺键 = 启用）。
+	for _, be := range s.cfg.Pool.Backends() {
+		if !s.checkinBackendEnabled(be) {
+			log.Printf("checkin: 上游 %s 已按配置关闭自动签到，跳过", be)
+			continue
+		}
+		s.cfg.Pool.CheckinBackend(ctx, be, includeDisabled)
+	}
+	// 余额刷新不按上游分：它是观测量而非"替账号做动作"，所有上游都要保持新鲜。
 	s.cfg.Pool.RefreshCreditsForTasks(ctx, includeDisabled)
 	s.RunStreakBonusNow()
+}
+
+// checkinBackendEnabled 报告某上游是否参与自动签到（缺键 = 启用）。
+//
+// 显式 false 才跳过，nil/缺键/true 都算启用——与配置注释同一口径。这条「缺省
+// 启用」是刻意的：新增上游时忘了配这张表，正确行为是照常签到，而不是静默关停。
+func (s *Scheduler) checkinBackendEnabled(backend string) bool {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	if s.cfg.CheckinBackends == nil {
+		return true
+	}
+	v, ok := s.cfg.CheckinBackends[backend]
+	if !ok {
+		return true
+	}
+	return v
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
@@ -649,7 +703,10 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 					continue
 				}
 			}
-			timer := time.NewTimer(cur)
+			// 间隔加 ±15% 抖动（见 jitter.go）：每 5 分钟整点一刷是规律机器节律。
+			// 抖动只改**本轮等待**，不改 s.balanceInterval 存的值——面板显示与
+			// 热改语义仍是用户配置的那个间隔。
+			timer := time.NewTimer(tickerJitter(cur, tickerJitterFraction))
 			select {
 			case <-ctx.Done():
 				timer.Stop()
@@ -692,7 +749,8 @@ func (s *Scheduler) StartTaskSweep(ctx context.Context, interval time.Duration) 
 					continue
 				}
 			}
-			timer := time.NewTimer(cur)
+			// 同余额刷新：±15% 抖动打散「每 15 分钟整点一扫」的机器节律。
+			timer := time.NewTimer(tickerJitter(cur, tickerJitterFraction))
 			select {
 			case <-ctx.Done():
 				timer.Stop()
