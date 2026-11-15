@@ -106,6 +106,14 @@ func (b *Backend) Chat(ctx context.Context, acc gateway.Account, in *gateway.Inb
 					Raw:       res.RemainRaw,
 				}
 			}
+			// 流内业务码（1005 额度/4017 风控/20405 设备…）由本包分类。
+			// 把业务码当 HTTP status 传给 upstream.Classify 会让「额度用尽」
+			// 被当成未知错误——账号不冷却，继续被轮转选中。
+			if res.ErrorCode != 0 {
+				cls := traepkg.Classify(0, nil, res.ErrorCode, res.ErrorMsg)
+				d := Decide(cls)
+				stats.Decision = &d
+			}
 			return stats, err
 		},
 	}, nil

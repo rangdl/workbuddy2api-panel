@@ -10,7 +10,6 @@ import (
 	"os"
 	"time"
 
-	backendtrae "github.com/linguo2625469/workbuddy2api-panel/internal/backend/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -115,9 +114,9 @@ func (h *Handler) dispatchViaBackend(w http.ResponseWriter, r *http.Request,
 	// Trae 运行期计数（在途/成功/失败/用量）：面板「Trae 签到」区块读这张表。
 	// CodeBuddy 不走这里——它的统计由池的 tokenUsage 与 Status 提供。
 	// defer 保证任何 return 都结算一次，否则在途数永远不归零。
-	traeFinish := h.beginTraeStat(acc)
+	streamFinish := h.beginStreamStat(acc)
 	statOK := false
-	defer func() { traeFinish(statOK) }()
+	defer func() { streamFinish(statOK) }()
 
 	out, err := be.Chat(r.Context(), acc, in)
 	if err != nil {
@@ -182,22 +181,21 @@ func (h *Handler) dispatchViaBackend(w http.ResponseWriter, r *http.Request,
 	return backendHandled, nil
 }
 
-// beginTraeStat 开启 Trae 账号的运行期计数；非 Trae 账号返回空操作。
+// beginStreamStat 开启账号的运行期计数（gateway.StreamLifecycle 可选能力）。
 //
-// 为什么在 dispatch 而不是在 backend 内部：面板读的是 h.cfg.TraeStats 这个实例
-// （main 构造、面板与 handler 共用），backend 包不认识它。
-// 为什么必须用 defer：在途计数不归零会让面板永远显示「1 个在途」。
-func (h *Handler) beginTraeStat(acc gateway.Account) func(ok bool) {
-	stats := h.cfg.TraeStats
-	if stats == nil || acc == nil || acc.Backend() != "trae" {
+// 未实现该接口的账号返回空操作。dispatch 不判断上游名：Trae 的账号自己
+// 实现了它（把计数交给装配层注入的 trae.Stats 实例），其余上游不实现即跳过。
+//
+// 为什么必须 defer：在途计数不归零会让面板永远显示「1 个在途」。
+func (h *Handler) beginStreamStat(acc gateway.Account) func(ok bool) {
+	if acc == nil {
 		return func(bool) {}
 	}
-	finish := stats.Begin(acc.UID())
-	return func(ok bool) {
-		// UsageDelta 的 token/延迟字段由 recordBackendUsage 另行落池，
-		// 这里只结算在途与成功/失败（面板的「成功/失败/在途」三列）。
-		finish(ok, trae.UsageDelta{})
+	lc, ok := acc.(gateway.StreamLifecycle)
+	if !ok {
+		return func(bool) {}
 	}
+	return lc.BeginStream()
 }
 
 // handleBackendFailure 按 Decision 处置账号，返回三态结果与失败原因。
@@ -230,7 +228,7 @@ func (h *Handler) handleBackendFailure(acc gateway.Account, model string, err er
 		h.recordBackendAccounting(acc, model, "", gateway.StreamStats{}, st)
 		return backendRetry, err
 	}
-	h.applyFailure(acc, model, f, st)
+	h.applyFailure(acc, model, f)
 	status := f.HTTPStatus
 	if status < 400 {
 		status = http.StatusBadGateway
@@ -261,7 +259,7 @@ func (h *Handler) handleBackendFailure(acc gateway.Account, model string, err er
 // Trae 的 soft_rate/session_dead/server/client 与 CodeBuddy 的 ErrKind 同名，
 // 按名字反查会把 Trae 失败送进 CodeBuddy 策略（冷却放大约 10 倍、
 // session_dead 的 reason 写成 12153、5xx 不再冷却）。
-func (h *Handler) applyFailure(acc gateway.Account, model string, f *gateway.Failure, st *chatStat) {
+func (h *Handler) applyFailure(acc gateway.Account, model string, f *gateway.Failure) {
 	if f.Decision.Policy == gateway.PolicyCodeBuddy {
 		kind := upstream.ErrKindOf(f.Decision.Kind)
 		body := string(f.Body)
@@ -384,7 +382,7 @@ func (h *Handler) forwardBackendStream(w http.ResponseWriter, acc gateway.Accoun
 	if res.ErrorCode != 0 {
 		st.status = http.StatusBadGateway
 		st.outcome = reqlog.OutcomeStreamError
-		h.applyStreamError(acc, model, res, st)
+		h.applyStreamError(acc, model, res)
 		return
 	}
 	if res.Repaired > 0 {
@@ -416,37 +414,26 @@ func (h *Handler) bindSessionAfterSuccess(sessKey string, acc gateway.Account) {
 // applyStreamError 处置流内错误帧（无法改状态码，只能更新账号状态）。
 //
 // 与内联路径的流尾处置同语义：不记成功、不清负缓存、不绑粘性。
-func (h *Handler) applyStreamError(acc gateway.Account, model string, res gateway.StreamStats, st *chatStat) {
-	// 按上游分流分类器：两家的流内错误码表完全不同。
-	//   - CodeBuddy：error 帧原文 → FrameKind（6004/11102/内容拦截等）
-	//   - Trae：业务码在 StreamStats.ErrorCode（1005/4008/4017/20405 等），
-	//     必须走 trae.Classify。把业务码当 HTTP status 传给 upstream.Classify
-	//     会让「额度用尽」被当成未知错误——账号不冷却，继续被轮转选中。
-	if acc.Backend() == "trae" {
-		h.applyTraeStreamError(acc, model, res)
+//
+// 这里**不判断上游**：流内错误的分类由 backend 在自己包里完成并填入
+// StreamStats.Decision（CodeBuddy 的 6004/11102 来自 error 帧原文，Trae 的
+// 1005/4017 来自事件流业务码）。改造前本函数按 `acc.Backend() == "trae"`
+// 分流到两套分类器，加第三个上游就要加第三个分支。
+//
+// 缺 Decision 时兜底：仍按「不罚号」处理并留一条 WARN。这是契约违约
+// （backend 忘了填），不该静默吞掉——否则一个正在限流的号会被记成健康。
+func (h *Handler) applyStreamError(acc gateway.Account, model string, res gateway.StreamStats) {
+	if res.Decision == nil {
+		log.Printf("WARN: [server] stream acct=%s model=%s backend=%s: 流内错误缺少 Decision（backend 未填），按不罚号处理 payload=%s",
+			acc.UID(), model, acc.Backend(), logfmt.Truncate(res.ErrorMsg, 200))
 		return
 	}
-	kind := upstream.FrameKind(res.ErrorMsg)
-	if kind == upstream.ErrNone {
-		// 非业务码（backend 用 ErrorCode=-1 标记「原文在 ErrorMsg」）：按上游原文分类。
-		// 传 0 而不是 int(ErrorCode)：-1 不是合法 HTTP status，会干扰分类。
-		kind = upstream.Classify(0, res.ErrorMsg)
-	}
-	log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
-		acc.UID(), model, kind, logfmt.Truncate(res.ErrorMsg, 200))
-	h.applyErrorPolicy(acc.UID(), kind, res.ErrorMsg, model, nil)
-}
-
-// applyTraeStreamError 处置 Trae 流内错误（用自己的分类器与决策表）。
-func (h *Handler) applyTraeStreamError(acc gateway.Account, model string, res gateway.StreamStats) {
-	cls := trae.Classify(0, nil, res.ErrorCode, res.ErrorMsg)
-	d := backendtrae.Decide(cls)
-	log.Printf("WARN: [server] stream acct=%s model=%s: trae stream error kind=%s code=%s action=%s payload=%s",
-		acc.UID(), model, cls.Kind, cls.Code, d.Action, logfmt.Truncate(res.ErrorMsg, 200))
-	h.applyDecision(acc, model, &gateway.Failure{
-		Decision:   d,
-		HTTPStatus: cls.HTTPStatus(),
-		Body:       []byte(res.ErrorMsg),
+	d := res.Decision
+	log.Printf("WARN: [server] stream acct=%s model=%s backend=%s: stream error kind=%s code=%s action=%s rotate=%v payload=%s",
+		acc.UID(), model, acc.Backend(), d.Kind, d.Code, d.Action, d.Rotate, logfmt.Truncate(res.ErrorMsg, 200))
+	h.applyFailure(acc, model, &gateway.Failure{
+		Decision: *d,
+		Body:     []byte(res.ErrorMsg),
 	})
 }
 
@@ -476,19 +463,21 @@ func (h *Handler) recordBackendUsage(acc gateway.Account, model, modelRate strin
 		st.hasCredit = true
 		st.creditEstimated = false
 	}
-	// 积分估算：Trae 的 chat 流不含扣费字段（实测），只能按 token × 模型倍率推算。
-	// 标成估算——它不参与选号成本分层，只作数量级参考。
+	// 积分估算：上游没在 usage 里给实测扣费时，由账号自己按 token × 倍率
+	// 推算（gateway.CreditEstimator）。估算口径是上游特有的——Trae 的 chat 流
+	// 不含扣费字段，CodeBuddy 在 usage 里直接给 credit——所以公式留在 backend。
+	// 标成估算：它不参与选号成本分层，只作数量级参考。
 	if res.Usage != nil && !st.hasCredit {
-		if rate, ok := h.traeRateFor(context.Background(), acc, model); ok {
-			if est, ok2 := trae.EstimateCreditsFromUsage(
-				res.Usage.PromptTokens, res.Usage.CacheRead,
-				res.Usage.CacheCreation, res.Usage.CompletionTokens, rate); ok2 {
-				log.Printf("[server] 积分估算 acct=%s model=%s rate=%v prompt=%d cacheRead=%d cacheWrite=%d completion=%d → %.4f",
-					acc.UID(), model, rate, res.Usage.PromptTokens, res.Usage.CacheRead,
-					res.Usage.CacheCreation, res.Usage.CompletionTokens, est)
-				st.credit = est
-				st.hasCredit = true
-				st.creditEstimated = true
+		if est, ok := acc.(gateway.CreditEstimator); ok {
+			if rate, hasRate := h.modelRateFor(context.Background(), acc, model); hasRate {
+				if credit, ok2 := est.EstimateCredits(res.Usage, rate); ok2 {
+					log.Printf("[server] 积分估算 acct=%s model=%s rate=%v prompt=%d cacheRead=%d cacheWrite=%d completion=%d → %.4f",
+						acc.UID(), model, rate, res.Usage.PromptTokens, res.Usage.CacheRead,
+						res.Usage.CacheCreation, res.Usage.CompletionTokens, credit)
+					st.credit = credit
+					st.hasCredit = true
+					st.creditEstimated = true
+				}
 			}
 		}
 	}
@@ -570,8 +559,13 @@ func (h *Handler) recordBackendAccounting(acc gateway.Account, model, modelRate 
 		if realm == "" {
 			realm = "cn"
 		}
-		if acc.Backend() == "trae" {
-			realm = "trae"
+		// 分账标签由账号自己决定（gateway.UsageLabeller）：Trae 的积分消耗
+		// 与 CodeBuddy 的套餐额度是两套体系，混在一个域会让「这个域花了多少」
+		// 失去意义。未实现该接口的上游用 Realm()。
+		if lb, ok := acc.(gateway.UsageLabeller); ok {
+			if label := lb.UsageLabel(); label != "" {
+				realm = label
+			}
 		}
 		h.cfg.Usage.Add(time.Now(), realm, uid, model, usage.Delta{
 			PromptTokens:     delta.PromptTokens,
@@ -606,28 +600,32 @@ func InitTraeRawDump() {
 	log.Printf("[trae] 原始事件转储已开启（TRAE_RAW_DUMP），对话内容会写入日志")
 }
 
-// traeRateFor 取该模型在 Trae 目录里的积分倍率。
+// modelRateFor 取该模型的积分倍率（gateway.ModelRate 可选能力）。
 //
-// 走池的 ModelRateFor → 账号自己的 gateway.ModelRate 实现（Trae 读 remote 目录
-// 的 30 分钟缓存），**不再在这里重新挑账号、重新拉目录**：改造前这里为一次
-// 估算又发一遍 HTTPS，既慢又绕过了池的健康判据。
+// 走池的 ModelRateFor → 账号自己的实现（Trae 读 remote 目录的进程内缓存），
+// **不在这里重新挑账号、重新拉目录**：改造前这里为一次估算又发一遍 HTTPS，
+// 既慢又绕过了池的健康判据。
 //
-// 目录拉不到或该模型无倍率信息时返回 false——不估算未知倍率，
-// 否则会把「未知」写成 0 被误读成免费。
-func (h *Handler) traeRateFor(ctx context.Context, acc gateway.Account, model string) (float64, bool) {
-	if acc == nil || acc.Backend() != "trae" || model == "" {
+// 未实现该能力的账号（CodeBuddy 在 usage 里直接给 credit）与「目录里没有
+// 该模型倍率」都返回 false——不估算未知倍率，否则会把「未知」写成 0 被
+// 误读成免费。
+func (h *Handler) modelRateFor(ctx context.Context, acc gateway.Account, model string) (float64, bool) {
+	if acc == nil || model == "" {
 		return 0, false
 	}
 	return h.cfg.Pool.ModelRateFor(ctx, acc, model)
 }
 
 // noteBackendRemain 记录上游流内上报的余额（并更新选号用的 credits）。
+//
+// 账号想接收这份数据就实现 gateway.RemainObserver（Trae 用它展示 IDE/Work
+// 两份积分）。dispatch 不判断上游名——未实现的账号直接跳过。
 func (h *Handler) noteBackendRemain(acc gateway.Account, r *gateway.Remain) {
 	if acc == nil || r == nil {
 		return
 	}
-	if h.cfg.TraeStats != nil && acc.Backend() == "trae" {
-		h.cfg.TraeStats.NoteRemain(acc.UID(), r.Available, r.Work)
+	if obs, ok := acc.(gateway.RemainObserver); ok {
+		obs.ObserveRemain(r)
 	}
 	// 池的 credits 用 IDE 额度（对话真正消耗的那份）。
 	if r.Available > 0 {

@@ -120,6 +120,18 @@ func (b *Backend) Chat(ctx context.Context, acc gateway.Account, in *gateway.Inb
 				stats.SentAny = true // 已下发内容后才发现错误帧，不能再改状态码
 				stats.ErrorMsg = errFrame
 				stats.ErrorCode = -1 // 非业务码：由 ErrorMsg 携带原文
+				// 流内错误的分类只有本包知道：6004/11102 之类是 error 帧
+				// 原文里的业务码，要按 FrameKind 认。填 Decision 后 server
+				// 不需要再按上游名分流到两套分类器。
+				kind := upstream.FrameKind(errFrame)
+				if kind == upstream.ErrNone {
+					// 非业务码（FrameKind 认不出）：按上游原文分类。
+					// 传 0 而不是 int(stats.ErrorCode)：-1 不是合法 HTTP
+					// status，会干扰分类。
+					kind = upstream.Classify(0, errFrame)
+				}
+				d := Decide(kind, 0, errFrame, 0)
+				stats.Decision = &d
 			}
 			if err != nil {
 				return stats, err

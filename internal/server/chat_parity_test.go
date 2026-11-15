@@ -15,7 +15,6 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -181,7 +180,6 @@ func TestChatParityBackendWritesModelCooldown(t *testing.T) {
 func TestApplyFailureRoutesCodeBuddyKindToDetailedPolicy(t *testing.T) {
 	h := NewHandler(Config{})
 	acc := fakeGatewayAccount{uid: "u1", backend: "codebuddy"}
-	st := &chatStat{}
 
 	// ErrModelBlocked（11102）走精细策略 → BlockModelBackoff 写负缓存。
 	f := &gateway.Failure{
@@ -196,7 +194,7 @@ func TestApplyFailureRoutesCodeBuddyKindToDetailedPolicy(t *testing.T) {
 	p := pool.New("")
 	p.Add(acc)
 	h.cfg.Pool = p
-	h.applyFailure(acc, "glm-5.2", f, st)
+	h.applyFailure(acc, "glm-5.2", f)
 
 	if bs := p.ModelBlocked("glm-5.2"); !bs.Blocked {
 		t.Errorf("ErrModelBlocked 应写模型负缓存，实际 %+v", bs)
@@ -221,7 +219,7 @@ func TestApplyFailureNonCodeBuddyKindFallsBack(t *testing.T) {
 		},
 		HTTPStatus: 402,
 	}
-	h.applyFailure(acc, "glm-5.2", f, &chatStat{})
+	h.applyFailure(acc, "glm-5.2", f)
 
 	st, ok := p.Status("t1")
 	if !ok {
@@ -453,9 +451,7 @@ func (b *brokenWriter) Flush() {}
 // （在途+1，结束时结算）。9a55778 删掉独立 Trae 端点时连带删了这两处调用，
 // 统一链路没补回——面板「Trae 签到」区块的 成功/失败/在途 三列因此恒为 0。
 func TestTraeStatsStillRecorded(t *testing.T) {
-	h, _, _ := newAccountingHandler(t)
-	stats := trae.NewStats()
-	h.cfg.TraeStats = stats
+	h, _, _, stats := newAccountingHandler(t)
 
 	body := `{"model":"trae:cn:glm-5.2","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -600,7 +596,7 @@ func TestTraeFailureNotRoutedToCodeBuddyPolicy(t *testing.T) {
 		},
 		HTTPStatus: 429,
 	}
-	h.applyFailure(acc, "glm-5.2", f, &chatStat{})
+	h.applyFailure(acc, "glm-5.2", f)
 
 	st, ok := p.Status("t1")
 	if !ok {
@@ -632,7 +628,7 @@ func TestCodeBuddyFailureUsesDetailedPolicy(t *testing.T) {
 		},
 		HTTPStatus: 400,
 	}
-	h.applyFailure(acc, "glm-5.2", f, &chatStat{})
+	h.applyFailure(acc, "glm-5.2", f)
 
 	if bs := p.ModelBlocked("glm-5.2"); !bs.Blocked {
 		t.Error("CodeBuddy 的 ErrModelBlocked 应写模型负缓存（精细策略）")
