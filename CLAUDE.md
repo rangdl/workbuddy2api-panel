@@ -43,7 +43,16 @@
 - **选号要校验「该上游真的有这个模型」**（`pool/gate.go` 的 `excludeNoModel`）。
   模型名按上游隔离，但 Trae 与 CodeBuddy 的账号 realm 都可能是 `cn`，不校验
   就会把 `cn:hy4free` 派给 Trae 账号打回「模型不存在」。判据读池里的目录缓存，
-  **缓存冷时放行**——不能因一次目录拉取失败让整池不可用。
+  **按 (上游, 域) 两维查**——两域目录基本不重叠，只按上游查会让国内目录替
+  global 账号「作证」；**缓存冷时放行**——不能因一次目录拉取失败让整池不可用。
+- **模型名比对一律归一，出站一律保留原始拼写。** 上游目录里同一个模型可能是
+  `DeepSeek-V4.1-Flash`，客户端可能写 `deepseek-v4.1-flash`。网关内部的比对
+  （选号存在性、模型级冷却 `modelCooldowns`、成本台账 `modelCost`、倍率查询、
+  Trae 的 function 归属）统统走 `gateway.NormalizeModel` / `pool.modelKey`
+  的小写键；但 `config_name` / `model` 这些**发给上游的 wire 名必须保持原样**
+  ——上游只认它自己发布的拼写，改成小写会回 4001 且报错不指向大小写。
+  守门测试：`pool/model_case_test.go`、`trae/payload_test.go` 的
+  `TestWireNamePreservesCase`。
 - **能用性判据只在 `pool/gate.go` 的 `gateLocked` 组合一次。**
   新增选号入口必须调它，不要自己拼条件。
 - **模型目录是上游级数据**（每上游挑一个号拉一次），

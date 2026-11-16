@@ -101,7 +101,8 @@ func (x Account) RateFor(ctx context.Context, model string) (float64, bool) {
 		return 0, false
 	}
 	cat := x.client.FetchRemoteModels(ctx, cfg, x.A, false)
-	row, ok := cat[model]
+	// 大小写不敏感查找：目录键是上游原始拼写，请求模型名来自客户端。
+	row, ok := traepkg.LookupRemoteModel(cat, model)
 	if !ok || row.CreditMultiplier == nil || *row.CreditMultiplier <= 0 {
 		// 未知或 0 都返回 false：0 在这个上下文等于「免费」，而目录里没有倍率
 		// 字段的模型也会走到这里，混淆会让估算凭空变成 0。

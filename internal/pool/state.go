@@ -240,16 +240,17 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		e.modelCost = make(map[string]modelCostEntry)
 	}
 	const alpha = 0.3
-	prev, seen := e.modelCost[model]
+	key := modelKey(model)
+	prev, seen := e.modelCost[key]
 	if !seen {
-		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
+		e.modelCost[key] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
 	} else {
 		// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
 		// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束。
 		if prev.CostPer1k <= 0 && per1k > 0 {
 			log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
 		}
-		e.modelCost[model] = modelCostEntry{
+		e.modelCost[key] = modelCostEntry{
 			CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
 			LastSeen:  time.Now(),
 			Samples:   prev.Samples + 1,

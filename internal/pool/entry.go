@@ -2,6 +2,7 @@
 package pool
 
 import (
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -281,11 +282,15 @@ type entry struct {
 }
 
 // modelCostOf 返回该账号在指定 model 上的有效成本观测；无观测或观测过期返回 ok=false。
+//
+// 键归一后查（见 modelKey）：账本键与请求模型名的大小写可能不一致
+// （上游目录 `DeepSeek-V4.1-Flash` vs 客户端 `deepseek-v4.1-flash`），
+// 精确查会让成本分层与积分保底静默失效——免费号被当成「无观测」。
 func (e *entry) modelCostOf(model string, now time.Time) (modelCostEntry, bool) {
 	if model == "" || len(e.modelCost) == 0 {
 		return modelCostEntry{}, false
 	}
-	mc, ok := e.modelCost[model]
+	mc, ok := e.modelCost[modelKey(model)]
 	if !ok {
 		return modelCostEntry{}, false
 	}
@@ -333,15 +338,30 @@ func (e *entry) modelExempt() bool {
 
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
 // 空 reqModel / 未记录 → false（不因模型级维度限制账号）。
+//
+// 键归一后查（见 modelKey）：否则 `DeepSeek-V4.1-Flash` 打出的冷却管不住
+// `deepseek-v4.1-flash` 的请求，同号同模型会被反复重试并持续被上游限流。
 func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 	if reqModel == "" {
 		return false
 	}
-	mc, ok := e.modelCooldowns[reqModel]
+	mc, ok := e.modelCooldowns[modelKey(reqModel)]
 	if !ok || mc.AuditOnly {
 		return false
 	}
 	return !mc.Until.IsZero() && now.Before(mc.Until)
+}
+
+// modelKey 模型级台账（modelCooldowns / modelCost）的键。
+//
+// 为什么必须归一：这两个 map 的键来自**请求模型名**，而同一个模型在客户端与
+// 上游目录里的拼写可能不同大小写（`DeepSeek-V4.1-Flash` vs
+// `deepseek-v4.1-flash`）。键不归一会出现两套互不相干的台账：冷却只挡住其中
+// 一种写法，成本观测被拆成两份、样本数永远攒不够。
+//
+// 与 gateway.NormalizeModel 同义；pool 不 import 具体上游，本函数是唯一实现。
+func modelKey(model string) string {
+	return strings.ToLower(strings.TrimSpace(model))
 }
 
 // healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）：

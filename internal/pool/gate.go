@@ -107,7 +107,11 @@ func (p *Pool) gateLocked(e *entry, s gateSpec) exclusion {
 	// 只在**缓存已有该上游目录**时才判：缓存冷/过期时宁可放行也不要误杀——
 	// 选号路径上不能让一次目录拉取失败变成「所有号都不可用」。这与错误路径上
 	// 的 gateway_hint 同一取舍（那里也是缓存冷就退中性提示）。
-	if s.model != "" && !p.backendServesModelLocked(e.acc.Backend(), s.model) {
+	//
+	// 按账号自己的域查：同一个上游的两个域目录**基本不重叠**（Trae 国内是
+	// GLM/Kimi/DeepSeek，国际是 Gemini/GPT/MiniMax）。只按上游查时，国内目录
+	// 里的 glm-5.2 会替 global 账号「作证」，把它放进候选再打回「模型不存在」。
+	if s.model != "" && !p.backendServesModelLocked(e.acc.Backend(), e.acc.Realm(), s.model) {
 		return excludeNoModel
 	}
 	// 积分保底：model 为空时恒不拦（见 floorBlockedForRealmModel 顶部早返回）。
@@ -120,23 +124,31 @@ func (p *Pool) gateLocked(e *entry, s gateSpec) exclusion {
 	return excludeNone
 }
 
-// backendServesModelLocked 报告某上游的**缓存目录**里是否有这个模型。
+// backendServesModelLocked 报告某上游**某个域**的缓存目录里是否有这个模型。
 //
 // 三态语义（关键，决定了它能否用于排除）：
-//   - 缓存里有该上游的目录且含此模型   → true；
-//   - 缓存里有该上游的目录但**不含**此模型 → false（该排除）；
-//   - 缓存里**没有**该上游的目录（冷/过期/该上游不支持目录） → true（放行）。
+//   - 缓存里有该 (上游,域) 的目录且含此模型   → true；
+//   - 缓存里有该 (上游,域) 的目录但**不含**此模型 → false（该排除）；
+//   - 缓存里**没有**该 (上游,域) 的目录（冷/过期/该上游不支持目录） → true（放行）。
 //
 // 第三态必须放行：选号是每次请求都要走的热路径，不能因为一次目录拉取失败
 // 就让整池变成不可用。宁可让请求打到上游拿一个真实的「模型不存在」，也不要
 // 在网关侧凭空判死——前者可诊断，后者表现为「所有账号突然不可用」。
 //
+// realm 为空时退化为「按上游查（不分域）」，即改造前的行为：调用方没给出域
+// 上下文时不该额外收紧判据。
+//
+// 模型名按 gateway.NormalizeModel 归一后比对：上游目录的拼写可能与客户端
+// 不同（`DeepSeek-V4.1-Flash` vs `deepseek-v4.1-flash`），精确比对会误判成
+// 「该上游没有此模型」并静默把可用号排除掉。
+//
 // 调用方必须已持有 p.mu（读锁即可）。catalogMu 是独立的锁，两级锁顺序固定为
 // p.mu → catalogMu（catalogCached 只在拉取时不持 p.mu，故不会反向）。
-func (p *Pool) backendServesModelLocked(backend, model string) bool {
+func (p *Pool) backendServesModelLocked(backend, realm, model string) bool {
 	if backend == "" || model == "" {
 		return true
 	}
+	want := gateway.NormalizeModel(model)
 	now := p.now()
 	p.catalogMu.Lock()
 	defer p.catalogMu.Unlock()
@@ -145,12 +157,15 @@ func (p *Pool) backendServesModelLocked(backend, model string) bool {
 		if g.backend != backend || len(e.models) == 0 {
 			continue
 		}
+		if realm != "" && g.realm != realm {
+			continue
+		}
 		if now.Sub(e.fetched) >= catalogTTL {
 			continue // 过期目录不作为判据
 		}
 		seenAny = true
 		for _, m := range e.models {
-			if m.ID == model {
+			if m.Key() == want {
 				return true
 			}
 		}

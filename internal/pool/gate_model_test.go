@@ -17,8 +17,13 @@ import (
 // 判据来自池里已有的模型目录缓存（gateway.Cataloger），**只在缓存新鲜时**生效，
 // 缓存冷则放行——选号是热路径，不能因一次目录拉取失败就让整池不可用。
 
-// seedCatalog 往池的目录缓存里塞一份「新鲜」的目录。
+// seedCatalog 往池的目录缓存里塞一份「新鲜」的目录（cn 域）。
 func seedCatalog(p *Pool, backend string, models ...string) {
+	seedCatalogRealm(p, backend, "cn", models...)
+}
+
+// seedCatalogRealm 同 seedCatalog，但指定域。
+func seedCatalogRealm(p *Pool, backend, realm string, models ...string) {
 	p.catalogMu.Lock()
 	defer p.catalogMu.Unlock()
 	if p.catalogCache == nil {
@@ -28,7 +33,7 @@ func seedCatalog(p *Pool, backend string, models ...string) {
 	for _, m := range models {
 		list = append(list, gateway.CatalogModel{ID: m})
 	}
-	p.catalogCache[catalogGroup{backend: backend, realm: "cn"}] = catalogCacheEntry{
+	p.catalogCache[catalogGroup{backend: backend, realm: realm}] = catalogCacheEntry{
 		models:  list,
 		fetched: p.now(),
 	}
@@ -96,16 +101,85 @@ func TestBackendServesModelTriState(t *testing.T) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	if !p.backendServesModelLocked("trae", "glm-5.3") {
+	if !p.backendServesModelLocked("trae", "cn", "glm-5.3") {
 		t.Error("目录里有该模型 → 应为 true")
 	}
-	if p.backendServesModelLocked("trae", "hy4free") {
+	if p.backendServesModelLocked("trae", "cn", "hy4free") {
 		t.Error("目录里没有该模型 → 应为 false")
 	}
-	if !p.backendServesModelLocked("codebuddy", "hy4free") {
+	if !p.backendServesModelLocked("codebuddy", "cn", "hy4free") {
 		t.Error("没有该上游的任何目录 → 应放行（true）")
 	}
-	if !p.backendServesModelLocked("trae", "") {
+	if !p.backendServesModelLocked("trae", "cn", "") {
 		t.Error("空模型名 → 应放行（true）")
+	}
+}
+
+// TestBackendServesModelCaseInsensitive 大小写不同的写法必须视为同一模型。
+//
+// 真实场景：Trae 目录里是 `DeepSeek-V4.1-Flash`，客户端写全小写。精确比对会
+// 判成「该上游没有此模型」，把唯一可用的号静默排除 → 503 no_healthy_account，
+// 报错完全不指向大小写。
+func TestBackendServesModelCaseInsensitive(t *testing.T) {
+	p := New("")
+	seedCatalog(p, "trae", "DeepSeek-V4.1-Flash")
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	// 目录里是混合大小写，客户端各种写法都要命中。
+	for _, variant := range []string{
+		"DeepSeek-V4.1-Flash", "deepseek-v4.1-flash", "DEEPSEEK-V4.1-FLASH",
+		"  deepseek-v4.1-flash  ", // 前后空白也要归一（TrimSpace）
+	} {
+		if !p.backendServesModelLocked("trae", "cn", variant) {
+			t.Errorf("%q 应命中目录里的 DeepSeek-V4.1-Flash", variant)
+		}
+	}
+	// 真的不存在的模型仍要排除（归一不能变成「一律放行」）。
+	if p.backendServesModelLocked("trae", "cn", "deepseek-v4.1-pro") {
+		t.Error("不存在的模型应被排除")
+	}
+}
+
+// TestBackendServesModelRealmScoped 目录判据必须按 (上游, 域) 分开。
+//
+// 真实场景：Trae 国内目录有 glm-5.2，国际目录没有。请求 trae:global:glm-5.2 时
+// realm 已把候选限死在 global，但只按上游查目录会让**国内**目录替 global 账号
+// 「作证」——账号进候选，打到国际网关报「模型不存在」，还可能被记一次失败。
+func TestBackendServesModelRealmScoped(t *testing.T) {
+	p := New("")
+	seedCatalogRealm(p, "trae", "cn", "glm-5.2", "deepseek-v4.1-flash")
+	seedCatalogRealm(p, "trae", "global", "gpt-5.4", "gemini-3-pro")
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	// 国内模型不能替国际账号作证。
+	if p.backendServesModelLocked("trae", "global", "glm-5.2") {
+		t.Error("global 账号不该被 cn 目录里的 glm-5.2 放行")
+	}
+	// 反向同理。
+	if p.backendServesModelLocked("trae", "cn", "gpt-5.4") {
+		t.Error("cn 账号不该被 global 目录里的 gpt-5.4 放行")
+	}
+	// 各自域内正常命中。
+	if !p.backendServesModelLocked("trae", "cn", "glm-5.2") {
+		t.Error("cn 账号应命中 cn 目录里的 glm-5.2")
+	}
+	if !p.backendServesModelLocked("trae", "global", "gpt-5.4") {
+		t.Error("global 账号应命中 global 目录里的 gpt-5.4")
+	}
+	// 两域共有的模型（如国际也上了 deepseek）互不干扰。
+	if p.backendServesModelLocked("trae", "global", "deepseek-v4.1-flash") {
+		t.Error("global 目录里没有 deepseek-v4.1-flash，不该放行")
+	}
+	// realm 为空 = 不分域（旧语义，调用方没给域上下文时不该额外收紧）。
+	if !p.backendServesModelLocked("trae", "", "glm-5.2") {
+		t.Error("realm 为空时应退化为按上游查")
+	}
+	// 另一域全无目录时放行（三态语义不变：无判据 ≠ 没有该模型）。
+	if !p.backendServesModelLocked("trae", "us", "glm-5.2") {
+		t.Error("该域没有任何目录 → 应放行")
 	}
 }

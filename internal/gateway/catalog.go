@@ -21,7 +21,10 @@
 //     不可用）。所以目录失败只进池的负缓存，不 NoteError、不进冷却。
 package gateway
 
-import "context"
+import (
+	"context"
+	"strings"
+)
 
 // CatalogModel 目录里的一条模型（跨上游统一形态）。
 //
@@ -89,6 +92,27 @@ type CatalogModel struct {
 	PromoLabel   string
 	PromoNote    string
 }
+
+// NormalizeModel 模型名归一（**只用于网关内部比对**）。
+//
+// 为什么需要：Trae 的上游目录里同一个模型可能以小写或大小写混合的形态出现
+// （`deepseek-v4.1-flash` 与 `DeepSeek-V4.1-Flash`），而客户端的写法不受控。
+// 比对若按精确字符串，`DeepSeek-V4.1-Flash` 打出的模型级冷却管不住
+// `deepseek-v4.1-flash` 的请求，选号的存在性校验也会误判「该上游没有此模型」。
+//
+// **绝不能把这个值发给上游**：wire id 是上游唯一认的拼写，改成小写会回 4001
+// （dsh 实测，`catalog.ts` 的 displayKey 注释：a form the upstream can reject
+// with 4001, because the wire id is the only llm_utils_chat name it publishes）。
+// 出站一律用 CatalogModel.ID 的原始拼写。
+func NormalizeModel(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+// Key 归一比对键（小写）。
+//
+// 做成方法而不是结构体字段：字段需要每个构造点（CodeBuddy / Trae / 兜底表 /
+// 测试）都同步填充，漏一个就静默失配；从 ID 现算则结构上不可能漂移。
+func (m CatalogModel) Key() string { return NormalizeModel(m.ID) }
 
 // Cataloger 账号能列出所属上游的模型目录。
 //

@@ -76,6 +76,31 @@ func TestFetchCatalogMergesFunctions(t *testing.T) {
 	}
 }
 
+// TestFunctionForConfigNameCaseInsensitive function 归属查询必须大小写不敏感。
+//
+// 目录里的 config_name 是上游原始拼写（真实数据里有 `DeepSeek-V4.1-Flash`
+// 这类混合大小写），而请求模型名来自客户端。精确比对查不到会让 function
+// 回落到内置规则，归属错了上游回 4001（「该 config_name 不被这个 function
+// 服务」）——报错完全不指向大小写。
+func TestFunctionForConfigNameCaseInsensitive(t *testing.T) {
+	cat := &Catalog{Live: true, Models: []CatalogModel{
+		{ID: "DeepSeek-V4.1-Flash", Function: FunctionSoloWorkRemote},
+		{ID: "glm-5.2", Function: FunctionSoloWorkLite},
+	}}
+	for _, variant := range []string{
+		"DeepSeek-V4.1-Flash", "deepseek-v4.1-flash", "DEEPSEEK-V4.1-FLASH",
+		"  deepseek-v4.1-flash  ",
+	} {
+		if fn := cat.FunctionForConfigName(variant); fn != FunctionSoloWorkRemote {
+			t.Errorf("FunctionForConfigName(%q) = %q, want %q", variant, fn, FunctionSoloWorkRemote)
+		}
+	}
+	// 不存在的模型仍返回空串（回落内置规则），归一不能变成「一律命中」。
+	if fn := cat.FunctionForConfigName("deepseek-v4.1-pro"); fn != "" {
+		t.Errorf("不存在的模型应返回空串，得到 %q", fn)
+	}
+}
+
 // TestFetchCatalogFallbackToBuiltin 上游全失败时回落到内置目录，
 // 且不标记 Live。
 func TestFetchCatalogFallbackToBuiltin(t *testing.T) {

@@ -238,6 +238,8 @@ func parseRemoteModels(body map[string]any) map[string]RemoteModel {
 		return nil
 	}
 	out := make(map[string]RemoteModel, len(list))
+	// byKey 归一键 → 首次出现的原始拼写，用于跨分组去重（见下方注释）。
+	byKey := make(map[string]string, len(list))
 	for _, item := range list {
 		m, ok := item.(map[string]any)
 		if !ok {
@@ -276,17 +278,46 @@ func parseRemoteModels(body map[string]any) map[string]RemoteModel {
 		// 思考能力与档位：reasoning_effort_config 是对象（与 features 不同，
 		// 这个字段不需要二次解析 JSON 字符串）。
 		row.ReasoningSupported, row.ReasoningEfforts, row.ReasoningDefault = parseReasoning(m)
-		// 去重：同一模型可能在多个 function 分组下重复出现，
-		// 已存在的保留（首个即可，字段内容一致）。
+		// 去重：同一模型可能在多个 function 分组下重复出现，已存在的保留
+		// （首个即可，字段内容一致）。
+		//
+		// 键用**上游原始拼写**（地图的键会流进 /v1/models 的 id 与出站
+		// config_name，不能改写成小写），但去重按归一后的名字比——上游可能
+		// 在不同分组里用不同大小写给出同一个模型，那样会产出两条重复条目。
 		if _, exists := out[id]; !exists {
+			if _, dup := byKey[normalizeModelName(id)]; dup {
+				continue
+			}
 			out[id] = row
+			byKey[normalizeModelName(id)] = id
 		}
 	}
 	return out
 }
 
-// wireEffortToGateway Trae 原生档位 → 网关档位名，**只含能真正送达的档位**。
+// Lookup 按模型名查目录行，**大小写不敏感**。
 //
+// 为什么不直接用 map 索引：这个 map 的键是上游原始拼写（会流进出站
+// config_name），不能改成小写；而请求模型名来自客户端，写法不受控。
+// 直接 cat[model] 在大小写不一致时查不到，表现为「倍率未知」——
+// 不会报错，只会让积分展示静默变成「—」。
+func LookupRemoteModel(cat map[string]RemoteModel, model string) (RemoteModel, bool) {
+	if len(cat) == 0 || model == "" {
+		return RemoteModel{}, false
+	}
+	if row, ok := cat[model]; ok { // 快路径：拼写完全一致
+		return row, true
+	}
+	want := normalizeModelName(model)
+	for id, row := range cat {
+		if normalizeModelName(id) == want {
+			return row, true
+		}
+	}
+	return RemoteModel{}, false
+}
+
+// wireEffortToGateway Trae 原生档位 → 网关档位名，**只含能真正送达的档位**。//
 // 与 payload.go 的 reasoningEffortMap 是互逆的两半：那边把客户端发来的网关
 // 档位翻成上游 wire 名，这里把上游公布的名字翻回来给面板展示。
 //

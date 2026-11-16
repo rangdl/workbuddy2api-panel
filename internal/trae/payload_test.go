@@ -162,6 +162,49 @@ func TestPrepareModelMapping(t *testing.T) {
 	}
 }
 
+// TestWireNamePreservesCase 出站 wire 名必须保留客户端给的**原始拼写**。
+//
+// 这条守的是「归一不得外溢到出站」：网关内部为了让大小写不同的写法互通，把
+// 模型名归一成小写做比对（gateway.NormalizeModel / pool.modelKey）。但
+// `config_name` 是上游唯一认的名字——把它改写成小写会回 4001，且报错不指向
+// 大小写（dsh 实测：the wire id is the only llm_utils_chat name it publishes）。
+//
+// 未收录模型（官方新上架、国际模型 gemini-*/gpt-*）走的就是原样透传这条路径，
+// 所以这里是归一最容易误伤的地方。**必须选不在 modelPairs 表里的模型名**：
+// 表里收录的模型按表登记的拼写出站（那是实测固化的 wire 名），不走透传。
+func TestWireNamePreservesCase(t *testing.T) {
+	for _, model := range []string{
+		"Gemini-3-Pro",
+		"GPT-5.4",
+		"Some-New-Model-X",
+	} {
+		if _, _, ok := ModelPair(model); ok {
+			t.Fatalf("%q 已在 modelPairs 表里，本用例要求未收录模型", model)
+		}
+		m := prepare(t, `{"model":"`+model+`","messages":[]}`, testPrepareOpt())
+		if m["config_name"] != model {
+			t.Errorf("%q 的 config_name = %v，出站名被改写了", model, m["config_name"])
+		}
+		if m["model"] != model {
+			t.Errorf("%q 的 model = %v，出站名被改写了", model, m["model"])
+		}
+		if m["model_name"] != model+"__dev" {
+			t.Errorf("%q 的 model_name = %v, want %q", model, m["model_name"], model+"__dev")
+		}
+	}
+
+	// 已收录模型：config_name 用表里登记的拼写（那才是上游认的形态），
+	// 不能因为请求写了大写就把表里的值也改成大写。
+	m := prepare(t, `{"model":"GLM-5.2","messages":[]}`, testPrepareOpt())
+	if m["config_name"] != "glm-5.2" {
+		t.Errorf("已收录模型应按表登记拼写出站，得到 %v", m["config_name"])
+	}
+	m = prepare(t, `{"model":"DEEPSEEK-V4-PRO","messages":[]}`, testPrepareOpt())
+	if m["config_name"] != "DeepSeek-V4-Pro" {
+		t.Errorf("已收录模型应按表登记拼写出站（含表里的大写），得到 %v", m["config_name"])
+	}
+}
+
 // TestPrepareToolChoice tool_choice 归一化：对象 → 字符串；none → 删 tools。
 func TestPrepareToolChoice(t *testing.T) {
 	base := `{"model":"glm-5.2","messages":[],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]`

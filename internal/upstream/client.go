@@ -1928,6 +1928,10 @@ func effectiveModelRate(mi ModelInfo) string {
 
 // storeModelRates 按 realm 整体替换模型倍率快照。目录成功刷新但没有可解析
 // 倍率时写入空桶，使旧倍率不会继续冒充当前价。
+//
+// 键用**归一后的模型名**（小写）：这张表只在网关内部用于查价，从不发给上游，
+// 所以可以安全归一。目录里的 id 与客户端请求的大小写可能不一致
+// （`DeepSeek-V4.1-Flash` vs `deepseek-v4.1-flash`），不归一会让查价静默落空。
 func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 	rates := make(map[string]string, len(infos))
 	for _, mi := range infos {
@@ -1935,7 +1939,7 @@ func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 			continue
 		}
 		if rate := effectiveModelRate(mi); rate != "" {
-			rates[mi.ID] = rate
+			rates[normalizeModelKey(mi.ID)] = rate
 		}
 	}
 	c.effortsMu.Lock()
@@ -1946,6 +1950,14 @@ func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 	c.modelRates[realmKey(realm)] = rates
 }
 
+// normalizeModelKey 模型名归一（**只用于网关内部比对，绝不发给上游**）。
+//
+// 与 gateway.NormalizeModel 同义，本包不 import gateway（依赖方向是
+// upstream ← backend/codebuddy → gateway；反向会让协议包依赖网关抽象）。
+func normalizeModelKey(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
 // ModelRate 返回最近成功刷新的指定域模型生效倍率；未知返回空串。
 func (c *Client) ModelRate(realm, model string) string {
 	if c == nil || model == "" {
@@ -1953,7 +1965,7 @@ func (c *Client) ModelRate(realm, model string) string {
 	}
 	c.effortsMu.RLock()
 	defer c.effortsMu.RUnlock()
-	return c.modelRates[realmKey(realm)][model]
+	return c.modelRates[realmKey(realm)][normalizeModelKey(model)]
 }
 
 // GlobalEffortSnapshot 导出 global 域 effort 能力缓存（探测下发 ∪ 静态兜底合并后的桶），

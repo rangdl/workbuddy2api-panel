@@ -202,6 +202,10 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			e.degradeUntil = *s.DegradeUntil
 		}
 		// 模型级独立冷却（6004 重置墙钟 / 11102 负缓存）：惰性过滤已过期条目。
+		//
+		// 键归一（modelKey）：旧 state.json 里的键是**请求模型名的原始拼写**，
+		// 可能混合大小写。不归一会出现「重启后冷却只挡住其中一种写法」——
+		// 同一模型两种拼写各自一条台账，样本与截止互不相干。
 		if len(s.ModelCooldowns) > 0 {
 			for m, mc := range s.ModelCooldowns {
 				if mc.Until.IsZero() || !now.Before(mc.Until) {
@@ -210,11 +214,20 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				if e.modelCooldowns == nil {
 					e.modelCooldowns = map[string]modelCooldown{}
 				}
-				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
+				key := modelKey(m)
+				// 归一后可能撞键（旧文件里两种拼写各一条）：保留截止更晚的那条，
+				// 冷却语义是「更保守者优先」——宁可多等一会儿，也不要提前放行。
+				if prev, exists := e.modelCooldowns[key]; exists && prev.Until.After(mc.Until) {
+					continue
+				}
+				e.modelCooldowns[key] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
 			}
 		}
 		// 成本账本：惰性过滤过期（modelCostTTL 外不恢复）+ 剔除结构破损条目
 		// （负 per1k / 零 LastSeen——上游异常或旧文件手改产生的脏数据）。
+		//
+		// 键同样归一；撞键时保留样本数更多的观测（它带着更多实测证据），
+		// 样本数相同则保留更新的那条。
 		if len(s.ModelCosts) > 0 {
 			for m, mc := range s.ModelCosts {
 				if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL || mc.CostPer1k < 0 {
@@ -223,7 +236,14 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				if e.modelCost == nil {
 					e.modelCost = map[string]modelCostEntry{}
 				}
-				e.modelCost[m] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
+				key := modelKey(m)
+				if prev, exists := e.modelCost[key]; exists {
+					if prev.Samples > mc.Samples ||
+						(prev.Samples == mc.Samples && !prev.LastSeen.Before(mc.LastSeen)) {
+						continue
+					}
+				}
+				e.modelCost[key] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
 			}
 		}
 		// byUID 的键恒为复合键（"backend:uid"）：落盘键对 CodeBuddy 是裸 uid、

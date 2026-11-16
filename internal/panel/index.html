@@ -1159,6 +1159,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div class="switch"><span class="lb">快过期积分优先</span>
               <input type="checkbox" name="prefer_expiring"></div>
+            <div class="switch"><span class="lb">裸模型名跨域回退</span>
+              <input type="checkbox" name="cross_domain_fallback">
+              <span class="hint">开启后，请求 <code>model</code> 不带 <code>cn:</code> / <code>global:</code> 前缀时不再等价于 <code>cn:&lt;模型&gt;</code>：首选域（cn）选不到可用号（账号级冷却 / 熔断 / 在途占满，或该域账号对这个模型 11102 后被模型级负缓存避开）会自动改用另一域再选一次。显式 <code>cn:</code> / <code>global:</code> 前缀<strong>永不回退</strong>。上游前缀（如 <code>wb:</code>）只锁上游、不锁域，仍可回退。跨域会消耗另一域的额度，故默认关闭</span></div>
           </div>
         </div>
 

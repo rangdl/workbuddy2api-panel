@@ -366,14 +366,28 @@ func builtinCatalog() *Catalog {
 
 // FunctionForConfigName 从目录里查某个 wire id 对应的 function。
 // 查不到返回空串，调用方回落到内置规则。
+//
+// 比对大小写不敏感：目录里的 config_name 是上游原始拼写（可能
+// `DeepSeek-V4.1-Flash`），而请求模型名来自客户端。精确比对查不到会让
+// function 回落到内置规则，归属错了上游回 4001（「该 config_name 不被这个
+// function 服务」）——报错完全不指向大小写。
 func (cat *Catalog) FunctionForConfigName(id string) string {
 	if cat == nil {
 		return ""
 	}
+	want := normalizeModelName(id)
 	for _, m := range cat.Models {
-		if m.ID == id {
+		if normalizeModelName(m.ID) == want {
 			return m.Function
 		}
 	}
 	return ""
+}
+
+// normalizeModelName 模型名归一（**只用于比对，绝不发给上游**）。
+//
+// 与 gateway.NormalizeModel 同义，本包不 import gateway（依赖方向是
+// trae ← backend/trae → gateway，反向会让上游协议包依赖网关抽象）。
+func normalizeModelName(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
 }

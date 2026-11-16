@@ -233,7 +233,7 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			if e.modelCooldowns == nil {
 				e.modelCooldowns = map[string]modelCooldown{}
 			}
-			e.modelCooldowns[model] = modelCooldown{
+			e.modelCooldowns[modelKey(model)] = modelCooldown{
 				Until:   p.cappedSoftUntilLocked(now, resetAt),
 				ResetAt: resetAt,
 				Reason:  reason,
@@ -268,7 +268,8 @@ func (p *Pool) RecordModelRateLimitAudit(uid, model, reason string) {
 		return
 	}
 	now := time.Now()
-	if old, exists := e.modelCooldowns[model]; exists && !old.AuditOnly && old.Until.After(now) {
+	key := modelKey(model)
+	if old, exists := e.modelCooldowns[key]; exists && !old.AuditOnly && old.Until.After(now) {
 		return // 已有真实模型冷却，审计记录不得覆盖路由截止
 	}
 	until := e.until
@@ -278,7 +279,7 @@ func (p *Pool) RecordModelRateLimitAudit(uid, model, reason string) {
 	if e.modelCooldowns == nil {
 		e.modelCooldowns = make(map[string]modelCooldown)
 	}
-	e.modelCooldowns[model] = modelCooldown{
+	e.modelCooldowns[key] = modelCooldown{
 		Until:     until,
 		Reason:    reason,
 		AuditOnly: true,
@@ -328,9 +329,10 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 		return
 	}
 	now := time.Now()
+	key := modelKey(model)
 	hits := 0
 	if e.modelCooldowns != nil {
-		hits = e.modelCooldowns[model].Hits
+		hits = e.modelCooldowns[key].Hits
 	}
 	hits++
 	ttl := modelBlockBaseTTL
@@ -342,7 +344,7 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	if e.modelCooldowns == nil {
 		e.modelCooldowns = map[string]modelCooldown{}
 	}
-	e.modelCooldowns[model] = modelCooldown{
+	e.modelCooldowns[key] = modelCooldown{
 		Until:  now.Add(ttl),
 		Reason: reason,
 		Hits:   hits,
@@ -363,11 +365,11 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	if !ok || len(e.modelCooldowns) == 0 {
 		return
 	}
-	mc, exists := e.modelCooldowns[model]
+	mc, exists := e.modelCooldowns[modelKey(model)]
 	if !exists || (!strings.HasPrefix(mc.Reason, "11102") && !strings.HasPrefix(mc.Reason, "11158")) {
 		return
 	}
-	delete(e.modelCooldowns, model)
+	delete(e.modelCooldowns, modelKey(model))
 	if len(e.modelCooldowns) == 0 {
 		e.modelCooldowns = nil
 	}
@@ -426,7 +428,7 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 			return ModelBlockStatus{}
 		}
 		st.Count++
-		if mc, ok := e.modelCooldowns[model]; ok {
+		if mc, ok := e.modelCooldowns[modelKey(model)]; ok {
 			if st.Reason == "" {
 				st.Reason = mc.Reason
 			}
