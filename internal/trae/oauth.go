@@ -413,7 +413,9 @@ func (c *Client) ExchangeRefresh(ctx context.Context, cfg *Config, acc *Account)
 	if strings.TrimSpace(acc.RefreshToken) == "" {
 		return nil, fmt.Errorf("账号 %s 无 refresh_token", acc.UID)
 	}
-	clientID := cfg.oauthClientID()
+	// ClientID 必须按**账号的包类型**取：SOLO 包用桌面 id 会被回 10101。
+	// 它同时参与 DeviceProof 签名原文，所以只能在一个地方取、一个地方用。
+	clientID := cfg.oauthClientIDFor(acc)
 	host := cfg.oauthHost()
 
 	var variants []struct {
@@ -659,12 +661,28 @@ func preview(raw []byte, n int) string {
 	return s[:n] + "…"
 }
 
-// oauthClientID / oauthClientSecret / oauthHost 取生效的 OAuth 参数（配置覆盖 → 内置默认）。
-func (c *Config) oauthClientID() string {
-	if strings.TrimSpace(c.OAuthClientID) != "" {
+// oauthClientIDFor 该账号续期应使用的 OAuth ClientID。
+//
+// 分叉依据是**是否 SOLO 包**，不是域：官方客户端按
+// packageType ∈ {SOLO_CN, SOLO_I18N, SOLO_CN_ENTERPRISE} 选 SOLO ClientID，
+// 其余用桌面 ClientID。所以 SOLO CN 也必须用 SOLO 的 id。
+//
+// 配置里的 OAuthClientID 优先级最高（上游换 client 时免发版），但它是
+// **全局覆盖**——一份 trae.json 里混有桌面号与 SOLO 号时才需要按账号区分，
+// 那时不要配这一项。
+func (c *Config) oauthClientIDFor(a *Account) string {
+	if c != nil && strings.TrimSpace(c.OAuthClientID) != "" {
 		return strings.TrimSpace(c.OAuthClientID)
 	}
+	if a != nil && strings.EqualFold(strings.TrimSpace(a.PackageType), "solo") {
+		return DefaultClientIDSolo
+	}
 	return DefaultClientID
+}
+
+// oauthClientID 保留无账号上下文的入口（授权页构造 URL 时还没有账号对象）。
+func (c *Config) oauthClientID() string {
+	return c.oauthClientIDFor(nil)
 }
 
 func (c *Config) oauthClientSecret() string {

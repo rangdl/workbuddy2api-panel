@@ -88,31 +88,41 @@ type RemoteModel struct {
 	ReasoningDefault string
 }
 
-// remoteCache 进程内缓存。
+// remoteCache 进程内缓存，**按域分表**（与 catalog.go 同理由）。
+//
+// 这份缓存还带积分倍率（CreditMultiplier），而国际版目录里没有
+// consumption_rate（订阅制）——混用会让国际账号显示国内的倍率。
 type remoteCache struct {
 	mu   sync.Mutex
-	at   time.Time
-	data map[string]RemoteModel
+	at   map[string]time.Time
+	data map[string]map[string]RemoteModel
 }
 
-var globalRemoteCache remoteCache
+var globalRemoteCache = remoteCache{
+	at:   make(map[string]time.Time, 2),
+	data: make(map[string]map[string]RemoteModel, 2),
+}
 
 // InvalidateRemoteModels 清空缓存。
 func InvalidateRemoteModels() {
 	globalRemoteCache.mu.Lock()
-	globalRemoteCache.data = nil
+	globalRemoteCache.data = make(map[string]map[string]RemoteModel, 2)
+	globalRemoteCache.at = make(map[string]time.Time, 2)
 	globalRemoteCache.mu.Unlock()
 }
 
-// FetchRemoteModels 拉取模型目录（带缓存）。
+// FetchRemoteModels 拉取模型目录（带缓存，按账号所属域分表）。
 //
 // 失败返回 nil：目录是**展示增强**，拿不到不该影响对话链路。
 func (c *Client) FetchRemoteModels(ctx context.Context, cfg *Config, acc *Account, force bool) map[string]RemoteModel {
+	key := catalogCacheKey(cfg, acc)
 	globalRemoteCache.mu.Lock()
-	if !force && globalRemoteCache.data != nil && time.Since(globalRemoteCache.at) < remoteModelsTTL {
-		hit := globalRemoteCache.data
-		globalRemoteCache.mu.Unlock()
-		return hit
+	if !force {
+		if hit, ok := globalRemoteCache.data[key]; ok && hit != nil &&
+			time.Since(globalRemoteCache.at[key]) < remoteModelsTTL {
+			globalRemoteCache.mu.Unlock()
+			return hit
+		}
 	}
 	globalRemoteCache.mu.Unlock()
 
@@ -121,8 +131,8 @@ func (c *Client) FetchRemoteModels(ctx context.Context, cfg *Config, acc *Accoun
 		return nil
 	}
 	globalRemoteCache.mu.Lock()
-	globalRemoteCache.data = out
-	globalRemoteCache.at = time.Now()
+	globalRemoteCache.data[key] = out
+	globalRemoteCache.at[key] = time.Now()
 	globalRemoteCache.mu.Unlock()
 	return out
 }
@@ -140,7 +150,7 @@ func (c *Client) fetchRemoteModels(ctx context.Context, cfg *Config, acc *Accoun
 	ctx, cancel := context.WithTimeout(ctx, catalogFetchTimeout)
 	defer cancel()
 
-	url := cfg.ChatBase + EndpointRemoteModels +
+	url := cfg.chatBaseForAccount(acc) + EndpointRemoteModels +
 		"?functions=" + strings.Join(remoteDirectoryFunctions, "%2C") +
 		"&show_custom_model=true"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -149,8 +159,14 @@ func (c *Client) fetchRemoteModels(ctx context.Context, cfg *Config, acc *Accoun
 	}
 	applyChatHeaders(req, cfg, acc, acc.AccessTokenHeader())
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Origin", "https://www.trae.cn")
-	req.Header.Set("Referer", "https://www.trae.cn/")
+	// Origin/Referer 按域给：国内是 www.trae.cn，国际是 www.trae.ai。
+	// 固定成国内域名会让国际请求带上一个不相干站点的来源头。
+	webOrigin := "https://www.trae.cn"
+	if acc.RegionOf(cfg) == RegionGlobal {
+		webOrigin = "https://www.trae.ai"
+	}
+	req.Header.Set("Origin", webOrigin)
+	req.Header.Set("Referer", webOrigin+"/")
 
 	resp, err := c.jsonHTTP.Do(req)
 	if err != nil {

@@ -158,9 +158,19 @@ func classifyBizCode(code int64, msg string, status int) Classification {
 	m := strings.TrimSpace(msg)
 	switch code {
 	case 1005:
+		// 1005 有两层语义，靠 extra.plan 区分（参考实现实测）：
+		//   - 带 extra.plan（如 4）= **档位不够**：模型存在，但当前账号的订阅
+		//     档位没有它。国际版是订阅制，这是最常见的一种。
+		//   - 不带 plan = 额度/积分用尽。
+		// 两者都按 plan_limit 处理（换号有用、账号长冷却），但文案要区分：
+		// 把「需订阅」说成「额度用尽」会让用户去充值而不是升级档位。
+		msgPlan := "该模型需更高订阅档位"
+		if strings.Contains(m, "plan") {
+			msgPlan = m
+		}
 		return Classification{
 			Kind: ErrPlanLimit, Cooldown: planLimitCooldown, Code: "1005",
-			Message: orDefault(m, "套餐额度用尽"),
+			Message: orDefault(m, msgPlan),
 		}
 	case 20403:
 		return Classification{

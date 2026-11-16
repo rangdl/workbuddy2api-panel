@@ -138,8 +138,8 @@ func TestPrepareModelMapping(t *testing.T) {
 		{"glm-5.2", "glm-5.2", "glm-5.2__dev", FunctionSoloWorkLite},
 		{"GLM-5.2", "glm-5.2", "glm-5.2__dev", FunctionSoloWorkLite}, // 大小写不敏感
 		{"deepseek-v4-pro", "DeepSeek-V4-Pro", "deepseek_v4_pro__dev", FunctionSoloWorkLite},
-		{"deepseek-v4.1-flash", "deepseek-v4.1-flash", "deepseek-v4.1-flash__dev", FunctionSoloAgent},
-		{"kimi-k2.8-preview", "kimi-k2.8-preview", "kimi-k2.8-preview__dev", FunctionSoloAgent},
+		{"deepseek-v4.1-flash", "deepseek-v4.1-flash", "deepseek-v4.1-flash__dev", FunctionSoloWorkRemote},
+		{"kimi-k2.8-preview", "kimi-k2.8-preview", "kimi-k2.8-preview__dev", FunctionSoloWorkRemote},
 		{"brand-new-model", "brand-new-model", "brand-new-model__dev", FunctionSoloWorkLite},
 	}
 	for _, c := range cases {
@@ -246,14 +246,19 @@ func TestPrepareInvalidJSON(t *testing.T) {
 	}
 }
 
-// TestFunctionForModel 模型 → function 映射（solo_agent 白名单）。
+// TestFunctionForModel 模型 → function 兜底映射。
+//
+// 这张表曾经把「只在 solo_agent 视图可用」的模型映射到 solo_agent——
+// 而 solo_agent **不能承载 llm_utils_chat**：任何模型用它发出去都回 4011
+// （dsh 2026-10-01 实测，issue #19）。这些模型真正可用的通道是
+// solo_work_remote（solo_work_lite 对它们回 4001）。
 func TestFunctionForModel(t *testing.T) {
 	if got := FunctionForModel("glm-5.2"); got != FunctionSoloWorkLite {
 		t.Errorf("glm-5.2 function = %s", got)
 	}
 	for _, m := range []string{"deepseek-v4.1-flash", "GLM-5.3-FLASH", "doubao-seed-code"} {
-		if got := FunctionForModel(m); got != FunctionSoloAgent {
-			t.Errorf("%s function = %s, want %s", m, got, FunctionSoloAgent)
+		if got := FunctionForModel(m); got != FunctionSoloWorkRemote {
+			t.Errorf("%s function = %s, want %s（solo_agent 不能聊天）", m, got, FunctionSoloWorkRemote)
 		}
 	}
 }

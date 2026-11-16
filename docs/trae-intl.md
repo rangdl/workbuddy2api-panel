@@ -303,23 +303,50 @@ PascalCase + number 时间戳），无需改动。
 
 ## 10. 落地清单（按本项目文件）
 
-按依赖顺序，前两步不做完后面全是错的。
+**状态：1–11 全部已实现**（2026-11-16）。下表保留原始设计意图，
+「实际实现」列记录落地时与计划不同的地方——那些差异都是实现时才暴露的。
 
-| # | 文件 | 改动 |
-|---|---|---|
-| 1 | `internal/trae/accounts.go` / `config.go` | `Account` 增加 `Host` 与 `UserRegion` 字段（从 storage.json 解密时带入）。域是**账号属性**，没有它就只能按配置文件判域 |
-| 2 | `internal/trae/region.go`（新） | `realmOfCredential(host, userRegion, edition) (realm, supported)`：三层判定 + US 第三态 |
-| 3 | `internal/backend/trae/account.go` | 删掉 `realmOfBase`，`Realm()` 改用账号自身的域；US 账号不进池 |
-| 4 | `internal/trae/config.go` | 加 `Global TraeRealm`（含 `Enabled` 域开关，形状对齐 `codebuddy.json` 的 `global` 段）；`ChatBaseFor` / `APIBaseFor` **真正**按 realm 分派（现在忽略参数直接返 CN） |
-| 5 | `internal/trae/catalog.go` / `remote_models.go` | 两个包级单例缓存改为 `map[realm]`；目录查询在国际域用 `solo_agent` |
-| 6 | `internal/trae/payload.go` | function 归属改为目录驱动；硬编码 `soloAgentModels` 退化为兜底 |
-| 7 | `internal/trae/oauth.go` | ClientID 按「是否 SOLO 包」选；`OAuthAuthorizeURL` 按域（国际是 `www.trae.ai/authorization`） |
-| 8 | `internal/trae/credits.go` / `backend/trae/account.go` | 国际域走 `ide_user_pay_status`；`Checkin()` 在国际域返 `Skipped: true` + 说明（**不是** `ErrUnsupported`，见 §7） |
-| 9 | `internal/trae/client.go` / `remote_models.go` | 去掉硬编码的 `Package-Type: stable_cn`、`Origin/Referer: www.trae.cn`——至少在域为 global 时不发这些 CN 专用头 |
-| 10 | `internal/panel/panel.go` | `panelPrefixFor` 现在对 trae 硬编码 `trae:cn:`；改为 `trae:<realm>:` |
-| 11 | `internal/trae/errors.go` | 补 `1005`（订阅门禁）、`4011`（限流）的语义分类 |
+| # | 文件 | 改动 | 实际实现 |
+|---|---|---|---|
+| 1 | `internal/trae/config.go` / `icube.go` | `Account` 增加 `Host` / `UserRegion` / `PackageType`；从 storage.json 的 `iCubeAuthInfo://icube.cloudide` 解密带入 | ✅ 新增 `ParseLoginClaim` / `LoginClaim` |
+| 2 | `internal/trae/region.go`（新） | 域判定 + US 第三态 | ✅ `ServiceRegion` / `RegionOfCredential` / `RegionOfHost` / `RegionOfUserRegion` |
+| 3 | `internal/backend/trae/account.go` | `Realm()` 改用账号自身的域；US 不进池 | ✅ `realmOfBase` 降级为**老账号兜底**（不删：老账号文件没有 host 字段） |
+| 4 | `internal/trae/config.go` | 加 `Global GlobalRealm`（含 `Enabled`）；`ChatBaseFor` / `APIBaseFor` 真正按 realm 分派 | ✅ `Enabled` 用 `*bool`（见下方说明） |
+| 5 | `catalog.go` / `remote_models.go` | 两个包级单例缓存改为按域分表 | ✅ `map[realm]`，键由 `catalogCacheKey` 统一给出 |
+| 6 | `internal/trae/payload.go` | function 归属改为目录驱动 | ✅ 新增 `chatFunctions` 表；硬编码表**改为 `solo_work_remote`**（原为 `solo_agent`，那个不能聊天） |
+| 7 | `internal/trae/oauth.go` | ClientID 按「是否 SOLO 包」选 | ✅ `oauthClientIDFor(acc)`；`OAuthAuthorizeURL` **未**按域（见下方说明） |
+| 8 | `credits.go` / `backend/trae/account.go` | 国际域走 `ide_user_pay_status`；`Checkin()` 返 `Skipped` | ⚠️ 签到已改（`Skipped` + 说明）；**用量接口分离未做**（见下方说明） |
+| 9 | `client.go` / `remote_models.go` | 域为 global 时不发 CN 专用头 | ✅ `Package-Type` / `X-Os-Version` / `Origin` 按域切换 |
+| 10 | `internal/panel/panel.go` | `panelPrefixFor` 改为 `trae:<realm>:` | ✅ |
+| 11 | `internal/trae/errors.go` | 补 `1005` / `4011` 语义 | ✅ `4011` 本已正确；`1005` 文案区分「需订阅」与「额度用尽」 |
 
-### 10.1 不能做的事
+### 10.1 实现时的三处调整
+
+**① `Global.Enabled` 用 `*bool` 而不是 `bool`。**
+`codebuddy.json` 里是 `bool` + `Default()` 显式置 true，因为它的默认配置由代码
+生成。Trae 的默认 `trae.json` 是空对象（`configs.go` 写 `{}`），`bool` 零值
+false 会让升级后**所有国际账号静默停用**。指针能区分「没写」与「显式 false」，
+缺省在 `GlobalEnabled()` 里按 true 处理。
+
+**② `realmOfBase` 没删，降级为老账号兜底。**
+计划里写「删掉」，但升级前导入的账号文件没有 `host` / `user_region` 字段。
+删了它们会全部掉到 CN 默认值——行为上没错，但那是**猜**的，不如保留按配置
+base 推断（就是改造前的行为）。新导入的账号走凭证判定。
+
+**③ 用量接口分离（`ide_user_pay_status`）没做。**
+国际域的 `Credits()` 仍会走国内的 `web_user_ent_usage`，返回 404 后按常规
+错误处理。原因是**没有国际账号可以验证响应解析**——把订阅状态硬塞进
+`gateway.Credits` 的「额度/到期批次」形状是猜的，而本项目刚因「按 token 估算
+积分」踩过猜测的坑。当前表现：国际账号的积分列取不到值（显示"—"），
+不影响对话。要做需要一台真实国际账号采样响应。
+
+**④ 授权 URL 未按域。**
+`OAuthAuthorizeURL` 仍是 `www.trae.cn/authorization`。国际账号的授权页是
+`www.trae.ai/authorization`，但在**服务端部署**场景下这条链路本来就依赖用户
+手工粘贴回调，改域只影响用户点开哪个页面。落地时按账号域切换即可，属低风险
+待办——真正的门槛是国际账号首次登录，那需要人操作。
+
+### 10.2 不能做的事
 
 - ❌ 把国际版做成新上游 `trae-global`（协议相同，不是新上游）
 - ❌ 引入 `ai` 作为第三个域值（本项目已有 `global`）
@@ -335,9 +362,26 @@ PascalCase + number 时间戳），无需改动。
 
 ## 11. 待验证
 
+**已在本地验证（2026-11-16，构造三个域的账号跑真实 Load+Wrap）**：
+
+```
+配置里账号数=3，进池=2
+  cntest  host=https://api.trae.cn             userRegion=CN → region=cn
+  sgtest  host=https://growsg-normal.trae.ai   userRegion=SG → region=global
+  ustest  host=https://grow-normal.traeapi.us  userRegion=US → region=us
+  进池: cntest realm=cn / sgtest realm=global
+  WARN: 账号 ustest 属于未支持的区域 "us"，已排除出调度池
+```
+
+即：域判定、US 排除、逃生门、旧版平铺 `trae.json` 的向后兼容都已验证。
+
+**仍未验证（需要真实国际账号）**：
+
 | 项 | 现状 | 怎么验 |
 |---|---|---|
-| `llm_utils_chat` 在国际域的端到端可用性 | 参考实现已验证（2026-09-15，A+：`gpt-5.4` 经 `coresg-normal` 返回完整 SSE） | 本项目用自己的请求体发一次最小请求 |
+| `llm_utils_chat` 在国际域的端到端可用性 | 参考实现已验证（2026-09-15，A+：`gpt-5.4` 经 `coresg-normal` 返回完整 SSE）；本项目**尚未用真号发过** | 用国际账号发一次最小请求 |
+| 国际域用量接口（`ide_user_pay_status`）的解析 | **未实现**（见 §10.1 ③）。现为 404 → 积分列显示"—" | 拿到真实响应后按实际字段实现 |
+| 国际域目录的真实阵容 | 只验证了缓存分表与归属收敛，没有真的拉过国际目录 | 用国际账号刷新一次面板目录 |
 | 国际 CLI（`~/.trae`）的默认 host | **未验证**，参考实现第一阶段禁用国际 CLI | 取证后放开 |
 | `custom_model_*` BYOK 条目是否该进目录 | display 名多为空，疑似模板 | 合并时按"display 名非空才收" |
 | 国际 remote 目录 ctx 与 `get_detail_param` 数值差异（272k vs 240k） | 两源差异比 CN 大 | 回归测试锁"wire 值优先" |

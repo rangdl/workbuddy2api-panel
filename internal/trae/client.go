@@ -106,7 +106,7 @@ func (c *Client) ChatStream(ctx context.Context, cfg *Config, acc *Account, body
 	// 不能 defer cancel。
 	ctx, cancel := context.WithCancel(ctx)
 
-	url := cfg.ChatBase + EndpointLLMChat
+	url := cfg.chatBaseForAccount(acc) + EndpointLLMChat
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		cancel() // 构造失败也要释放 ctx，否则泄漏
@@ -156,15 +156,26 @@ func applyChatHeaders(req *http.Request, cfg *Config, acc *Account, tokenWithPre
 	h.Set("X-Device-Cpu", "Intel")
 	h.Set("X-Device-Id", acc.DeviceID)
 	h.Set("X-Machine-Id", acc.MachineID)
-	h.Set("X-Os-Version", "Windows 11 Home China")
 	h.Set("Request-Traffic-Type", "prod")
-	h.Set("Package-Type", "stable_cn")
 	h.Set("X-Lgw-Req-Sdk-Type", "3")
 	h.Set("X-Lscbd-Aid", "787976")
 	h.Set("X-Lscbd-Platform", "windows")
 	h.Set("X-Ss-Dp", "787976")
 	h.Set("App-Version", cfg.IDEVersion)
-	h.Set("Referer", cfg.ChatBase+EndpointLLMChat)
+	h.Set("Referer", cfg.chatBaseForAccount(acc)+EndpointLLMChat)
+
+	// 域相关的头：这几项是客户端安装包/地域属性，照抄国内的会让国际请求
+	// 显得自相矛盾（国内 OS 串 + 国际网关）。
+	//
+	// 只改明显带地域/包类型语义的两项，其余保持不动——参考实现实测整套国内头
+	// 被 SG 网关原样接受，所以这不是**必需**的修正，而是减少无谓的破绽。
+	if acc.RegionOf(cfg) == RegionGlobal {
+		h.Set("Package-Type", "stable")
+		h.Set("X-Os-Version", "Windows 11")
+	} else {
+		h.Set("Package-Type", "stable_cn")
+		h.Set("X-Os-Version", "Windows 11 Home China")
+	}
 
 	// 链路追踪头：上游按 request id 记账，缺省不致命但补齐更贴近真实客户端。
 	traceID := "00-" + genUUIDLike() + "-" + genUUIDLike() + "-01"

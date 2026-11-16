@@ -680,6 +680,12 @@ func (p *Panel) traeLoginFinish(w http.ResponseWriter, r *http.Request) {
 			PrivateKeyPEM: cred.PrivateKeyPEM,
 			PublicKeyPEM:  cred.PublicKeyPEM,
 			AppVersion:    trae.DefaultPageAppVersion,
+			// 域判据随凭证一起落下：host / userRegion 来自登录态
+			// （storage.json 的 iCubeAuthInfo://icube.cloudide），是域判定的
+			// 权威来源。缺了它们，国际账号只能靠配置 base 推断域——而一份
+			// trae.json 只能表示一个域。
+			Host:       cred.Host,
+			UserRegion: cred.UserRegion,
 		})
 		idx = len(cfg.Accounts) - 1
 	} else {

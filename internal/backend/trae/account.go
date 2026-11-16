@@ -4,8 +4,8 @@ package trae
 import (
 	"context"
 	"errors"
+	"log"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
@@ -18,9 +18,11 @@ const Name = "trae"
 // Account 把 *trae.Account 适配成 gateway.Account。
 type Account struct {
 	A *traepkg.Account
-	// realm 由账号所属的 base 域名决定（见 realmOfBase）。
+	// realm 该账号的网关域值（cn / global）。由凭证自身判定，见 Wrap。
 	// 未导出：Realm() 方法同名会冲突（Go 不允许字段与方法同名）。
 	realm string
+	// region 该账号的服务区域（比 realm 宽，含 us）。
+	region traepkg.ServiceRegion
 	// dir 账号凭证目录（"auths"），SetNickname 落盘用。空 = 只改内存。
 	dir string
 	// client / configFn 是账号**自己的能力依赖**：Credits/Checkin/Keepalive
@@ -116,34 +118,21 @@ func Unwrap(acc gateway.Account) *traepkg.Account {
 	return nil
 }
 
-// realmOfBase 按上游域名判定账号域。
+// realmOfBase 按 base 域名判定域——**仅作老账号的兜底**。
 //
-// Trae 与 CodeBuddy 一样有 cn / global 两个域，只是判定依据不同：
-//   - CodeBuddy 看 auth 文件里的 realm 字段或 domain 后缀；
-//   - Trae 看对话/接口 base 的域名——本仓库目前只实现了 CN（mchost.guru /
-//     trae.cn / trae.com.cn），其余域名一律视为 global。
+// 正常情况下域由账号凭证自身的 userRegion / host 决定（见 traepkg.Account.Region）。
+// 这条路径只服务升级前导入的账号文件（没有 host 与 user_region 字段），
+// 那时域只能从配置 base 推断——这正是改造前的行为。
 //
-// 为什么必须返回非空：空串在 gateSpec 里表示「不过滤域」，静默返回空会让
-// 域隔离失效，cn 请求可能落到 global 账号上。
+// 为什么不能只保留这一条：它让整份 trae.json 只能是单域。国际账号与国内账号
+// 混在同一份配置里时，所有账号会拿到同一个域。
 func realmOfBase(chatBase, apiBase string) string {
 	for _, u := range []string{chatBase, apiBase} {
-		u = strings.ToLower(strings.TrimSpace(u))
-		if u == "" {
-			continue
-		}
-		// 判定顺序敏感：trae.com.cn 是 CN 域，但它是 trae.com 的超串，
-		// 所以必须先判 .com.cn 再判国际版后缀，否则 CN 会被误判成 global。
-		switch {
-		case strings.Contains(u, "trae.com.cn"),
-			strings.Contains(u, "trae.cn"),
-			strings.Contains(u, "trae-api-cn"),
-			strings.Contains(u, "mchost.guru"):
-			return "cn"
-		case strings.Contains(u, "trae.ai"), strings.Contains(u, "trae.com"):
-			return "global"
+		if r, ok := traepkg.RegionOfHost(u); ok && r.IsServable() {
+			return string(r)
 		}
 	}
-	// 无法判定时按 CN 处理（与仓库当前的唯一实现一致）。
+	// 无法判定时按 CN 处理（与升级前导入的账号一致）。
 	return gateway.DefaultRealm
 }
 
@@ -151,15 +140,34 @@ func realmOfBase(chatBase, apiBase string) string {
 //
 // client/configFn 一并注入账号对象：Credits/Checkin/Keepalive 是账号自己的
 // 能力，不该由调用方（池/调度器）代持上游依赖。
+//
+// 域判定：优先账号自身凭证（userRegion / host），缺失时回落配置 base。
+// **美国区（us）账号不进池**——它是真实存在但本项目未实现的区域，让它进池
+// 会被当成普通账号选中，然后 401，再被记成一次上游故障污染熔断判据
+// （参考项目 issue #66 的教训）。
 func Wrap(cfg *traepkg.Config, client *traepkg.Client) []gateway.Account {
 	if cfg == nil {
 		return nil
 	}
-	realm := realmOfBase(cfg.ChatBase, cfg.APITraeBase)
+	fallbackRealm := realmOfBase(cfg.ChatBase, cfg.APITraeBase)
 	out := make([]gateway.Account, 0, len(cfg.Accounts))
 	for i := range cfg.Accounts {
+		a := &cfg.Accounts[i]
+		// 先判「凭证声明了什么区域」：US 的排除与逃生门无关，不能因为
+		// global.enabled=false 就把 US 账号当成 CN 放进来。
+		region := a.Region(cfg)
+		if !region.IsServable() {
+			log.Printf("WARN: [trae] 账号 %s 属于未支持的区域 %q（host=%q userRegion=%q），已排除出调度池",
+				a.UID, region, a.Host, a.UserRegion)
+			continue
+		}
+		// 再应用逃生门：global.enabled=false 时国际账号降级为 cn（纯 CN 锁定）。
+		realm := a.RegionOf(cfg).Realm()
+		if realm == "" {
+			realm = fallbackRealm
+		}
 		out = append(out, Account{
-			A: &cfg.Accounts[i], realm: realm, dir: cfg.AuthDir,
+			A: a, realm: realm, region: region, dir: cfg.AuthDir,
 			client: client,
 		})
 	}
@@ -243,7 +251,28 @@ func (x Account) Credits(ctx context.Context) (*gateway.Credits, error) {
 }
 
 // Checkin 对该账号执行一次签到。
+//
+// **国际域（global）没有签到能力**：参考实现实测（2026-09-24）
+// `/trae/api/v2/ug/*` 全族在国际网关上不存在——growsg-normal / api-sg-central /
+// api.trae.ai 均 404，www.trae.ai 回落 HTML 首页。
+//
+// 所以国际账号返回 Skipped，**不是 ErrUnsupported**：
+//   - Skipped = 「这个账号正常，只是这类账号不参与」→ 池正常记账，面板能读到
+//     （panel 的 checkin_done 只看 Skipped），可以显示「该区域无签到」；
+//   - ErrUnsupported = 「这个上游没实现」→ 池静默跳过，用户什么也看不到。
+//
+// 与 codebuddy 企业版的处理逐字对齐（那边也是 Skipped + 说明）。
+// **不要**在上层（调度器/池）按域过滤——那会让账号在面板上神秘消失，
+// 且 CodeBuddy 的 global 账号是照常签到的，两条上游的行为应当一致。
 func (x Account) Checkin(ctx context.Context) (*gateway.CheckinResult, error) {
+	// 域判定放在依赖检查**之前**：它不需要 client，且「这个域没有签到能力」
+	// 是比「对象没装配好」更本质的答案。装配缺失时也不该把它误报成上游故障。
+	if x.realm == string(traepkg.RegionGlobal) {
+		return &gateway.CheckinResult{
+			Skipped: true,
+			Message: "国际版（global 域）无签到体系",
+		}, nil
+	}
 	if x.client == nil || x.A == nil {
 		return nil, gateway.ErrUnsupported
 	}

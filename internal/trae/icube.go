@@ -38,6 +38,11 @@ const (
 	tcTagLen    = 64 // SHA-512 完整性校验标签
 	// ICubeKeyPrefix storage.json 中设备凭证键的前缀。
 	ICubeKeyPrefix = "iCubeAuthInfo://icube-dc:"
+	// AuthStorageKey storage.json 中**登录态**的键（含 host / userRegion）。
+	//
+	// 与设备凭证是两个不同的键，但用同一个 tc 信封加密，所以同一个解密器
+	// 就能读（参考实现实测四版通吃）。
+	AuthStorageKey = "iCubeAuthInfo://icube.cloudide"
 )
 
 var tcMagic = [6]byte{116, 99, 5, 16, 0, 0}
@@ -58,6 +63,14 @@ type DeviceCredential struct {
 	MachineID string `json:"machine_id"`
 	// AppVersion 客户端版本（安装目录 package.json 的 version）。
 	AppVersion string `json:"app_version"`
+	// Host / UserRegion 登录态里的域判据（见 LoginClaim）。
+	//
+	// 由 ParseStorageJSON 从同一个 storage.json 的
+	// iCubeAuthInfo://icube.cloudide 键读出。**不是**设备凭证的固有属性，
+	// 只是"同一次导入顺手带出来的信息"——导入面板据此把账号直接落到正确域，
+	// 免得用户手工填。
+	Host       string `json:"host,omitempty"`
+	UserRegion string `json:"user_region,omitempty"`
 }
 
 // TCDecrypt 解密 tc 信封，返回明文（JSON 字符串）。
@@ -174,6 +187,59 @@ func IsValidDeviceID(d string) bool {
 	return true
 }
 
+// LoginClaim 从 storage.json 的登录态里读出的域判据。
+//
+// 这两个字段是**域判定的权威来源**（见 region.go）：它们由客户端在登录时写入，
+// 比任何配置推导都准。老版本导入的账号没有它们，此时才回落到配置 base。
+type LoginClaim struct {
+	// Host 登录时使用的 API host（如 https://api.trae.cn / https://growsg-normal.trae.ai）。
+	Host string
+	// UserRegion userRegion 原始声明（可能是对象里的 region 字段，也可能是裸串）。
+	UserRegion string
+}
+
+// ParseLoginClaim 从 storage.json 提取登录态里的域判据。
+//
+// 找不到该键或解密失败都返回零值（不是错误）：登录态缺失只意味着「无法据此
+// 判域」，调用方回落到配置 base 即可——不该因为读不到而拒绝导入设备凭证，
+// 那是两件独立的事。
+func ParseLoginClaim(raw []byte) LoginClaim {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return LoginClaim{}
+	}
+	v, ok := obj[AuthStorageKey]
+	if !ok {
+		return LoginClaim{}
+	}
+	var b64 string
+	if err := json.Unmarshal(v, &b64); err != nil {
+		return LoginClaim{}
+	}
+	plain, err := TCDecrypt(b64, false)
+	if err != nil {
+		return LoginClaim{}
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(plain), &doc); err != nil {
+		return LoginClaim{}
+	}
+	out := LoginClaim{Host: strings.TrimSpace(str(doc["host"]))}
+	// userRegion 两种形态：对象 {"region":"CN",...} 或裸串 "sg"。
+	// 统一存成裸串——判定函数 RegionOfUserRegion 两种都认。
+	switch ur := doc["userRegion"].(type) {
+	case string:
+		out.UserRegion = strings.TrimSpace(ur)
+	case map[string]any:
+		if r := strings.TrimSpace(str(ur["region"])); r != "" {
+			out.UserRegion = r
+		} else {
+			out.UserRegion = strings.TrimSpace(str(ur["_aiRegion"]))
+		}
+	}
+	return out
+}
+
 // DecryptICubeValue 解密单个 iCubeAuthInfo 值，返回设备凭证。
 // deviceID 由调用方从 storage.json 的键名给出（值本身不含设备 id）。
 //
@@ -224,6 +290,8 @@ func ParseStorageJSON(raw []byte) ([]*DeviceCredential, error) {
 	if v, ok := obj["telemetry.machineId"]; ok {
 		_ = json.Unmarshal(v, &machineID)
 	}
+	// 登录态里的域判据（同一份 storage.json，另一个键）。
+	claim := ParseLoginClaim(raw)
 	out := make([]*DeviceCredential, 0, 2)
 	for k, v := range obj {
 		deviceID, ok := strings.CutPrefix(k, ICubeKeyPrefix)
@@ -240,6 +308,8 @@ func ParseStorageJSON(raw []byte) ([]*DeviceCredential, error) {
 			continue
 		}
 		cred.MachineID = machineID
+		cred.Host = claim.Host
+		cred.UserRegion = claim.UserRegion
 		out = append(out, cred)
 	}
 	return out, nil

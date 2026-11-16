@@ -14,14 +14,27 @@ import (
 // 蓝本：TraeWorkAssistant 的 api_server/payload.rs（2026-09 实测固化）。
 // 转换是**纯函数**（除注入的 id 生成器外无副作用），便于表驱动单测。
 
-// function 取值：Trae Work 模式默认 solo_work_lite；部分模型仅在 solo_agent 下可用。
+// function 取值：默认聊天通道是 solo_work_lite。
 const (
-	FunctionSoloWorkLite = "solo_work_lite"
-	FunctionSoloAgent    = "solo_agent"
+	FunctionSoloWorkLite   = "solo_work_lite"
+	FunctionSoloWorkRemote = "solo_work_remote"
+	// FunctionSoloAgent 只在**目录查询**里使用，不能用于聊天。
+	//
+	// 保留这个常量是因为 catalog.go 还要按它询问目录（它列的条目最全）；
+	// 但任何 llm_utils_chat 请求都不得用它——实测会回 4011
+	// （dsh 2026-10-01，issue #19）。见 catalog.go 的 chatFunctions。
+	FunctionSoloAgent = "solo_agent"
 )
 
-// soloAgentModels 仅在 solo_agent 视图可用的模型（实测）。
-var soloAgentModels = map[string]bool{
+// remoteOnlyModels 只在 solo_work_remote 下可聊天的模型（实测）。
+//
+// **注意不是 solo_agent**：历史上这张表写的是 solo_agent，但那个函数不能承载
+// 聊天（每个模型用它会回 4011）。这些模型在 solo_work_lite 下同样不可用
+// （报 4001「该 function 不服务这个模型」），而 solo_work_remote 可以。
+//
+// 这张表只是**目录拉取失败时的兜底**：正常情况下归属由目录给出
+// （Catalog.FunctionForConfigName），不要靠它维护模型清单。
+var remoteOnlyModels = map[string]bool{
 	"doubao-seed-code":    true,
 	"glm-5.3-flash":       true,
 	"qwen3.8-flash":       true,
@@ -29,10 +42,14 @@ var soloAgentModels = map[string]bool{
 	"kimi-k2.8-preview":   true,
 }
 
-// FunctionForModel 模型 → function（硬编码回退；调用方传小写模型名）。
+// FunctionForModel 模型 → function（硬编码**兜底**；调用方传小写模型名）。
+//
+// 只在目录不可用时使用（Catalog.Live == false）。国际模型的归属不在表里，
+// 会落到默认的 solo_work_lite——国际侧大部分模型确实由它承载，部分只在
+// solo_agent_remote 下的模型需要靠目录给出。
 func FunctionForModel(modelLower string) string {
-	if soloAgentModels[strings.ToLower(strings.TrimSpace(modelLower))] {
-		return FunctionSoloAgent
+	if remoteOnlyModels[strings.ToLower(strings.TrimSpace(modelLower))] {
+		return FunctionSoloWorkRemote
 	}
 	return FunctionSoloWorkLite
 }

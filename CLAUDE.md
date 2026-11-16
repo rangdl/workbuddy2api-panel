@@ -29,6 +29,13 @@
   `userRegion` 判定，不能拿 `trae.json` 的 base 域名反推（那等于整份配置只能是
   一个域）。US 区真实存在但未支持，判定到它时必须显式排除，**不可回落成
   `global`**（会 401 且污染熔断判据）。详见 `docs/trae-intl.md`。
+- **Trae 的两个域各有硬性行为差异**，不要用一套逻辑套到底：
+  国际域**没有签到**（`/trae/api/v2/ug/*` 整族 404，`Checkin()` 返
+  `Skipped:true` + 说明，**不是** `ErrUnsupported`——后者面板读不到原因）；
+  目录缓存**按域分表**（两域阵容基本不重叠）；续期 ClientID 按**是否 SOLO 包**
+  分叉而非按域（SOLO 用 `en1oxy7wnw8j9n`，用桌面 id 会回 `10101`）。
+  `solo_agent` 能列模型但**不能聊天**（调用回 4011），目录归属必须收敛到
+  `catalog.go` 的 `chatFunctions`。
 - **积分只认实测，绝不按 token 推算。** Trae 的 `consumption_rate`（如 0.06）
   是**相对倍率**（IDE 里显示的 `x0.06`），不是「每 token 多少积分」；拿它乘
   token 数会虚高约 1500 倍。真实的逐请求扣费只有两种来源：上游在 usage 里

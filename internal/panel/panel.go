@@ -537,14 +537,18 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 
 // panelPrefixFor 该条目在面板上的 ID 前缀（即客户端调用时要填的 model 值前缀）。
 //
-// Trae 的 ID 形态是 "trae:cn:<模型>"（三段），CodeBuddy 是 "<realm>:<模型>"。
+// Trae 的 ID 形态是 "trae:<realm>:<模型>"（三段），CodeBuddy 是 "<realm>:<模型>"。
 // 两者的域段位置不同，所以前缀不能一套规则套到底。
+//
+// 域段用条目的真实域：Trae 国际版接入后同一个上游会有 cn / global 两组目录，
+// 硬编码 "trae:cn:" 会让国际模型的 ID 谎报自己的域，客户端按它调用会被
+// 域过滤挡掉。
 func panelPrefixFor(backend, realm string) string {
-	if backend == panelUpstreamTrae {
-		return panelUpstreamTrae + ":" + panelTraeRealm + ":"
-	}
 	if realm == "" {
-		realm = panelTraeRealm // CodeBuddy 单域部署时的合理缺省
+		realm = gateway.DefaultRealm
+	}
+	if backend == panelUpstreamTrae {
+		return panelUpstreamTrae + ":" + realm + ":"
 	}
 	return realm + ":"
 }
@@ -633,7 +637,7 @@ const (
 	panelUpstreamTrae      = "trae"
 )
 
-// panelTraeRealm Trae 当前只实现 CN 域（与 server 侧 defaultTraeRealm 一致）。
+// panelTraeRealm Trae 的缺省域（用于无域信息时的兜底展示，不再代表"只有一个域"）。
 const panelTraeRealm = "cn"
 
 // modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out

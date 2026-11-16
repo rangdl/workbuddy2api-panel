@@ -448,7 +448,7 @@ func (c *Client) apiPost(ctx context.Context, cfg *Config, acc *Account, path st
 		}
 		bodyBytes = b
 	}
-	url := cfg.apiBase() + path
+	url := cfg.apiBaseForAccount(acc) + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(bodyBytes)))
 	if err != nil {
 		return nil, err
@@ -599,13 +599,9 @@ func checkinBody(cfg *Config) map[string]any {
 	return nil
 }
 
-// apiBase 生效的签到/积分接口 base。
-func (c *Config) apiBase() string {
-	if strings.TrimSpace(c.APITraeBase) != "" {
-		return strings.TrimRight(strings.TrimSpace(c.APITraeBase), "/")
-	}
-	return DefaultAPITraeBase
-}
+// 【已移除】apiBase：它忽略账号域，直接读配置顶层的 api_trae_base，
+// 于是国际账号的用量请求会打到国内网关。改用 cfg.apiBaseForAccount(acc)
+// （账号域优先，国际域用凭证自带 host）。
 
 // ---- 宽容解析 ----
 

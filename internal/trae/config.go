@@ -26,8 +26,20 @@ import (
 
 // 上游常量（与 TraeWorkAssistant 的 api_server/mod.rs 同源，2026-09 实测值）。
 const (
-	// DefaultChatBase 对话上游（通用积分 product_id 208）。
+	// DefaultChatBase 国内版对话上游（通用积分 product_id 208）。
 	DefaultChatBase = "https://trae-api-cn.mchost.guru"
+	// DefaultChatBaseGlobal 国际版对话上游。
+	//
+	// 国际版两个 App（Trae 桌面 / TRAE SOLO）**共用**这一个网关，它是国内
+	// mchost.guru + solo.trae.cn 的 SG 合并等价物。SG 侧还有分片
+	// （api16/api22-normal-alisg.mchost.guru）但内容相同，统一走 coresg。
+	DefaultChatBaseGlobal = "https://coresg-normal.trae.ai"
+	// DefaultAPITraeBaseGlobal 国际版签到/用量接口的缺省 base。
+	//
+	// **注意**：国际版的用量接口挂在**凭证自带的 host** 上（实测有
+	// api-sg-central / growsg-normal 两种），所以这个只是无 host 信息时的
+	// 缺省值；有 host 时优先用 host。
+	DefaultAPITraeBaseGlobal = "https://growsg-normal.trae.ai"
 	// EndpointLLMChat 核心对话端点（HTTP + SSE）。
 	EndpointLLMChat = "/api/agent/v3/llm_utils_chat"
 	// EndpointGetDetailParam 模型列表端点。
@@ -40,8 +52,17 @@ const (
 	DefaultAppID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
 
 	// DefaultClientID / DefaultClientSecret OAuth 公开常量（授权页与 ExchangeToken 用）。
+	//
+	// **桌面包**的 ClientID。SOLO 包是另一个（DefaultClientIDSolo）——这个分叉
+	// 属于 OAuth client，不属于 endpoint 或域，见 docs/trae-intl.md §6。
 	DefaultClientID     = "ono9krqynydwx5"
 	DefaultClientSecret = "-"
+	// DefaultClientIDSolo SOLO 包（含 SOLO CN 与 SOLO 国际）的 ClientID。
+	//
+	// 实测（2026-10-11）：用桌面 ClientID 给 SOLO 账号续期会被回
+	// `10101 无效参数`；而 SOLO 包用它对旧 /cloudide 路径也有效。历史事故：
+	// 早期实现在旧路径上写死桌面 id，导致国际 SOLO 账号一旦过期就刷不回来。
+	DefaultClientIDSolo = "en1oxy7wnw8j9n"
 
 	// DefaultWorkspaceID llm_utils_chat 请求体的固定字段（实测值）。
 	DefaultWorkspaceID = "e04cdd"
@@ -61,21 +82,49 @@ const (
 // 两个字段都是 base 覆盖：空 = 回落内置默认。Trae 的对话域与签到域是**不同域名**
 // （mchost.guru vs api.trae.cn），不能合成一个 base。
 type TraeRealm struct {
-	// ChatBase 对话上游 base；空 = DefaultChatBase。
+	// ChatBase 对话上游 base；空 = 该域的内置默认。
 	ChatBase string `json:"chat_base"`
-	// APIBase 签到/积分接口 base；空 = DefaultAPITraeBase。
+	// APIBase 签到/积分接口 base；空 = 该域的内置默认。
 	APIBase string `json:"api_base"`
+}
+
+// GlobalRealm 国际域配置（比 CN 多一个启用开关）。
+//
+// Enabled 放在 global 段内而不是顶层：它是**域开关**（是否路由到 global），
+// 不是「上游开关」。与 codebuddy 的 GlobalRealm 同名字段同语义。
+type GlobalRealm struct {
+	TraeRealm
+	// Enabled global 域路由开关。缺省 true。
+	//
+	// 显式 false = 逃生门（纯 CN 锁定）：即便账号凭证声明的是国际版，
+	// 也不路由到 global 域。纯 CN 部署行为不变。
+	//
+	// **用指针**：codebuddy 那边是 bool + Default() 里显式置 true，但 Trae 的
+	// 默认配置是空对象（configs.go 写 `{}`），bool 零值 false 会让升级后所有
+	// 国际账号静默停用。指针能区分「没写」与「显式 false」，缺省按 true 处理。
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
+// GlobalEnabled 报告 global 域是否允许路由（未配置视为 true）。
+func (c *Config) GlobalEnabled() bool {
+	return c == nil || c.Global.Enabled == nil || *c.Global.Enabled
 }
 
 // Config trae.json 结构。
 type Config struct {
 	// Enabled 总开关；false 时该上游不参与调度。
 	Enabled bool `json:"enabled"`
-	// CN 国内域配置（Trae 目前只有这一个域）。
+	// CN 国内域配置。
 	//
-	// **域维度是刻意的**：CodeBuddy 已有 cn/global 两域，Trae 迟早也会有。
-	// 结构上先留好位置，届时只加一个 Global 字段、不改形状，消费方按 realm 取 base。
+	// **域维度是刻意的**：CodeBuddy 已有 cn/global 两域，Trae 与国际版对齐后
+	// 同样是两域。形状与 codebuddy.json 的 cn/global 两段一致。
 	CN TraeRealm `json:"cn"`
+	// Global 国际域配置（Trae 国际版 = trae.ai）。
+	//
+	// 比 CN 多一个 Enabled 域开关，形状与 codebuddy.json 的 global 段一致。
+	// 它是**域开关**（是否允许路由到 global），不是「启用 Trae 上游」——
+	// 上游平权后不存在「启用某个上游」这回事，有账号即参与调度。
+	Global GlobalRealm `json:"global"`
 
 	// ChatBase 对话上游 base（缺省 DefaultChatBase）。
 	//
@@ -179,6 +228,23 @@ type Account struct {
 	PublicKeyPEM string `json:"public_key_pem,omitempty"`
 	// AppVersion 客户端版本（DeviceInfo.ClientVersion）。
 	AppVersion string `json:"app_version"`
+	// Host 凭证自带的 API host（如 https://api.trae.cn / https://growsg-normal.trae.ai）。
+	//
+	// 域判定与「国际版用量接口打哪个 host」都要用它。老账号文件没有这个字段，
+	// 此时 Region() 回落到配置 base 判定（零回归）。
+	Host string `json:"host,omitempty"`
+	// UserRegion 凭证的 userRegion 声明（"CN" / "SG" / "US" 等原始字符串）。
+	//
+	// 两种实测形态都可能被写进来：storage.json 里是对象
+	// {"region":"CN","_aiRegion":"CN"}，App 日志里是裸小写 "sg"。
+	// 判定在 RegionOfUserRegion 里做（大小写不敏感），这里只存原始值。
+	UserRegion string `json:"user_region,omitempty"`
+	// PackageType 客户端包类型（"solo" = SOLO 包，空 = 桌面包）。
+	//
+	// 只影响**续期用哪个 OAuth ClientID**：SOLO 包必须用
+	// DefaultClientIDSolo，否则上游回 10101（"无效参数"），而那个报错
+	// 完全不指向 ClientID，极难排查。
+	PackageType string `json:"package_type,omitempty"`
 	// Disabled 手动禁用（保留在列表但不参与轮转）。
 	Disabled bool `json:"disabled"`
 	// DisabledReason 禁用原因（展示用）。
@@ -203,6 +269,17 @@ func (c *Config) Normalize() {
 		c.CN.APIBase = DefaultAPITraeBase
 	}
 	c.CN.APIBase = strings.TrimRight(strings.TrimSpace(c.CN.APIBase), "/")
+	// global 段：空 = 用内置默认（与该域 CN 段同口径）。
+	c.Global.ChatBase = strings.TrimRight(strings.TrimSpace(c.Global.ChatBase), "/")
+	c.Global.APIBase = strings.TrimRight(strings.TrimSpace(c.Global.APIBase), "/")
+	if c.Global.ChatBase == "" {
+		c.Global.ChatBase = DefaultChatBaseGlobal
+	}
+	if c.Global.APIBase == "" {
+		c.Global.APIBase = DefaultAPITraeBaseGlobal
+	}
+	// Enabled 用指针，缺省在 GlobalEnabled() 里按 true 处理（零值 false
+	// 会让升级后所有国际账号静默停用）。这里不写它。
 	// 反向同步：让仍在读顶层字段的老代码路径拿到生效值（读取方逐步迁移到
 	// ChatBaseFor/APIBaseFor，在两个都改完之前这层映射保证不出现两套值）。
 	c.ChatBase = c.CN.ChatBase
@@ -267,6 +344,41 @@ func (a *Account) normalize() {
 	a.MachineID = strings.TrimSpace(a.MachineID)
 	a.PrivateKeyPEM = strings.TrimSpace(a.PrivateKeyPEM)
 	a.AppVersion = strings.TrimSpace(a.AppVersion)
+	a.Host = strings.TrimRight(strings.TrimSpace(a.Host), "/")
+	a.UserRegion = strings.TrimSpace(a.UserRegion)
+}
+
+// Region 判定该账号所属的服务区域。
+//
+// 判定顺序（与 docs/trae-intl.md §2 一致）：
+//
+//	账号的 userRegion 声明  →  账号的 host  →  配置里该域是否启用
+//
+// 前两级来自账号自身的凭证，是权威判据。都缺失时才回落 cn——这是改造前的
+// 行为（老账号文件没有那两个字段），保留它是为了零回归。
+//
+// cfg 用于读取 global 域的启用开关；传 nil 表示不设逃生门（视为 enabled）。
+func (a *Account) Region(cfg *Config) ServiceRegion {
+	if a == nil {
+		return RegionCN
+	}
+	if r, ok := RegionOfCredential(a.Host, a.UserRegion); ok {
+		return r
+	}
+	return RegionCN
+}
+
+// RegionOf 同 Region，但额外应用 global 域的逃生门。
+//
+// 逃生门（cfg.Global.Enabled=false）把国际账号降级成 cn 而不是丢弃：
+// 纯 CN 部署下它们会像改造前一样走国内网关（多数会 401，但那是有账号
+// 但锁了域时的既有行为，比静默摘号更容易排查）。
+func (a *Account) RegionOf(cfg *Config) ServiceRegion {
+	r := a.Region(cfg)
+	if r == RegionGlobal && !cfg.GlobalEnabled() {
+		return RegionCN
+	}
+	return r
 }
 
 // Validate 校验配置自洽性（与 Load 同口径，供面板保存前调用）。
@@ -274,6 +386,19 @@ func (c *Config) Validate() error {
 	c.Normalize()
 	if !strings.HasPrefix(c.ChatBase, "http://") && !strings.HasPrefix(c.ChatBase, "https://") {
 		return fmt.Errorf("chat_base 必须以 http:// 或 https:// 开头")
+	}
+	// global 段的两条 base 同样校验：它们与 CN 段是平行的网关入口，
+	// 写坏了会在国际账号发起请求时才失败（且表现为连接错误）。
+	for name, base := range map[string]string{
+		"global.chat_base": c.Global.ChatBase,
+		"global.api_base":  c.Global.APIBase,
+	} {
+		if base == "" {
+			continue // 空 = 内置默认
+		}
+		if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+			return fmt.Errorf("%s 必须以 http:// 或 https:// 开头（得到 %q）", name, base)
+		}
 	}
 	seen := make(map[string]bool, len(c.Accounts))
 	for i, a := range c.Accounts {
@@ -433,25 +558,84 @@ func MigrateLegacyAccounts(configPath, defaultAuthDir string) (int, error) {
 	return migrated, nil
 }
 
-// ConfigPath 返回与 config.json 同目录的 trae.json 路径。
-// ChatBaseFor 取某域的对话 base（目前只有 cn；未知域回落 cn）。
+// chatBaseForAccount 该账号应使用的对话 base。
 //
-// 为什么用方法而不是让调用方直接读字段：Trae 加 global 域时，所有读取点
-// 都要跟着改判断，而方法只需要在**这一处**改。这是域维度落地的最小接口。
+// 账号的域优先，配置里该域的 base 覆盖其次，内置默认兜底。
+func (c *Config) chatBaseForAccount(a *Account) string {
+	if a == nil {
+		return c.ChatBaseFor(string(RegionCN))
+	}
+	return c.ChatBaseFor(string(a.RegionOf(c)))
+}
+
+// apiBaseForAccount 该账号应使用的签到/用量 base。
+//
+// 国际版的用量接口挂在**凭证自带的 host** 上（SG 侧有 api-sg-central 与
+// growsg-normal 两种），所以账号 Host 优先于配置。国内版没有这个现象，
+// Host 通常就是 api.trae.cn，等价。
+func (c *Config) apiBaseForAccount(a *Account) string {
+	if a == nil {
+		return strings.TrimRight(c.APIBaseFor(string(RegionCN)), "/")
+	}
+	r := a.RegionOf(c)
+	base := c.APIBaseFor(string(r))
+	if r == RegionGlobal && strings.TrimSpace(a.Host) != "" {
+		base = strings.TrimRight(strings.TrimSpace(a.Host), "/")
+	}
+	return strings.TrimRight(base, "/")
+}
+
+// ConfigPath 返回与 config.json 同目录的 trae.json 路径。
+// ChatBaseFor 取某域的对话 base（空则回落该域内置默认）。
+//
+// 域参数**必须真正参与分派**：改造前这个函数忽略 realm 直接返 CN 的 base，
+// 于是无论账号声明哪个域，国际账号都会被打到国内网关。国际版与国内版的
+// 聊天网关是两个完全不同的域名（mchost.guru vs coresg-normal.trae.ai）。
+//
+// 未知域回落 cn：与 realm 枚举的缺省口径一致（gateway.DefaultRealm）。
 func (c *Config) ChatBaseFor(realm string) string {
 	if c == nil {
 		return DefaultChatBase
 	}
-	// 目前只有 cn 一个域；realm 参数为将来 global 预留。
-	return c.CN.ChatBase
+	if realm == string(RegionGlobal) {
+		if c.Global.ChatBase != "" {
+			return c.Global.ChatBase
+		}
+		return DefaultChatBaseGlobal
+	}
+	if c.CN.ChatBase != "" {
+		return c.CN.ChatBase
+	}
+	// 兼容：未走 Normalize 的调用方（测试、PoC）只填顶层 chat_base，
+	// 而顶层字段的语义历来就是 CN 的 base（Normalize 也是这么反向同步的）。
+	if strings.TrimSpace(c.ChatBase) != "" {
+		return strings.TrimRight(strings.TrimSpace(c.ChatBase), "/")
+	}
+	return DefaultChatBase
 }
 
-// APIBaseFor 取某域的签到/积分 base（目前只有 cn）。
+// APIBaseFor 取某域的签到/积分 base（空则回落该域内置默认）。
+//
+// 国际版的用量接口挂在**凭证自带 host** 上（SG 侧有 api-sg-central /
+// growsg-normal 两种），所以调用方应优先用账号的 Host 覆盖这里的返回值。
 func (c *Config) APIBaseFor(realm string) string {
 	if c == nil {
 		return DefaultAPITraeBase
 	}
-	return c.CN.APIBase
+	if realm == string(RegionGlobal) {
+		if c.Global.APIBase != "" {
+			return c.Global.APIBase
+		}
+		return DefaultAPITraeBaseGlobal
+	}
+	if c.CN.APIBase != "" {
+		return c.CN.APIBase
+	}
+	// 兼容：同 ChatBaseFor 的顶层字段兜底。
+	if strings.TrimSpace(c.APITraeBase) != "" {
+		return strings.TrimRight(strings.TrimSpace(c.APITraeBase), "/")
+	}
+	return DefaultAPITraeBase
 }
 
 func ConfigPath(configPath string) string {
