@@ -222,7 +222,7 @@ PascalCase + number 时间戳），无需改动。
 **回退策略**：先试新契约（带 proof），失败再试旧 `/cloudide`；**没有 keypair 时
 直接走旧契约**，不发注定被 20405 拒绝的请求。
 
-## 7. 签到：国际版没有，必须按域跳过
+## 7. 签到：国际域没有该能力，由账号返 `Skipped`
 
 参考实现实测（2026-09-24）：`/trae/api/v2/ug/*` 全族在**国际版网关上不存在**——
 `growsg-normal.trae.ai` / `api-sg-central.trae.ai` / `api.trae.ai` 均 404，
@@ -230,15 +230,28 @@ PascalCase + number 时间戳），无需改动。
 
 所以：
 
-- **不要让国际版账号参与签到轮转**。发出去只会拿到 404，然后被分类成
-  "网络故障"，污染账号健康度与熔断判据。
-- 面板上国际账号的签到区块应直接不显示（或显示"该区域无签到"），
-  而不是显示一个点了报错的按钮。
+- **国际账号照常进入签到轮转**，不要在上层（调度器/池）按域过滤——这与
+  CodeBuddy 的处理一致：`codebuddy` 的 global 账号也照常参与签到，只有
+  **企业版**才跳过。上层过滤会让账号在面板上"神秘消失"，用户看不出原因。
+- 过滤发生在 `Account.Checkin()` 里，且**返回 `Skipped` 而不是 `ErrUnsupported`**：
+
+  ```go
+  if x.realm == "global" {
+      return &gateway.CheckinResult{Skipped: true, Message: "国际版无签到体系"}, nil
+  }
+  ```
+
+  两者的语义差别是硬约定（`gateway/backend.go` 的注释）：
+  - `Skipped` = 「这个账号正常，只是这类账号不参与」→ 池按正常流程记账，
+    **面板能读到**（`panel.go` 的 `checkin_done`），可以显示「该区域无签到」；
+  - `ErrUnsupported` = 「这个上游没实现」→ 池静默跳过，**用户什么也看不到**。
+
+  国际版账号是正常的 Trae 账号，只是那个域没有签到端点，属于前者。
+  这与 CodeBuddy 企业版的写法（`Skipped: true` + 中文说明）逐字对齐。
 - 本项目的签到是**单点排程**（`config.json` 的 `schedule.checkin_enabled` +
-  `checkin_backends`），按上游开关。国际版是同上游不同域，所以**不需要新增
-  开关**——在 `Account.Checkin()` 里按域返回 `gateway.ErrUnsupported` 即可，
-  调度器已经会把 `ErrUnsupported` 当作"该账号不支持"跳过（不要再加
-  `if realm == "global"` 之类的分支）。
+  `checkin_backends`，按上游）。国际版是同一上游的不同域，所以**不需要新增
+  开关**——`checkin_backends` 是按上游的，Trae 整个上游一个开关，域差异由
+  账号自己回答。
 
 ## 8. 用量与积分：数据源不同构，不能复用
 
@@ -255,7 +268,40 @@ PascalCase + number 时间戳），无需改动。
   没有 `consumption_rate`，更没有可估算的积分。国际账号的积分列只能显示
   "—"或订阅状态，**绝不要退回按 token 估算**。
 
-## 9. 落地清单（按本项目文件）
+## 9. 与 CodeBuddy 的 cn/global 处理对齐
+
+本项目的域模型是由 CodeBuddy 先落地的，Trae 的 global 域**必须与它同形**，
+否则同一个 `global` 在两个上游上语义不同，`pool` / 面板 / 用量账本都会被撕裂。
+下表是逐项比对（✅ = 方案已对齐，⚠️ = 需要改，❌ = 明确不同且应保持不同）。
+
+| 维度 | CodeBuddy 现状 | Trae 方案 | |
+|---|---|---|---|
+| 域值 | `cn` / `global` | 同 | ✅ |
+| 域来源 | 凭证 `realm` 字段，回落到 `domain` 后缀（`isGlobalDomain`） | 凭证 `userRegion.region`，回落到 host 后缀 | ✅ 同一套「凭证优先、host 兜底」 |
+| 域归属 | **账号属性**（`auth.Auth.Realm()`） | 需要改成账号属性（现在按 `trae.json` 的 base 判） | ⚠️ 见清单 #1-#3 |
+| 持久化 | `auth` 文件里存 `realm`，`BackfillRealm` 补写，`RealmStored` 可直读 | 建议 `Account` 存 `Host` / `UserRegion`（凭证原始值），域是派生 | ✅ 更保守：存原始值不存推导结果 |
+| base 分派 | `ChatBaseFor(realm)` / `BillingBaseFor(realm)`，方法级分派 | 同名方法已存在但**忽略 realm 参数** | ⚠️ 见清单 #4 |
+| 域开关 | `global.enabled`（缺省 true，false = 纯 CN 锁定逃生门） | 同形：`trae.json` 的 `global.enabled` | ✅ 形状对齐；**不要**做全局单例（CodeBuddy 那个是单上游时代的设计） |
+| 目录分流 | `Catalog()` 内按 `Realm()` 分端点，池缓存 `catalogGroup{backend,realm}` | 同 | ⚠️ provider 内的两个包级单例缓存要先改成按 realm（清单 #5） |
+| 签到 | global 账号**照常签到**；只有企业版返 `Skipped` | 国际域无签到端点 → 返 `Skipped`（**不是** `ErrUnsupported`） | ✅ 同为 `Skipped` 语义 |
+| 补偿任务 | global 跳过（`CompSkipGlobal`，「国际版无 CN 补偿体系」） | Trae 无补偿任务，不适用 | ❌ 不适用（Trae 整体没有该能力） |
+| 域级调度策略 | `strategy.domestic` / `strategy.international` + accountOrder | 同一处逻辑，pool 层自动生效 | ✅ 无需改动 |
+| 单账号在途上限 | `pool.max_in_flight_global` | 同上，自动生效 | ✅ 无需改动 |
+| 面板登录 | `loginEndpoints(realm)` 按域切三端点 + Origin | 国际版授权页是 `www.trae.ai/authorization` | ⚠️ 见清单 #7 |
+| 用量记录 | 账本按 `(backend, realm)` 记 | 同，`acc.Realm()` 返回 `global` 即可 | ✅ 无需改动 |
+| 生成 model ID | `panelPrefixFor` → `<realm>:<model>` | 现在对 trae 硬编码 `trae:cn:` | ⚠️ 见清单 #10 |
+
+**唯一的实质性结构差异**是「域开关的载体」：CodeBuddy 的逃生门是包级
+`atomic.Bool`（`auth.SetGlobalEnabled`），因为它是唯一的上游。Trae 若照抄就会
+出现两个互不相干的全局开关。应改为**各自配置文件的 `global.enabled`**，
+由各上游自己在 `Realm()` 里读取——形状与 `codebuddy.json` 一致，但作用域是
+单上游。
+
+> 这也回答了「上游平权」约束是否被违反：`global.enabled` **不是**「启用某个
+> 上游」，而是「是否允许路由到该上游的 global 域」。CodeBuddy 的同名字段就是
+> 这个语义，文档里写得很清楚（`codebuddy/config.go` 的注释）。
+
+## 10. 落地清单（按本项目文件）
 
 按依赖顺序，前两步不做完后面全是错的。
 
@@ -264,25 +310,30 @@ PascalCase + number 时间戳），无需改动。
 | 1 | `internal/trae/accounts.go` / `config.go` | `Account` 增加 `Host` 与 `UserRegion` 字段（从 storage.json 解密时带入）。域是**账号属性**，没有它就只能按配置文件判域 |
 | 2 | `internal/trae/region.go`（新） | `realmOfCredential(host, userRegion, edition) (realm, supported)`：三层判定 + US 第三态 |
 | 3 | `internal/backend/trae/account.go` | 删掉 `realmOfBase`，`Realm()` 改用账号自身的域；US 账号不进池 |
-| 4 | `internal/trae/config.go` | 加 `Global TraeRealm`；`ChatBaseFor` / `APIBaseFor` **真正**按 realm 分派（现在忽略参数直接返 CN） |
+| 4 | `internal/trae/config.go` | 加 `Global TraeRealm`（含 `Enabled` 域开关，形状对齐 `codebuddy.json` 的 `global` 段）；`ChatBaseFor` / `APIBaseFor` **真正**按 realm 分派（现在忽略参数直接返 CN） |
 | 5 | `internal/trae/catalog.go` / `remote_models.go` | 两个包级单例缓存改为 `map[realm]`；目录查询在国际域用 `solo_agent` |
 | 6 | `internal/trae/payload.go` | function 归属改为目录驱动；硬编码 `soloAgentModels` 退化为兜底 |
 | 7 | `internal/trae/oauth.go` | ClientID 按「是否 SOLO 包」选；`OAuthAuthorizeURL` 按域（国际是 `www.trae.ai/authorization`） |
-| 8 | `internal/trae/credits.go` / `backend/trae/account.go` | 国际域走 `ide_user_pay_status`；`Checkin()` 在国际域返 `ErrUnsupported` |
+| 8 | `internal/trae/credits.go` / `backend/trae/account.go` | 国际域走 `ide_user_pay_status`；`Checkin()` 在国际域返 `Skipped: true` + 说明（**不是** `ErrUnsupported`，见 §7） |
 | 9 | `internal/trae/client.go` / `remote_models.go` | 去掉硬编码的 `Package-Type: stable_cn`、`Origin/Referer: www.trae.cn`——至少在域为 global 时不发这些 CN 专用头 |
 | 10 | `internal/panel/panel.go` | `panelPrefixFor` 现在对 trae 硬编码 `trae:cn:`；改为 `trae:<realm>:` |
 | 11 | `internal/trae/errors.go` | 补 `1005`（订阅门禁）、`4011`（限流）的语义分类 |
 
-### 9.1 不能做的事
+### 10.1 不能做的事
 
 - ❌ 把国际版做成新上游 `trae-global`（协议相同，不是新上游）
 - ❌ 引入 `ai` 作为第三个域值（本项目已有 `global`）
 - ❌ 用 `base` 域名反推账号域（一个配置文件只能是一个域）
 - ❌ 让 US 凭据回退成 `global`（会 401 且污染熔断）
-- ❌ 让国际账号参与签到（404 会被误判成网络故障）
+- ❌ 在调度器/池里按域过滤掉国际账号的签到（与 CodeBuddy 不一致——它的
+  global 账号照常签到；过滤让账号在面板上神秘消失，原因也不可见）
+- ❌ 用 `ErrUnsupported` 表示「国际域无签到」（那是「上游没实现」的语义，
+  面板读不到；应返 `Skipped` + 说明）
+- ❌ 给 Trae 再造一个全局 `globalEnabled` 单例（CodeBuddy 那个是单上游时代的
+  设计；两个上游各一个全局开关会互相矛盾，应放进各自的配置文件）
 - ❌ 国际账号按 token 估算积分（没有 `consumption_rate`）
 
-## 10. 待验证
+## 11. 待验证
 
 | 项 | 现状 | 怎么验 |
 |---|---|---|
@@ -296,7 +347,7 @@ PascalCase + number 时间戳），无需改动。
 > 聊天走同一组端点，付费改变的是同一份响应里的授权标志与调用时的错误码（`1005`）。
 > 所以不要为付费账号加新端点。
 
-## 11. 一个容易混的相邻概念：企业版
+## 12. 一个容易混的相邻概念：企业版
 
 参考实现还区分了 `TraePanel`（`cn` / `enterprise` / `ai`），其中 `enterprise`
 是**同一份 CN 凭据的第二个聊天网关**（`console.enterprise.trae.cn`），租户账号
@@ -307,7 +358,7 @@ PascalCase + number 时间戳），无需改动。
 **它不是域，也不是上游**——是"同一凭证的第二条计费通道"。本项目目前不做；
 真要做时它是 `trae.json` 的一个开关 + base，不要塞进 realm 枚举。
 
-## 12. 来源
+## 13. 来源
 
 - `dsh/docs/INTL_SUPPORT_PLAN.md` —— 实施方案与模块清单
 - `dsh/docs/INTL_SG_EVIDENCE.md` —— 证据矩阵（host / refresh 契约 / 目录 / usage）
