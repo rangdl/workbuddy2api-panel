@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -41,13 +42,18 @@ func (b *blockingBody) Close() error {
 //
 // 回归点：Trae 此前**完全没有**流中空闲监控（CodeBuddy 有）。表现为请求挂住
 // 直到外层 ctx 超时，期间占着在途名额与 goroutine，排查时看日志只有"没反应"。
+//
+// cancelled 用 atomic 而不是裸 int32：它由 cancel 回调在**监控 goroutine**里写，
+// 由测试主 goroutine 轮询读。裸读写会被 -race 判为数据竞争（CI 的 go test (race)
+// 就是这么红的），而且这不是误报——两个 goroutine 之间确实没有 happens-before
+// 关系。用原子量表达"只关心是否发生过"，语义也更准。
 func TestIdleBodyCancelsOnStall(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	var cancelled int32
 	body := newIdleBody(newBlockingBody(), 100*time.Millisecond, func() {
-		cancelled = 1
+		atomic.StoreInt32(&cancelled, 1)
 		cancel()
 	})
 	defer body.Close()
@@ -61,12 +67,12 @@ func TestIdleBodyCancelsOnStall(t *testing.T) {
 	// 等 idle 触发：100ms idle → 监控周期 25ms，给足余量。
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if cancelled == 1 {
+		if atomic.LoadInt32(&cancelled) == 1 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if cancelled != 1 {
+	if atomic.LoadInt32(&cancelled) != 1 {
 		t.Fatal("流卡住超过 idle 后未触发 cancel（空闲监控未生效）")
 	}
 	select {
