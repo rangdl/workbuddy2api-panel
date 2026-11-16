@@ -79,6 +79,12 @@ type traeConfigView struct {
 	Cooldowns []trae.CoolInfo `json:"cooldowns"`
 	// Usable 当前可参与轮转的账号数（扣掉 disabled 与冷却中）。
 	Usable int `json:"usable"`
+	// GlobalEnabled global 域路由开关（trae.json 的 global.enabled）。
+	//
+	// 缺省 true（见 trae.Config.GlobalEnabled 的指针语义：空对象不能等于关闭，
+	// 否则升级后所有国际账号会静默停用）。显式关掉 = 逃生门：即便账号凭证声明
+	// 是国际版，也不路由到 global 域，一律按 CN 处理。
+	GlobalEnabled bool `json:"global_enabled"`
 }
 
 // getTraeConfig 读取 trae.json 并返回脱敏视图（文件不存在时返回默认值）。
@@ -94,12 +100,14 @@ func (p *Panel) getTraeConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view := traeConfigView{
-		IDEVersion: trae.DefaultIDEVersion,
-		Accounts:   []traeAccountView{},
+		IDEVersion:    trae.DefaultIDEVersion,
+		Accounts:      []traeAccountView{},
+		GlobalEnabled: true, // 缺省 true，与 trae.Config.GlobalEnabled() 同口径
 	}
 	if cfg != nil {
 		view.IDEVersion = cfg.IDEVersion
 		view.CheckinUserAgent = cfg.CheckinUserAgent
+		view.GlobalEnabled = cfg.GlobalEnabled()
 		for _, a := range cfg.Accounts {
 			// 只展示池里的账号：池是权威列表。凭证文件残留（例如手工塞进
 			// auths/ 但未进池）不该出现在这里，否则用户会以为它在参与调度。
@@ -174,6 +182,12 @@ func (p *Panel) getTraeConfig(w http.ResponseWriter, r *http.Request) {
 type traeSaveRequest struct {
 	IDEVersion       string `json:"ide_version"`
 	CheckinUserAgent string `json:"checkin_user_agent"`
+	// GlobalEnabled global 域路由开关。**用指针**：没提交 = 不改。
+	//
+	// 不能用 bool 值类型——零值 false 会让「旧前端/旧脚本没带这个字段」被解释成
+	// 「用户要求关闭 global 域」，一次保存就把所有国际账号静默停用。这与
+	// trae.GlobalRealm.Enabled 用指针是同一个理由。
+	GlobalEnabled *bool `json:"global_enabled"`
 }
 
 // saveTraeConfig 保存**纯配置**：启用开关 / 对话 base / IDE 版本 / 签到排程。
@@ -240,6 +254,13 @@ func (p *Panel) saveTraeConfig(w http.ResponseWriter, r *http.Request) {
 	// 无法区分"没提交该字段"与"提交了空串"是 JSON 的固有限制；这里选择尊重空串
 	// ——用户清空输入框的意图就是恢复默认，而"没提交"在前端总会带全字段。
 	next.CheckinUserAgent = req.CheckinUserAgent
+	// global 段必须**整段带过**：next 是从零值构造的，不显式复制就会把用户手改的
+	// 国际版 base（chat_base / api_base）连同 enabled 一起清空——这比"少一个开关"
+	// 严重得多，属于一次面板保存静默毁配置。
+	next.Global = old.Global
+	if req.GlobalEnabled != nil {
+		next.Global.Enabled = req.GlobalEnabled
+	}
 	if err := next.Validate(); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return

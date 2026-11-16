@@ -134,7 +134,11 @@ function mdUpstreamOf(m) {
 }
 
 // mdUpstreamLabel 上游的展示名（徽标与筛选项共用同一套文案）。
-const MD_UPSTREAM_LABEL = { codebuddy: 'CodeBuddy', trae: 'Trae' };
+//
+// 直接用 accounts.js 里的 BACKEND_LABEL —— **全站唯一一份**。这里原先复制过
+// 一份并写成 'CodeBuddy'，于是同一个上游在模型页叫 CodeBuddy、在账号池和配置页
+// 叫 WorkBuddy。取值与为什么是 WorkBuddy 见 accounts.js 的定义处。
+const MD_UPSTREAM_LABEL = BACKEND_LABEL;
 
 // mdMatch 单个模型是否满足全部筛选条件。
 function mdMatch(m, f) {
@@ -237,13 +241,69 @@ function mdAvailabilityTag(m) {
   return ' <span class="tag ' + av.cls + ' md-avail" title="' + esc(av.tip) + '">' + esc(av.label) + '</span>';
 }
 
-// mdUpstreamTag 上游徽标（「模型」列 ID 前）。用颜色区分：Trae 用 warn 色，
-// CodeBuddy 用 mute 色——前者是后接入的少数派，需要一眼能从长列表里挑出来。
-function mdUpstreamTag(m) {
-  const up = mdUpstreamOf(m);
-  const label = MD_UPSTREAM_LABEL[up] || up;
-  const cls = up === 'trae' ? 'warn' : 'mute';
-  return '<span class="tag ' + cls + ' md-up" title="上游：' + esc(label) + '">' + esc(label) + '</span> ';
+// mdProviderTag 单个「上游×域」徽标，文字是**可直填的调用前缀**（wb:cn / trae:global）。
+//
+// 为什么不写展示名（WorkBuddy·CN）：这一列是给运维看「这个模型从哪调」的，
+// 用户真正要复制的是模型名前缀。展示名还得让他自己翻译回 `wb:` / `trae:`，
+// 多一道心算。`wb` 是 CodeBuddy 注册的上游别名（backend/codebuddy 的
+// Aliases()），客户端写 `wb:cn:<模型>` 与 `cn:<模型>` 等价。
+//
+// 域直接跟在后面（cn / global），与模型 ID 里的写法一致。
+//
+// **配色不带状态语义**：早先借 warn 表示 Trae、mute 表示 WorkBuddy，于是同一
+// 张表里两个来源背景和字色都不一样，Trae 还看着像在告警。现在两者共用一套
+// 中性外观（见 index.html 的 .md-prov），上游差异只由左侧色条表达。
+function mdProviderTag(p, clickable) {
+  const up = String((p && p.upstream) || '');
+  const realm = String((p && p.realm) || 'cn');
+  // 前缀用上游的**短别名**（后端注册过的那个），不是展示名。
+  const prefix = mdUpstreamPrefix(up);
+  // 未知上游也要有色条位（落到 accent），避免将来新增上游时没有视觉标识。
+  const cls = 'md-prov up-' + (up === 'trae' ? 'trae' : 'codebuddy');
+  const hidden = p && p.hidden === true;
+  const bits = [];
+  if (p && p.credits) bits.push('倍率 ' + p.credits);
+  if (p && p.context_length) bits.push('上下文 ' + fmtK(p.context_length));
+  if (p && p.max_output_tokens) bits.push('最大输出 ' + fmtK(p.max_output_tokens));
+  if (hidden) bits.push('已被 models.hidden 隐藏（客户端调不到）');
+  const tip = '调用名：' + String((p && p.id) || '') + (bits.length ? ' · ' + bits.join(' · ') : '');
+  // 域单独一层淡色，让「哪一半是上游、哪一半是域」一眼分开。
+  const text = esc(prefix) + '<span class="md-prov-realm">:' + esc(realm) + '</span>';
+  const style = hidden ? ' style="opacity:.45;text-decoration:line-through"' : '';
+  if (!clickable) return '<span class="tag ' + cls + '" title="' + esc(tip) + '"' + style + '>' + text + '</span>';
+  return '<span class="tag ' + cls + '" data-up="' + esc(up) + '" data-realm="' + esc(realm) +
+    '" title="' + esc(tip + '（点击筛选该来源）') + '" style="cursor:pointer' +
+    (hidden ? ';opacity:.45;text-decoration:line-through' : '') + '">' + text + '</span>';
+}
+
+// mdUpstreamPrefix 上游的**模型名前缀**（客户端实际可写的短别名）。
+//
+// 与展示名（MD_UPSTREAM_LABEL）是两件事：展示名给人读，前缀给人填。
+// CodeBuddy 的 `wb` 来自后端的 Aliases()（见 backend/codebuddy/backend.go）；
+// Trae 没有别名，前缀就是 `trae`。新增上游时这里要跟着补。
+function mdUpstreamPrefix(up) {
+  return up === 'trae' ? 'trae' : 'wb';
+}
+
+// mdProviderTags 一个模型的全部来源徽标，**每个来源一行**。
+//
+// 并列成一个长串在来源多时（3~4 个）会挤成一条难以扫读的横排，且各来源的
+// 域容易看串行。逐行排列后「这个模型由谁提供」是一列清晰的清单。
+function mdProviderTags(m, clickable) {
+  const ps = (m && m.providers) || [];
+  return '<div class="md-prov-list">' + ps.map(p => mdProviderTag(p, clickable)).join('') + '</div>';
+}
+
+// mdUpstreamTag 明细视图 ID 前的来源标签 —— **已移除，恒为空字符串**。
+//
+// 明细视图的 ID 本身就把来源写全了：`cn:glm-5.2` / `global:gpt-5.4` /
+// `trae:cn:DeepSeek-V4-Pro`。前面再挂一个 `wb:cn` / `trae:cn` 徽标是把同一份
+// 信息写两遍，还占掉模型名的横向空间。
+//
+// 保留这个空函数而不是删掉调用点：mdRowHtml 的拼接、以及既有测试的取值位置
+// 都还指到这里；返回 '' 让「标签区」自然消失，改动面最小。
+function mdUpstreamTag() {
+  return '';
 }
 
 // mdRowHtml 单个模型行（纯渲染，便于独立测试）。
@@ -260,7 +320,14 @@ function mdRowHtml(m, pr) {
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
   const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + mdUpstreamTag(m) + '<span class="mid">' + esc(m.id) + '</span>' + mdAvailabilityTag(m) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+  // hidden 的可见标记：标签区去掉后不能再靠徽标划线，改在 ID 本身加划线与
+  // 悬停说明（后端 entry["hidden"] 本来就带着这个信息）。
+  const hid = m.hidden === true;
+  const midStyle = hid ? ' style="text-decoration:line-through;opacity:.5"' : '';
+  const hidTag = hid
+    ? ' <span class="tag bad" title="已被 models.hidden 隐藏：客户端 /v1/models 不返回它，点名调用也会被拒">已隐藏</span>'
+    : '';
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + mdUpstreamTag(m) + '<span class="mid"' + midStyle + '>' + esc(m.id) + '</span>' + hidTag + mdAvailabilityTag(m) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
     '<td class="num">' + rateCell(m) + '</td>' +
     '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
     '<td class="efs" style="white-space:normal">' + effs + '</td>' +
@@ -268,56 +335,21 @@ function mdRowHtml(m, pr) {
     outCell(m, pr) + '</tr>';
 }
 
-// mdProviderTag 单个「上游×域」徽标。
-//
-// 为什么把域并进徽标文字而不是单独一列：用户要的就是「这个模型谁提供」，
-// 拆成两列（上游 + 域）会让他自己做笛卡尔积式的阅读。合在一个 chip 里
-// 一眼就是「WorkBuddy·CN」这样的完整来源。
-//
-// 配色：上游决定色系（Trae 用 warn——它是后接入的少数派，需要从长列表里
-// 一眼挑出来；WorkBuddy 用 mute），域用深浅区分（global 加边框）。
-function mdProviderTag(p, clickable) {
-  const up = String((p && p.upstream) || '');
-  const realm = String((p && p.realm) || 'cn');
-  const upLabel = MD_UPSTREAM_LABEL[up] || up || '?';
-  const realmLabel = realm === 'global' ? 'Global' : 'CN';
-  const cls = up === 'trae' ? 'warn' : 'mute';
-  const hidden = p && p.hidden === true;
-  const bits = [];
-  if (p && p.credits) bits.push('倍率 ' + p.credits);
-  if (p && p.context_length) bits.push('上下文 ' + fmtK(p.context_length));
-  if (p && p.max_output_tokens) bits.push('最大输出 ' + fmtK(p.max_output_tokens));
-  if (hidden) bits.push('已被 models.hidden 隐藏（客户端调不到）');
-  const tip = '调用名：' + String((p && p.id) || '') + (bits.length ? ' · ' + bits.join(' · ') : '');
-  const text = esc(upLabel) + '·' + esc(realmLabel);
-  const style = hidden ? ' style="opacity:.45;text-decoration:line-through"' : '';
-  if (!clickable) return '<span class="tag ' + cls + '" title="' + esc(tip) + '"' + style + '>' + text + '</span>';
-  return '<span class="tag ' + cls + ' md-prov" data-up="' + esc(up) + '" data-realm="' + esc(realm) +
-    '" title="' + esc(tip + '（点击筛选该来源）') + '" style="cursor:pointer' +
-    (hidden ? ';opacity:.45;text-decoration:line-through' : '') + '">' + text + '</span>';
-}
-
-// mdProviderTags 一个模型的全部来源徽标。
-function mdProviderTags(m, clickable) {
-  const ps = (m && m.providers) || [];
-  return ps.map(p => mdProviderTag(p, clickable)).join(' ');
-}
-
 // mdMergedRateCell 合并视图的倍率列：各来源倍率不同，逐个列出。
 //
 // 刻意**不合并成一个数**：倍率是各自计费的，取最小或平均都会误导用户对
-// 「用这个模型要花多少」的预期。悬停里带来源名，一眼知道哪个便宜。
+// 「用这个模型要花多少」的预期。后面的来源标注用与提供者列相同的**调用前缀**
+// （wb:cn / trae:global），同一行里两处指代同一个来源时写法必须一致。
 function mdMergedRateCell(m) {
   const ps = (m && m.providers) || [];
   const parts = [];
   for (const p of ps) {
     if (!p.credits && !p.promo_credits) continue;
-    const upLabel = MD_UPSTREAM_LABEL[p.upstream] || p.upstream || '?';
-    const realmLabel = p.realm === 'global' ? 'Global' : 'CN';
+    const src = mdUpstreamPrefix(p.upstream) + ':' + (p.realm || 'cn');
     const rate = p.promo_credits || p.credits;
     const label = p.promo_label ? ' <span class="tag ok">' + esc(p.promo_label) + '</span>' : '';
-    parts.push('<div class="id" title="' + esc(upLabel + '·' + realmLabel) + '">' +
-      esc(rate) + label + ' <span style="color:var(--ink-3)">' + esc(upLabel) + '</span></div>');
+    parts.push('<div class="id" title="' + esc(src) + '">' +
+      esc(rate) + label + ' <span style="color:var(--ink-3)">' + esc(src) + '</span></div>');
   }
   return parts.length ? parts.join('') : '—';
 }
@@ -361,8 +393,11 @@ function mdMergedRowHtml(m) {
 function mdMergedMatch(m, f) {
   f = f || mdFilter;
   if (f.q) {
+    // 可搜的写法：上游标识、展示名、以及**界面上真正显示的调用前缀**
+    // （wb:cn / trae:global）——用户是照着标签复制粘贴来搜的。
     const provText = ((m.providers) || []).map(p =>
-      [p.upstream, p.realm, MD_UPSTREAM_LABEL[p.upstream] || ''].join(' ')).join(' ');
+      [p.upstream, p.realm, MD_UPSTREAM_LABEL[p.upstream] || '',
+        mdUpstreamPrefix(p.upstream) + ':' + (p.realm || 'cn')].join(' ')).join(' ');
     const text = [m.id, m.bare_id, m.name, provText].filter(Boolean).join(' ').toLowerCase();
     for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
       if (!text.includes(kw)) return false;

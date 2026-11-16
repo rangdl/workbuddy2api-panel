@@ -12,9 +12,17 @@ function setTableHTML(el, html) {
   el.innerHTML = html;
 }
 
-/* BACKEND_LABEL 上游标识 → 展示名。
+/* BACKEND_LABEL 上游标识 → 展示名。**全站唯一一份**。
    多上游合池后，账号表按上游分组：调度虽然是统一的，但凭证形态、积分口径、
-   可用的运维动作都不一样，混在一起排会让人分不清哪一行能用哪些按钮。 */
+   可用的运维动作都不一样，混在一起排会让人分不清哪一行能用哪些按钮。
+
+   为什么必须只有一份：这个常量原先在 accounts.js / config.js / models.js 里
+   各写了一遍，其中模型页那份写成 'CodeBuddy'，账号池和配置页写 'WorkBuddy'
+   ——同一个上游在同一个面板里有两个名字。取值统一到 **WorkBuddy**（项目名、
+   面板标题、README 主线都叫这个；`codebuddy` 只是后端标识符与目录名）。
+
+   本文件在 index.html 里先于 models.js / usage.js / config.js 加载，它们直接
+   引用这个常量即可，不要再各自复制一份。 */
 const BACKEND_LABEL = { codebuddy: 'WorkBuddy', trae: 'Trae' };
 
 /* groupByBackend 按上游分组，保持组内原有顺序。

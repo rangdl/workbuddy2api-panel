@@ -47,6 +47,45 @@ func TestCrossDomainFallbackExposedInConfigPage(t *testing.T) {
 	}
 }
 
+// TestCrossDomainFallbackHintOutsideSwitch 说明文字必须在 .switch **外面**。
+//
+// .switch 是 `justify-content: space-between` 的横排 flex（标签在左、开关在右）。
+// 把长说明塞进它内部，文字会被挤成夹在两者之间的窄条：截图里那行「裸模型名
+// 跨域回退 开启后，请求 model 不带…」就是这个词条的真实观感。
+// 项目里其它带说明的开关一律是「.switch 结束后紧跟一个 <div class="hint">」，
+// 这里锁住同形，避免以后又把 span 塞回去。
+func TestCrossDomainFallbackHintOutsideSwitch(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	html := rec.Body.String()
+
+	i := strings.Index(html, `name="`+crossDomainField+`"`)
+	if i < 0 {
+		t.Fatalf("找不到 %s 控件", crossDomainField)
+	}
+	// 取控件所在的那个 .switch 块（到它的闭合 </div> 为止）。
+	start := strings.LastIndex(html[:i], `<div class="switch"`)
+	if start < 0 {
+		t.Fatal("控件不在 .switch 块内")
+	}
+	end := strings.Index(html[i:], "</div>")
+	if end < 0 {
+		t.Fatal(".switch 块没有闭合")
+	}
+	block := html[start : i+end]
+	// 只查 hint：标签本身是 <span class="lb">，那是 .switch 的正常构成。
+	if strings.Contains(block, `class="hint"`) {
+		t.Errorf("说明文字被塞进了 .switch 内部，会被横排 flex 挤成窄条；"+
+			"应改为 .switch 结束后另起 <div class=\"hint\">。实际块：%s", block)
+	}
+
+	// 说明确实存在（没有为了让上面的断言通过而干脆删掉）。
+	if !strings.Contains(html, "裸模型名跨域回退") {
+		t.Error("找不到开关标签")
+	}
+}
+
 // TestCrossDomainFallbackMappedInJS CFG_MAP 必须有映射，否则保存不生效。
 //
 // 这是「假成功」类缺陷：控件画出来了、用户勾了、点保存提示成功，但

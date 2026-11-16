@@ -385,7 +385,8 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function mdRateValue');
 const end = src.indexOf('function mdRowHtml');
 if (start < 0 || end < 0) throw new Error('model filter helpers not found');
-const ctx = { Number, String, Array, Object, isFinite, parseFloat };
+const ctx = { Number, String, Array, Object, isFinite, parseFloat,
+  BACKEND_LABEL: { codebuddy: 'WorkBuddy', trae: 'Trae' } };
 vm.createContext(ctx);
 vm.runInContext(src.slice(start, end) + '\nthis.mdMatch=mdMatch; this.mdSortList=mdSortList; this.mdRateValue=mdRateValue;', ctx);
 const models = [
@@ -452,9 +453,12 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
-// 按上游筛选 + 上游徽标：Trae 的 ID 是 "trae:cn:<模型>"（三段），CodeBuddy 是
+// 按上游筛选 + 上游徽标：Trae 的 ID 是 "trae:cn:<模型>"（三段），WorkBuddy 是
 // "<realm>:<模型>"（两段）。域筛选若只看 startsWith(realm+":")，Trae 的 CN 模型
 // 会被判成非 CN 而整片消失——这是加 Trae 后最容易踩的坑。
+//
+// 徽标文案断言 WorkBuddy·CN：展示名全站唯一一份（accounts.js 的 BACKEND_LABEL），
+// 这里注入的桩必须与那份一致，否则测的就不是真实文案。
 func TestAppJSModelUpstreamFilter(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -466,7 +470,9 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function mdRateValue');
 const end = src.indexOf('function mdRowHtml');
 if (start < 0 || end < 0) throw new Error('model filter helpers not found');
-const ctx = { Number, String, Array, Object, isFinite, parseFloat, esc: s => String(s) };
+const ctx = { Number, String, Array, Object, isFinite, parseFloat, esc: s => String(s),
+  fmtK: n => { n = Number(n || 0); return n >= 1000 ? Math.round(n / 1000) + 'K' : String(n); },
+  BACKEND_LABEL: { codebuddy: 'WorkBuddy', trae: 'Trae' } };
 vm.createContext(ctx);
 vm.runInContext(src.slice(start, end) + '\nthis.mdMatch=mdMatch; this.mdSortList=mdSortList; this.mdUpstreamTag=mdUpstreamTag; this.mdUpstreamOf=mdUpstreamOf; this.mdRealmOf=mdRealmOf;', ctx);
 const models = [
@@ -489,8 +495,18 @@ process.stdout.write(JSON.stringify({
   legacyUpstream: ctx.mdUpstreamOf(models[4]),
   realmOfTrae: ctx.mdRealmOf(models[2]),
   realmOfBuddy: ctx.mdRealmOf(models[0]),
-  tagTrae: ctx.mdUpstreamTag(models[2]).includes('Trae') && ctx.mdUpstreamTag(models[2]).includes('tag warn'),
-  tagBuddy: ctx.mdUpstreamTag(models[0]).includes('CodeBuddy') && ctx.mdUpstreamTag(models[0]).includes('tag mute'),
+  // 明细视图不再挂标签（ID 自带 cn: / trae:cn: 前缀），mdUpstreamTag 恒为空。
+  detailTagEmpty: ['cn:glm-5.2','global:hy3','trae:cn:doubao-seed'].every(id =>
+    ctx.mdUpstreamTag({ id }) === ''),
+  // 合并视图的来源徽标显示**可直填的调用前缀**（wb:cn / trae:global）。
+  provBuddyCn: ctx.mdProviderTag({upstream:'codebuddy',realm:'cn',id:'cn:x'}, false).replace(/<[^>]*>/g,''),
+  provTraeGlobal: ctx.mdProviderTag({upstream:'trae',realm:'global',id:'trae:global:x'}, false).replace(/<[^>]*>/g,''),
+  // 两个来源的外观必须完全一致：把色条类名与文字抹平后，HTML 应逐字相同。
+  sameLook: (() => {
+    const norm = h => h.replace(/up-(trae|codebuddy)/, 'UP').replace(/>[^<]*</g, '>TEXT<');
+    return norm(ctx.mdProviderTag({upstream:'trae',realm:'cn',id:'x'}, false)) ===
+           norm(ctx.mdProviderTag({upstream:'codebuddy',realm:'cn',id:'x'}, false));
+  })(),
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "model-upstream-*.cjs")
 	if err != nil {
@@ -511,7 +527,7 @@ process.stdout.write(JSON.stringify({
 		`"traeCnRealm":["trae:cn:doubao-seed","trae:cn:deepseek-v4","trae:cn:legacy"],` +
 		`"traeGlobalRealm":[],` +
 		`"legacyUpstream":"trae","realmOfTrae":"cn","realmOfBuddy":"cn",` +
-		`"tagTrae":true,"tagBuddy":true}`
+		`"detailTagEmpty":true,"provBuddyCn":"wb:cn","provTraeGlobal":"trae:global","sameLook":true}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("model upstream filter=%s\nwant %s", out, want)
 	}
@@ -919,6 +935,7 @@ const cbEls = {
 };
 const ctx = {
   Date, Number, String, Math, Map, Array, Object, isNaN, URLSearchParams, Set,
+  BACKEND_LABEL: { codebuddy: 'WorkBuddy', trae: 'Trae' },
   document: { getElementById: id => (id === 'cfgForm' ? cfgForm : null) },
   $: id => (id === 'cfgForm' ? cfgForm : (cbEls[id] || null)),
 };
@@ -1505,7 +1522,8 @@ func TestRegionSchedulingFormRoundTrip(t *testing.T) {
  }
  const cfg={pool:{strategy:{domestic:'round_robin',international:'sequential_exhaust'},account_order:{domestic:['c','a'],international:['y','x']}}};
  const nodes={cfgForm:{elements},cfgPath:{},cfgNote:{}};
- const ctx={cfgLoaded:null,api:async()=>({config:cfg}),$:id=>nodes[id],markDurationFields(){},toast(message){throw Error(message)}};
+ const ctx={cfgLoaded:null,api:async()=>({config:cfg}),$:id=>nodes[id],markDurationFields(){},toast(message){throw Error(message)},
+   BACKEND_LABEL:{codebuddy:'WorkBuddy',trae:'Trae'}};
  vm.createContext(ctx);
  vm.runInContext(src.slice(src.indexOf('const CFG_MAP ='),src.indexOf('/* Go 时长字段即时校验')),ctx);
  (async()=>{

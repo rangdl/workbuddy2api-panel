@@ -184,6 +184,15 @@ input[type=checkbox] { width: auto; accent-color: var(--accent); }
 label.fld { display: block; margin-bottom: 14px; }
 label.fld > .lb { display: block; font-size: 12.5px; color: var(--ink-2); margin-bottom: 5px; }
 label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
+/* 开关下方的说明（.switch 紧跟 .hint 的形态）。
+   必须显式给样式：.hint 此前只对 label.fld 的子元素生效，作为 .pad 下的
+   独立 div 时**没有任何规则命中**，会以正文 14px 深色显示——和旁边 11.5px
+   灰字的说明完全不是一个观感，也就是「样式不统一」的来源。
+   只选相邻兄弟，避免一次性改写配置页里所有既有 hint 的观感。 */
+.switch + .hint {
+  display: block; font-size: 11.5px; line-height: 1.55; color: var(--ink-3);
+  margin: -2px 0 10px;
+}
 .inline { display: flex; align-items: center; gap: 9px; }
 
 /* ── 统计条（观测区）──────────────────────────────────────────────── */
@@ -289,6 +298,24 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .tag.warn { background: var(--warn-soft); color: var(--warn); }
 .tag.bad { background: var(--bad-soft); color: var(--bad); }
 .tag.mute { background: var(--surface-2); color: var(--ink-3); border: 1px solid var(--line); }
+/* ── 来源徽标（模型页的「上游×域」）─────────────────────────────────────
+   刻意**不用 warn / mute 这两个状态色**：它们是语义色（告警 / 中性），拿来表示
+   「属于哪个上游」会让同一个表格里 Trae 显得像在告警、WorkBuddy 像次要信息——
+   用户看到的就是「两个来源背景和字色不一致」。
+   统一成一套中性外观（同底色、同字色、同边框），上游差异只用左侧 3px 色条表达：
+   一眼能分出谁是谁，又不带任何状态暗示。 */
+.md-prov {
+  background: var(--surface-2); color: var(--ink-2);
+  border: 1px solid var(--line); border-left-width: 3px;
+  font-variant-numeric: tabular-nums;
+}
+.md-prov.up-codebuddy { border-left-color: var(--accent); }
+.md-prov.up-trae { border-left-color: var(--warn); }
+.md-prov .md-prov-realm { color: var(--ink-3); }
+/* 提供者列每个来源单独一行（一行并列多个会挤成一条难以扫读的长串）。
+   .acc td 全局是 white-space:nowrap，这里必须显式覆盖，否则 <td> 内的
+   文本节点会把 flex 容器又挤回一行。 */
+.md-prov-list { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; white-space: normal; }
 .md-avail { flex: none; padding: 0 6px; font-size: 10.5px; line-height: 16px; }
 .rate-limits { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; min-width: 210px; }
 .rate-limit {
@@ -822,7 +849,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <input id="mdQ" type="search" placeholder="搜索模型 ID / 名称 / 描述 / 厂商" aria-label="搜索模型">
           <select id="mdUpstream" aria-label="按上游筛选">
             <option value="">全部上游</option>
-            <option value="codebuddy">CodeBuddy</option>
+            <option value="codebuddy">WorkBuddy</option>
             <option value="trae">Trae</option>
           </select>
           <select id="mdRealm" aria-label="按域筛选">
@@ -1171,8 +1198,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="switch"><span class="lb">快过期积分优先</span>
               <input type="checkbox" name="prefer_expiring"></div>
             <div class="switch"><span class="lb">裸模型名跨域回退</span>
-              <input type="checkbox" name="cross_domain_fallback">
-              <span class="hint">开启后，请求 <code>model</code> 不带 <code>cn:</code> / <code>global:</code> 前缀时不再等价于 <code>cn:&lt;模型&gt;</code>：首选域（cn）选不到可用号（账号级冷却 / 熔断 / 在途占满，或该域账号对这个模型 11102 后被模型级负缓存避开）会自动改用另一域再选一次。显式 <code>cn:</code> / <code>global:</code> 前缀<strong>永不回退</strong>。上游前缀（如 <code>wb:</code>）只锁上游、不锁域，仍可回退。跨域会消耗另一域的额度，故默认关闭</span></div>
+              <input type="checkbox" name="cross_domain_fallback"></div>
+            <div class="hint">开启后，请求 <code>model</code> 不带 <code>cn:</code> / <code>global:</code> 前缀时不再等价于 <code>cn:&lt;模型&gt;</code>：首选域（cn）选不到可用号（账号级冷却 / 熔断 / 在途占满，或该域账号对这个模型 11102 后被模型级负缓存避开）会自动改用另一域再选一次。显式 <code>cn:</code> / <code>global:</code> 前缀<b>永不回退</b>。上游前缀（如 <code>wb:</code>）只锁上游、不锁域，仍可回退。跨域会消耗另一域的额度，故默认关闭。</div>
           </div>
         </div>
 
@@ -1204,24 +1231,24 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="pad">
             <div class="grid2">
               <label class="fld"><span class="lb">出站 User-Agent</span>
-                <input id="cbUserAgent" placeholder="留空 = 内置三段式默认">
-                <span class="hint">影响官网积分记录「使用端」显示；需重启</span></label>
+                <input id="cbUserAgent" placeholder="WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1（Global 账号平台段为 WorkBuddy AI）">
+                <span class="hint">留空即用此内置三段式；影响官网积分记录「使用端」显示；需重启</span></label>
               <label class="fld"><span class="lb">客户端版本</span>
-                <input id="cbClientVersion" placeholder="留空 = 内置默认">
-                <span class="hint">出站 UA 的 WorkBuddy 段与 X-IDE-Version；需重启</span></label>
+                <input id="cbClientVersion" placeholder="5.5.4">
+                <span class="hint">留空即 5.5.4；出站 UA 的 WorkBuddy 段与 X-IDE-Version；需重启</span></label>
             </div>
             <div class="grid2">
               <label class="fld"><span class="lb">CLI 版本</span>
-                <input id="cbCliVersion" placeholder="留空 = 内置默认">
-                <span class="hint">出站 UA 的 CLI 段；需重启</span></label>
+                <input id="cbCliVersion" placeholder="2.137.1">
+                <span class="hint">留空即 2.137.1；出站 UA 的 CLI 段；需重启</span></label>
               <label class="fld"><span class="lb">国内版对话 base<span class="realm-tag">CN</span></span>
-                <input id="cbChatBase" placeholder="留空 = 内置默认">
-                <span class="hint">需重启</span></label>
+                <input id="cbChatBase" placeholder="https://copilot.tencent.com">
+                <span class="hint">留空即此内置地址；需重启</span></label>
             </div>
             <div class="grid2">
               <label class="fld"><span class="lb">国际版对话 base<span class="realm-tag">Global</span></span>
-                <input id="cbGlobalChatBase" placeholder="留空 = 内置默认">
-                <span class="hint">需重启</span></label>
+                <input id="cbGlobalChatBase" placeholder="https://www.workbuddy.ai">
+                <span class="hint">留空即此内置地址；需重启</span></label>
               <div class="switch" style="align-self:center"><span class="lb">启用国际版路由<span class="realm-tag">Global</span></span>
                 <input type="checkbox" id="cbGlobalEnabled"></div>
             </div>
@@ -1239,12 +1266,18 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="pad">
             <div class="grid2">
               <label class="fld"><span class="lb">出站 User-Agent</span>
-                <input id="traeUserAgent" placeholder="留空 = Trae/0.1.52（新版合并客户端形态）">
-                <span class="hint">Trae 签到/积分接口的 UA；上游改版时可回退旧形态</span></label>
+                <input id="traeUserAgent" placeholder="Trae/0.1.52">
+                <span class="hint">留空即 Trae/0.1.52（新版合并客户端形态）；Trae 签到/积分接口的 UA；上游改版时可回退旧形态</span></label>
               <label class="fld"><span class="lb">IDE 版本</span>
                 <input id="traeIdeVersion" placeholder="0.1.50">
-                <span class="hint">出站 X-Ide-Version；上游版本变化时可覆盖</span></label>
+                <span class="hint">留空即 0.1.50；出站 X-Ide-Version；上游版本变化时可覆盖</span></label>
             </div>
+            <div class="hr"></div>
+            <div class="switch"><span class="lb">启用国际版路由<span class="realm-tag">Global</span></span>
+              <input type="checkbox" id="traeGlobalEnabled"></div>
+            <div class="hint">关闭后即便账号凭证声明是国际版（<code>global</code> 域），也不路由到 Trae 国际版，
+              一律按国内版处理。用于「只想跑 CN」的逃生门：国际账号会像改造前一样走国内网关（多数会 401，
+              但那是有账号却锁了域时的既有行为，比静默摘号更容易排查）。默认开启。</div>
           </div>
         </div>
 
@@ -1260,8 +1293,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 </select>
                 <span class="hint">需重启</span></label>
               <label class="fld"><span class="lb">提示词文件路径</span>
-                <input name="prompt_file" placeholder="留空 = 内置默认提示词">
-                <span class="hint">需重启</span></label>
+                <input name="prompt_file" placeholder="defaultprompt.md">
+                <span class="hint">留空即内置 defaultprompt.md；需重启</span></label>
             </div>
             <div class="hr"></div>
             <div class="switch"><span class="lb">会话粘性路由</span>
@@ -1438,7 +1471,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div id="addUpstream">
         <div class="realm-row">
           <span class="hint" style="font-size:12px">上游：</span>
-          <label class="realm-opt"><input type="radio" name="addUpstream" value="codebuddy" checked> CodeBuddy</label>
+          <label class="realm-opt"><input type="radio" name="addUpstream" value="codebuddy" checked> WorkBuddy</label>
           <label class="realm-opt"><input type="radio" name="addUpstream" value="trae"> Trae</label>
         </div>
       </div>

@@ -23,13 +23,16 @@ func runModelsJS(t *testing.T, body string) string {
 	if err != nil {
 		t.Skip("node not installed; merged model render test skipped")
 	}
-	// 抽片段的边界：从 mdProviderTag 开始到 mdApplyView 结束。
-	const startMark = "// mdProviderTag 单个"
+	// 抽片段的边界：从 mdRealmOf 开始（mdUpstreamTag 依赖它，也顺带把
+	// MD_UPSTREAM_LABEL = BACKEND_LABEL 的接线真跑一遍），到 mdApplyView 结束。
+	const startMark = "// mdRealmOf 取模型 id 里的域段"
 	const endMark = "// mdApplyView 切换"
 	// exportsJS 在片段末尾把需要的函数收集成一个对象返回。
 	// 必须与片段**同一次** runInContext 执行——函数声明留在该次执行的词法
 	// 作用域里，第二次调用取不到。
-	exportsJS := "\n({mdProviderTag:mdProviderTag,mdMergedRowHtml:mdMergedRowHtml," +
+	exportsJS := "\n({mdProviderTag:mdProviderTag,mdProviderTags:mdProviderTags," +
+		"mdUpstreamTag:mdUpstreamTag," +
+		"mdMergedRowHtml:mdMergedRowHtml," +
 		"mdMergedMatch:mdMergedMatch,mdMergedSortList:mdMergedSortList,renderMergedModels:renderMergedModels});\n"
 	script := `const fs = require('fs');
 const vm = require('vm');
@@ -40,7 +43,7 @@ if (start < 0 || end < 0 || end <= start) throw new Error('merged render region 
 const ctx = {
   esc: s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])),
   fmtK: n => { n = Number(n || 0); return n >= 1000 ? Math.round(n / 1000) + 'K' : String(n); },
-  MD_UPSTREAM_LABEL: { codebuddy: 'WorkBuddy', trae: 'Trae' },
+  BACKEND_LABEL: { codebuddy: 'WorkBuddy', trae: 'Trae' },
   $: () => ({ innerHTML: '', textContent: '', className: '', hidden: false }),
   mdFilter: { q: '', upstream: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' },
   mdView: 'merged', mdMerged: [],
@@ -86,11 +89,12 @@ const m = {
 };
 const html = mdMergedRowHtml(m);
 process.stdout.write(JSON.stringify({
-  providers: [...html.matchAll(/md-prov" data-up="([^"]*)" data-realm="([^"]*)"/g)].map(x => x[1]+'·'+x[2]),
+  providers: [...html.matchAll(/md-prov[^"]*" data-up="([^"]*)" data-realm="([^"]*)"/g)].map(x => x[1]+'·'+x[2]),
+  providerRows: (html.match(/md-prov-list/g) || []).length,
   hasModel: html.includes('deepseek-v4.1-flash'),
   context: (html.match(/(\d+)K<\/td><td class="num">/) || [])[1],
 }));`)
-	want := `{"providers":["codebuddy·cn","trae·cn","trae·global"],"hasModel":true,"context":"1000"}`
+	want := `{"providers":["codebuddy·cn","trae·cn","trae·global"],"providerRows":1,"hasModel":true,"context":"1000"}`
 	if out != want {
 		t.Fatalf("rendered=%s\nwant %s", out, want)
 	}

@@ -58,8 +58,10 @@ const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
      实际行为一致（否则用户会看到"能签到却显示关着"）。
 
    上游列表来自后端返回的「账号池里实际存在的上游」，不是硬编码：
-   新增上游、或某上游账号全删光，列表自动跟着变。 */
-const BACKEND_LABEL_CFG = { codebuddy: 'WorkBuddy', trae: 'Trae' };
+   新增上游、或某上游账号全删光，列表自动跟着变。
+
+   展示名复用 accounts.js 的 BACKEND_LABEL（全站唯一一份，见那里的说明）。 */
+const BACKEND_LABEL_CFG = BACKEND_LABEL;
 let checkinBackendsState = null; // 加载时缓存，collect 时读它
 
 function renderCheckinBackends(backends, enabled) {
@@ -216,13 +218,17 @@ function collectTraeConfig() {
   // 管理。省略 accounts 字段（而非传空数组）才会走后端的「保留全部账号」分支；
   // 传 [] 会删除全部账号的文件。
   //
-  // 「上游接入」页删除后，这里只剩搬到配置页的两个字段（IDE 版本 / 签到 UA）。
-  // 对话 base 不再暴露配置：它是上游路径，一个上游不该有可配的路径。
+  // 「上游接入」页删除后，这里只剩搬到配置页的三个字段（IDE 版本 / 签到 UA /
+  // 国际版路由开关）。对话 base 不再暴露配置：它是上游路径，一个上游不该有可配的路径。
   const ideVer = ($('traeIdeVersion') ? $('traeIdeVersion').value || '' : '').trim();
   const ua = ($('traeUserAgent') ? $('traeUserAgent').value || '' : '').trim();
   const out = {};
   if (ideVer) out.ide_version = ideVer;
   if (ua) out.checkin_user_agent = ua;
+  // 开关**必须显式发布尔值**（含 false）：后端用指针区分「没提交」与「显式关闭」，
+  // 漏发就等于永远关不掉这个域。
+  const glEl = $('traeGlobalEnabled');
+  if (glEl) out.global_enabled = !!glEl.checked;
   return out;
 }
 /* parseHours 解析 "9, 21" → [9,21]（非法项丢弃；空串 → []）。 */
@@ -282,17 +288,21 @@ function collectCodeBuddyConfig() {
   return out;
 }
 
-/* loadTraeConfig 把 Trae 上游的两个可配项填进配置页（IDE 版本 / 签到 UA）。
-   上游接入页删除后，其余字段（对话 base / 启用开关 / 签到排程）都不再暴露：
+/* loadTraeConfig 把 Trae 上游的可配项填进配置页（IDE 版本 / 签到 UA / 国际版路由）。
+   上游接入页删除后，其余字段（对话 base / 启用总开关 / 签到排程）都不再暴露：
    - base 是上游路径，不该可配；
-   - 启用开关随「平权」移除——加了账号就启用；
-   - 签到排程并入 config.json 的 schedule（总开关 + 按上游勾选）。 */
+   - 启用总开关随「平权」移除——加了账号就启用；
+   - 签到排程并入 config.json 的 schedule（总开关 + 按上游勾选）。
+
+   `global_enabled` 与「启用总开关」不是一回事：前者是**域**开关（同一上游的
+   cn / global 两个域），后者是**上游**开关。域是账号属性，与上游平权无关。 */
 async function loadTraeConfig() {
   try {
     const d = await api('trae_config');
     const c = d.config || {};
     if ($('traeIdeVersion')) $('traeIdeVersion').value = c.ide_version || '';
     if ($('traeUserAgent')) $('traeUserAgent').value = c.checkin_user_agent || '';
+    if ($('traeGlobalEnabled')) $('traeGlobalEnabled').checked = c.global_enabled !== false;
   } catch (e) { /* 后端未提供该接口时静默 */ }
 }
 /* syncTraeNicknames 从上游 GetUserInfo 拉昵称（账号池页与 Trae 页共用）。 */
