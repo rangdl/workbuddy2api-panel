@@ -22,6 +22,13 @@
   `acc.Realm()` 回答——**不要另造一个"标签"往 realm 里塞**（历史上的
   `UsageLabeller` 就是这么把 `"trae"` 写进 realm，让面板「按域」冒出
   cn/global/trae 三行）。用量账本按 `(backend, realm)` 分别记账。
+- **Trae 国际版是 `global` 域，不是新上游、也不是第三个域名。** 参考项目
+  （dsh）内部管它叫 `ai` 桶，那是它的存储键名，与本项目的 `global` 是同一件事
+  ——**不要把 `ai` 引进本仓库的域枚举**，也不要新建 `trae-global` 上游（国际版
+  与国内版协议相同，只有 base/目录/用量源不同）。域是**账号属性**，由凭证的
+  `userRegion` 判定，不能拿 `trae.json` 的 base 域名反推（那等于整份配置只能是
+  一个域）。US 区真实存在但未支持，判定到它时必须显式排除，**不可回落成
+  `global`**（会 401 且污染熔断判据）。详见 `docs/trae-intl.md`。
 - **积分只认实测，绝不按 token 推算。** Trae 的 `consumption_rate`（如 0.06）
   是**相对倍率**（IDE 里显示的 `x0.06`），不是「每 token 多少积分」；拿它乘
   token 数会虚高约 1500 倍。真实的逐请求扣费只有两种来源：上游在 usage 里
@@ -78,4 +85,6 @@ go build ./... && go vet ./... && gofmt -l internal/ cmd/ && go test ./...
 - `docs/config-layout.md` —— 配置与数据目录划分
 - `docs/deprecated.md` —— 已移除的功能与遗留死代码
 - `docs/trae-upstream-plan.md` —— Trae 上游协议分析
+- `docs/trae-intl.md` —— Trae 国际版（`global` 域）接入：契约差异、域判定、
+  US 区陷阱、目录分缓存、续期 ClientID 分叉、签到不可用
 - `README.md` —— 面向用户的使用文档

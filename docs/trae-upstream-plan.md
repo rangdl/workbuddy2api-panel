@@ -33,6 +33,10 @@
 | 区域 | cn / global 双 realm | 仅 cn（`trae.cn` / `trae.com.cn`） |
 | 积分 | 成长任务体系 | IDE 积分 208（通用）/ Work 积分 209（不可复刻） |
 
+> **国际版（`global` 域）**：Trae 的域维度已预留，国际版接入的契约差异、
+> 域判定、目录分缓存、续期 ClientID 分叉与签到不可用见
+> [`docs/trae-intl.md`](trae-intl.md)。
+
 参考项目记录的 Trae 端点全貌（`docs/tech-framework.md` §6.1）：
 
 | 域名 | 端点 | 用途 |

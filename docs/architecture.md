@@ -281,10 +281,15 @@ CodeBuddy 的配置也不在 `config.json` 里，而是 `codebuddy.json`（见�
 |---|---|
 | `config.json` | 与上游无关：监听、密钥、账号池策略、排程 |
 | `codebuddy.json` | CodeBuddy：cn/global 两域 base、超时、UA、版本、脱敏 |
-| `trae.json` | Trae：cn 域 base、IDE 版本、签到 UA、OAuth 常量 |
+| `trae.json` | Trae：cn/global 两域 base、IDE 版本、签到 UA、OAuth 常量 |
 
 **文件内保留域维度**（`cn` / `global` 各一段）。不要为了"少一层嵌套"把两域
 base 合成一个——跨域回退（issue #135）依赖两域可分别寻址，域隔离是硬约束。
+
+Trae 的 `global` 域（国际版）契约差异、域判定、US 区陷阱见
+[`docs/trae-intl.md`](trae-intl.md)。要点：国际版是**同上游的另一个域**，
+不是新上游也不是第三个域名；域由**账号凭证**的 `userRegion` 判定，
+不能拿 `trae.json` 的 base 域名反推。
 
 **传送层参数不按域拆，也不进上游文件**：超时、SSE 首字节/空闲上限属于传输层，
 所有上游共用一份（在 `config.json` 的 `upstream` 段）。它们描述的是「一条 SSE
