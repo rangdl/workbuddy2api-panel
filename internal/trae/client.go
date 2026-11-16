@@ -1,0 +1,208 @@
+package trae
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strconv"
+	"time"
+)
+
+// client.go Trae 上游 HTTP 调用。
+//
+// 出站头清单与蓝本（TraeWorkAssistant api_server/routes.rs）逐项对齐——Trae
+// 上游对头族敏感，缺项会得到 4xx/风控而非明确报错。
+
+const (
+	// defaultStreamHeaderTimeout 流式请求首字节超时的**内置默认值**。
+	//
+	// 实际生效值由 SetTimeouts 注入（config.json 的 upstream.header_timeout_seconds）：
+	// 此前它是硬编码常量，等于 Trae 的 SSE 首字节上限不可配——而 CodeBuddy 同一个
+	// 语义是可配的。两个上游的对话都是 SSE 长连接，这个参数该一视同仁。
+	defaultStreamHeaderTimeout = 120 * time.Second
+	dialTimeout                = 30 * time.Second
+	idleConnTimeout            = 90 * time.Second
+	// maxErrorBodyBytes 错误体读取上限（原文要透传，但异常大 body 不得拖垮网关）。
+	maxErrorBodyBytes = 64 * 1024
+)
+
+// Client Trae 上游客户端（双 http.Client 共享连接池）。
+type Client struct {
+	transport  *http.Transport
+	streamHTTP *http.Client
+	jsonHTTP   *http.Client
+
+	// idleTimeout 流式响应体空闲超时（0 = 不监控）。
+	//
+	// 为什么需要：SSE 长连接上上游可能已经卡死却不断开 TCP，客户端会一直等。
+	// CodeBuddy 侧有同样的监控（internal/upstream 的 monitorBody），Trae 此前
+	// 完全没有——表现为「请求挂住直到外层 ctx 超时」。
+	idleTimeout time.Duration
+
+	// Trace 变体尝试追踪（可选；nil = 不追踪，生产路径零开销）。
+	//
+	// 存在的理由：ExchangeAuthCode / ExchangeRefresh 是"变体链"——依次尝试直到成功，
+	// 但**哪个变体成功**恰恰是 P0 要回答的问题（服务端无客户端私钥时，无 DeviceProof
+	// 的兜底变体是否仍被上游接受）。PoC 工具（cmd/traepoc）挂上它即可逐变体报告；
+	// 生产路径不设置，行为与不追踪时完全一致。
+	Trace func(tag string, ok bool, err error)
+}
+
+// NewClient 构造客户端。
+func NewClient() *Client {
+	tr := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   16,
+		IdleConnTimeout:       idleConnTimeout,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: defaultStreamHeaderTimeout,
+		ForceAttemptHTTP2:     true,
+	}
+	return &Client{
+		transport:  tr,
+		streamHTTP: &http.Client{Transport: tr},
+		jsonHTTP:   &http.Client{Transport: tr},
+	}
+}
+
+// SetTimeouts 注入传输层超时（由启动装配调用，参数来自 config.json 的
+// upstream 段——与 CodeBuddy 共用同一份配置，因为它们描述的是传输层行为）。
+//
+// headerTimeout <= 0 时保留内置默认（120s）；idleTimeout <= 0 表示关闭空闲监控。
+// 必须在创建 Client 之后、发出第一个请求之前调用。
+func (c *Client) SetTimeouts(headerTimeout, idleTimeout time.Duration) {
+	if c == nil || c.transport == nil {
+		return
+	}
+	if headerTimeout > 0 {
+		c.transport.ResponseHeaderTimeout = headerTimeout
+	}
+	c.idleTimeout = idleTimeout
+}
+
+// ChatStream 发起一次 llm_utils_chat 请求。
+//
+// 成功时返回未读取的 SSE 响应体（调用方负责 Close）；上游 >=400 时返回
+// (nil, status, body, nil)——错误分类交给调用方；传输层错误才返回 err。
+func (c *Client) ChatStream(ctx context.Context, cfg *Config, acc *Account, body []byte) (io.ReadCloser, int, []byte, error) {
+	if cfg == nil || acc == nil {
+		return nil, 0, nil, fmt.Errorf("trae: nil config or account")
+	}
+	token := acc.AccessTokenHeader()
+	if token == "" {
+		return nil, 0, nil, fmt.Errorf("trae: 账号 %s 无 access_token", acc.UID)
+	}
+	// 派生可取消的 ctx：空闲监控需要在「流卡住」时主动断流。
+	// 成功路径的 cancel 交给调用方（由返回的 body 包装负责），所以这里
+	// 不能 defer cancel。
+	ctx, cancel := context.WithCancel(ctx)
+
+	url := cfg.chatBaseForAccount(acc) + EndpointLLMChat
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		cancel() // 构造失败也要释放 ctx，否则泄漏
+		return nil, 0, nil, fmt.Errorf("build request: %w", err)
+	}
+	applyChatHeaders(req, cfg, acc, token)
+
+	resp, err := c.streamHTTP.Do(req)
+	if err != nil {
+		cancel()
+		return nil, 0, nil, err
+	}
+	if resp.StatusCode >= 400 {
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		cancel()
+		return nil, resp.StatusCode, raw, nil
+	}
+	return newIdleBody(resp.Body, c.idleTimeout, cancel), resp.StatusCode, nil, nil
+}
+
+// applyChatHeaders 设置 Trae 上游要求的完整头族。
+//
+// 说明：token 要同时设三处——`Authorization`（带 `Cloud-IDE-JWT ` 前缀）、
+// `X-Cloudide-Token`（裸 token）、`X-Ide-Token`（裸 token）。bluechonk 实测
+// 缺任一个都可能被拒（"同一 token 要设三处，缺任一个都可能被拒"）。
+func applyChatHeaders(req *http.Request, cfg *Config, acc *Account, tokenWithPrefix string) {
+	raw := acc.AccessToken
+	if len(tokenWithPrefix) > len("Cloud-IDE-JWT ") {
+		raw = tokenWithPrefix[len("Cloud-IDE-JWT "):]
+	}
+	h := req.Header
+	h.Set("Content-Type", "application/json")
+	h.Set("Accept", "*/*")
+	h.Set("User-Agent", "TraeClient/TTNet")
+	h.Set("Authorization", tokenWithPrefix)
+	h.Set("X-Cloudide-Token", raw)
+	h.Set("X-Ide-Token", raw)
+	h.Set("X-App-Id", cfg.AppID)
+	h.Set("X-App-Version", "default")
+	h.Set("X-App-Version-Code", cfg.IDEVersionCode)
+	h.Set("X-Ide-Version", cfg.IDEVersion)
+	h.Set("X-Ide-Version-Code", cfg.IDEVersionCode)
+	h.Set("X-Ide-Version-Type", "stable")
+	h.Set("X-Device-Type", "windows")
+	h.Set("X-Device-Brand", "CREFG-XX")
+	h.Set("X-Device-Cpu", "Intel")
+	h.Set("X-Device-Id", acc.DeviceID)
+	h.Set("X-Machine-Id", acc.MachineID)
+	h.Set("Request-Traffic-Type", "prod")
+	h.Set("X-Lgw-Req-Sdk-Type", "3")
+	h.Set("X-Lscbd-Aid", "787976")
+	h.Set("X-Lscbd-Platform", "windows")
+	h.Set("X-Ss-Dp", "787976")
+	h.Set("App-Version", cfg.IDEVersion)
+	h.Set("Referer", cfg.chatBaseForAccount(acc)+EndpointLLMChat)
+
+	// 域相关的头：这几项是客户端安装包/地域属性，照抄国内的会让国际请求
+	// 显得自相矛盾（国内 OS 串 + 国际网关）。
+	//
+	// 只改明显带地域/包类型语义的两项，其余保持不动——参考实现实测整套国内头
+	// 被 SG 网关原样接受，所以这不是**必需**的修正，而是减少无谓的破绽。
+	if acc.RegionOf(cfg) == RegionGlobal {
+		h.Set("Package-Type", "stable")
+		h.Set("X-Os-Version", "Windows 11")
+	} else {
+		h.Set("Package-Type", "stable_cn")
+		h.Set("X-Os-Version", "Windows 11 Home China")
+	}
+
+	// 链路追踪头：上游按 request id 记账，缺省不致命但补齐更贴近真实客户端。
+	traceID := "00-" + genUUIDLike() + "-" + genUUIDLike() + "-01"
+	h.Set("X-Tt-Trace-Id", traceID)
+	h.Set("X-Request-Id", "req_"+genUUIDLike())
+	if len(traceID) >= 16 {
+		h.Set("X-Custom-Trace-Id", traceID[:16])
+	}
+	if len(traceID) >= 35 {
+		h.Set("X-Flow-Traceparent", "04-"+traceID[3:35]+"-"+genUUIDLike()+"-01")
+	}
+}
+
+// RetryAfter 从响应头解析 Retry-After（秒）；缺失或非法返回 0。
+// 供调用方做分级退避（429 场景）。
+func RetryAfter(h http.Header) time.Duration {
+	v := h.Get("Retry-After")
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}

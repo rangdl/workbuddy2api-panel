@@ -8,14 +8,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
 func (p *Pool) Disable(uid, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		p.disableLocked(e, reason)
 	}
 }
@@ -32,7 +32,7 @@ func (p *Pool) Disable(uid, reason string) {
 func (p *Pool) NoteSessionDead(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return false
 	}
@@ -50,7 +50,7 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 func (p *Pool) ClearSessionDead(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		e.sessionDeadFails = 0
 	}
 }
@@ -62,7 +62,7 @@ func (p *Pool) ClearSessionDead(uid string) {
 func (p *Pool) ReviveDisabled(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok && e.disabled {
+	if e, ok := p.lookupLocked(uid); ok && e.disabled {
 		e.disabled = false
 		e.reason = ""
 		e.sessionDeadFails = 0
@@ -77,7 +77,7 @@ func (p *Pool) ReviveDisabled(uid string) {
 func (p *Pool) Revive(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return false
 	}
@@ -103,7 +103,7 @@ func (p *Pool) Revive(uid string) bool {
 func (p *Pool) Pause(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return false
 	}
@@ -115,7 +115,7 @@ func (p *Pool) Pause(uid string) bool {
 func (p *Pool) Resume(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return false
 	}
@@ -132,7 +132,7 @@ func (p *Pool) Resume(uid string) bool {
 func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		if remain > 0 && !e.disabled {
 			p.reviveCoolingLocked(e, remain, total)
 		} else {
@@ -154,7 +154,7 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 func (p *Pool) NoteError(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		e.errTotal++
 		e.lastErr = time.Now()
 		p.recordBreakerFailureLocked(e)
@@ -174,7 +174,7 @@ func (p *Pool) NoteError(uid string) {
 func (p *Pool) NoteSuccess(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		e.successCount++
 		e.lastSuccess = time.Now()
 		e.fails = 0
@@ -217,7 +217,7 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return
 	}
@@ -240,16 +240,17 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		e.modelCost = make(map[string]modelCostEntry)
 	}
 	const alpha = 0.3
-	prev, seen := e.modelCost[model]
+	key := modelKey(model)
+	prev, seen := e.modelCost[key]
 	if !seen {
-		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
+		e.modelCost[key] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
 	} else {
 		// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
 		// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束。
 		if prev.CostPer1k <= 0 && per1k > 0 {
 			log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
 		}
-		e.modelCost[model] = modelCostEntry{
+		e.modelCost[key] = modelCostEntry{
 			CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
 			LastSeen:  time.Now(),
 			Samples:   prev.Samples + 1,
@@ -315,7 +316,7 @@ func (p *Pool) deductExpiryLocked(e *entry, d int64) {
 func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return
 	}
@@ -358,22 +359,19 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 func (p *Pool) Status(uid string) (Status, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return Status{}, false
 	}
 	return p.statusOf(uid, e), true
 }
 
-// AuthByUID 返回账号的完整凭证（给调度器/运维接口用）。
-func (p *Pool) AuthByUID(uid string) *auth.Auth {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if e, ok := p.byUID[uid]; ok {
-		return e.a
-	}
-	return nil
-}
+// AuthByUID 已移除：它返回 *auth.Auth，是 internal/pool 依赖 internal/auth
+// 的最后一处（见 docs/architecture.md「已知例外①」）。
+//
+// 需要 CodeBuddy 凭证的调用方（cmd/server 的模型倍率预热、panel 的成长任务
+// 接口）改为：取 gateway.Account → codebuddy.Unwrap(acc)。池本身不再关心
+// 任何上游的凭证类型。
 
 // AvailableUIDs 返回当前 healthy 且未占满在途名额的账号 UID 列表（按 UID 排序，稳定输出）。
 // 供会话粘性路由（internal/session）做快路径命中校验 + 双段分配；无可用返回空切片。
@@ -382,14 +380,12 @@ func (p *Pool) AvailableUIDs() []string {
 	defer p.mu.RUnlock()
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
-		if !e.healthy(now) {
+	for _, e := range p.byUID {
+		if !p.gateLocked(e, gateSpec{now: now}).ok() {
 			continue
 		}
-		if p.inFlightFull(e) {
-			continue
-		}
-		uids = append(uids, uid)
+		// 返回裸 uid：调用方（session / 面板）按裸 uid 使用，池内索引键才是复合的。
+		uids = append(uids, e.acc.UID())
 	}
 	sort.Strings(uids)
 	return uids
@@ -398,19 +394,19 @@ func (p *Pool) AvailableUIDs() []string {
 // AvailableUIDsForModel 同 AvailableUIDs，但把健康口径换成 healthyForModel：
 // 在该模型上被 6004 限流的账号不列入，而在**其他模型**被限流的账号照常列入（模型豁免）。
 // 供会话粘性按模型分配与命中校验；model 为空时等价于 AvailableUIDs。
+//
+// 积分保底也计入：触底号不列进候选表，否则粘性会先粘到它、再由
+// PickByUIDForModel 拦住解绑（同一个判据，见 gate.go）。
 func (p *Pool) AvailableUIDsForModel(model string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
-		if !e.healthyForModel(now, model) {
+	for _, e := range p.byUID {
+		if !p.gateLocked(e, gateSpec{model: model, now: now}).ok() {
 			continue
 		}
-		if p.inFlightFull(e) {
-			continue
-		}
-		uids = append(uids, uid)
+		uids = append(uids, e.acc.UID())
 	}
 	sort.Strings(uids)
 	return uids
@@ -420,57 +416,69 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 // 6004 限流时返回 nil，让调用方（handler）解绑并回落普通轮换。
 // 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
 // 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
-func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
+func (p *Pool) PickByUIDForModel(uid, model string) gateway.Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return nil
 	}
+	return p.pickEntryLocked(e, model)
+}
+
+// pickByKey 按池内复合键精确取号（粘性绑定用）。
+func (p *Pool) pickByKey(key, model string) gateway.Account {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[key]
+	if !ok {
+		return nil
+	}
+	return p.pickEntryLocked(e, model)
+}
+
+// pickEntryLocked 校验单个账号在指定模型下是否可选，并记录 selected 序号。
+// 调用方必须已持有 p.mu。
+func (p *Pool) pickEntryLocked(e *entry, model string) gateway.Account {
 	now := time.Now()
-	if !e.healthyForModel(now, model) {
-		return nil
-	}
-	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
-	// （判据含上游目录倍率兜底，realm 取账号所属域——粘性号已确定，无需外部传入）。
-	// 返回 nil 后 handler 侧解绑粘性（unbindSticky）走普通轮换换号，粘性号回血
-	// 后下次会话重新绑定。
-	// 日志频次：天然每请求至多一条——首次返回 nil 即解绑，后续轮转不再调入本路径
-	// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
-	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
+	// 统一判据（gate.go）。realm 取账号自己的域：粘性号已确定，无需外部传入，
+	// 但积分保底里的上游倍率表按 (域, 模型) 分桶，所以必须带上它而不是留空。
+	switch x := p.gateLocked(e, gateSpec{model: model, realm: e.acc.Realm(), now: now}); x {
+	case excludeNone:
+	case excludeCreditFloor:
+		// 与 pick 的 floorBlocked 同判据——触底 + 收费即拦。返回 nil 后 handler 侧
+		// 解绑粘性（unbindSticky）走普通轮换换号，粘性号回血后下次会话重新绑定。
+		// 日志频次：天然每请求至多一条——首次返回 nil 即解绑，后续轮转不再调入本路径
+		// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
 		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
-			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
+			logfmt.Label(e.acc.UID(), e.acc.Nickname()), model, e.credits, p.creditFloor)
 		return nil
-	}
-	if p.inFlightFull(e) {
+	default:
 		return nil
 	}
 	e.lastUsed = now
 	p.pickSeq++
 	e.usedSeq = p.pickSeq
-	return e.a
+	return e.acc
 }
 
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
 // 否则返回 nil。供会话粘性路由命中校验与直取使用。
-func (p *Pool) PickByUID(uid string) *auth.Auth {
+func (p *Pool) PickByUID(uid string) gateway.Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return nil
 	}
 	now := time.Now()
-	if !e.healthy(now) {
-		return nil
-	}
-	if p.inFlightFull(e) {
+	if !p.gateLocked(e, gateSpec{now: now}).ok() {
 		return nil
 	}
 	e.lastUsed = now
 	p.pickSeq++
 	e.usedSeq = p.pickSeq
-	return e.a
+	return e.acc
 }
 
 // CountsDetailed 返回 total/healthy/cooling/disabled/inFlightFull 五类计数。
@@ -513,7 +521,7 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 	defer p.mu.RUnlock()
 	now := time.Now()
 	for _, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
+		if realm != "" && e.acc.Realm() != realm {
 			continue
 		}
 		total++
@@ -552,7 +560,7 @@ func (p *Pool) ServableForRealm(realm string) bool {
 	defer p.mu.RUnlock()
 	now := time.Now()
 	for _, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
+		if realm != "" && e.acc.Realm() != realm {
 			continue
 		}
 		if p.inFlightFull(e) {
@@ -572,14 +580,17 @@ func (p *Pool) ServableForRealm(realm string) bool {
 func (p *Pool) List() []Status {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	uids := make([]string, 0, len(p.byUID))
-	for uid := range p.byUID {
-		uids = append(uids, uid)
+	keys := make([]string, 0, len(p.byUID))
+	for k := range p.byUID {
+		keys = append(keys, k)
 	}
-	sort.Strings(uids)
-	out := make([]Status, 0, len(uids))
-	for _, uid := range uids {
-		out = append(out, p.statusOf(uid, p.byUID[uid]))
+	sort.Strings(keys)
+	out := make([]Status, 0, len(keys))
+	for _, k := range keys {
+		e := p.byUID[k]
+		// Status.UID 保持裸 uid（面板/调度器按裸 uid 调用各接口），
+		// 池内索引键才是复合的。
+		out = append(out, p.statusOf(e.acc.UID(), e))
 	}
 	return out
 }
@@ -592,9 +603,10 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
 		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
-		Realm:                    e.a.Realm(),
-		Enterprise:               e.a.IsEnterprise(),
-		Nickname:                 e.a.Nickname,
+		Realm:                    e.acc.Realm(),
+		Backend:                  e.acc.Backend(),
+		Enterprise:               e.acc.Enterprise(),
+		Nickname:                 e.acc.Nickname(),
 		Credits:                  e.credits,
 		CreditsTotal:             e.creditsTotal,
 		CreditsExpiring:          e.creditsExpiring,
@@ -603,23 +615,23 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 拷贝一份：List 返回后 JSON 序列化在锁外进行，不能与 NoteModelCost 的
 		// 原地扣减共享底层数组（数据竞争）。
 		CreditsExpiryBuckets: append([]ExpiryBucket(nil), e.expiryBuckets...),
-		Cooling:                  now.Before(e.until) || now.Before(e.breakerUntil),
-		Disabled:                 e.disabled,
-		Paused:                   e.paused,
-		SuccessCount:             e.successCount,
-		ErrTotal:                 e.errTotal,
-		CheckinDone:              e.lastCheckinDay == now.Format("2006-01-02"),
-		TokenUsage:               e.tokenUsage,
-		LastSuccessTime:          e.lastSuccess,
-		LastErrTime:              e.lastErr,
-		Until:                    e.until,
-		SoftStreak:               e.softStreak,
-		ModelCosts:               p.modelCostsStatusLocked(e, now),
-		ConsecutiveFails:         e.consecutiveFails,
-		DegradeUntil:             e.degradeUntil,
-		InFlight:                 int(e.inFlight.Load()),
-		BreakerFails:             e.fails,
-		BreakerUntil:             e.breakerUntil,
+		Cooling:              now.Before(e.until) || now.Before(e.breakerUntil),
+		Disabled:             e.disabled,
+		Paused:               e.paused,
+		SuccessCount:         e.successCount,
+		ErrTotal:             e.errTotal,
+		CheckinDone:          e.lastCheckinDay == now.Format("2006-01-02"),
+		TokenUsage:           e.tokenUsage,
+		LastSuccessTime:      e.lastSuccess,
+		LastErrTime:          e.lastErr,
+		Until:                e.until,
+		SoftStreak:           e.softStreak,
+		ModelCosts:           p.modelCostsStatusLocked(e, now),
+		ConsecutiveFails:     e.consecutiveFails,
+		DegradeUntil:         e.degradeUntil,
+		InFlight:             int(e.inFlight.Load()),
+		BreakerFails:         e.fails,
+		BreakerUntil:         e.breakerUntil,
 	}
 	// reason 仅在冷却/禁用中透出（issue #171）：软冷却按 until 到期恢复，
 	// 但 until/coolKind/reason 字段按设计不主动清理（NoteSuccess 注释：
@@ -730,4 +742,16 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 		return nil
 	}
 	return rows
+}
+
+// PickByUIDForBackend 按 (backend, uid) 精确取回粘性账号。
+//
+// 与 PickByUIDForModel 的差异：后者只按裸 uid 反查，两个上游共用同一 uid
+// 时会因歧义返回 nil（或取到错误上游的账号）。粘性绑定值带 backend，
+// 这里用它做精确匹配，是「同一会话只落在同一上游」的实现基础。
+func (p *Pool) PickByUIDForBackend(backend, uid, model string) gateway.Account {
+	if backend == "" {
+		return p.PickByUIDForModel(uid, model)
+	}
+	return p.pickByKey(gateway.QualifiedUID(bareAccount{backend: backend, uid: uid}), model)
 }

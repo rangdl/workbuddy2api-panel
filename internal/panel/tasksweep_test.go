@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
@@ -103,12 +104,17 @@ func newSweepPanel(t *testing.T, b *sweepBackend, accounts ...*auth.Auth) *Panel
 	t.Cleanup(srv.Close)
 	p := pool.New("")
 	for _, a := range accounts {
-		p.Add(a)
+		p.Add(backendcb.WrapAuth(a))
 	}
 	return &Panel{cfg: Config{
 		Pool: p,
 		Upstream: &upstream.Client{
 			HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL,
+		},
+		// 装配期注入的凭证访问（生产由 cmd/server 提供）。测试直接按 uid 回查
+		// 池里的账号——与 main 的 CredentialFor 同语义。
+		CredentialFor: func(uid string) *auth.Auth {
+			return backendcb.UnwrapAuth(p.Account(uid))
 		},
 	}}
 }

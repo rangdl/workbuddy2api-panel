@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 )
 
 var flushInterval = 5 * time.Second
@@ -134,7 +134,13 @@ func (p *Pool) load() {
 // 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
 func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 	now := time.Now()
-	for uid, s := range accounts {
+	for key, s := range accounts {
+		// 键形态：单 backend 时代是裸 uid；合池后是 "backend:uid"。
+		// 无冒号 → 视为 CodeBuddy（旧 state.json 全部属于它，向后兼容）。
+		backend, uid := gateway.SplitQualifiedUID(key)
+		if backend == "" {
+			backend = BackendCodeBuddy
+		}
 		// err_total 优先；旧文件的 err_count（连续错误）作一次性迁移源映射进来（二者取较大者，
 		// 尽最大可能保留历史观测信号——旧语义下 err_count 也真实发生过错误，不应丢）。
 		errTotal := s.ErrTotal
@@ -142,7 +148,8 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			errTotal = int64(s.ErrCount)
 		}
 		e := &entry{
-			a:                        &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			// placeholder：只为承载 credits/冷却等状态，SyncToDir/Add 时
+			// 会被真实账号替换（upsertLocked 保留状态、只换 acc）。
 			credits:                  s.Credits,
 			creditsTotal:             s.CreditsTotal,
 			creditsExpiring:          s.CreditsExpiring,
@@ -195,6 +202,10 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			e.degradeUntil = *s.DegradeUntil
 		}
 		// 模型级独立冷却（6004 重置墙钟 / 11102 负缓存）：惰性过滤已过期条目。
+		//
+		// 键归一（modelKey）：旧 state.json 里的键是**请求模型名的原始拼写**，
+		// 可能混合大小写。不归一会出现「重启后冷却只挡住其中一种写法」——
+		// 同一模型两种拼写各自一条台账，样本与截止互不相干。
 		if len(s.ModelCooldowns) > 0 {
 			for m, mc := range s.ModelCooldowns {
 				if mc.Until.IsZero() || !now.Before(mc.Until) {
@@ -203,11 +214,20 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				if e.modelCooldowns == nil {
 					e.modelCooldowns = map[string]modelCooldown{}
 				}
-				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
+				key := modelKey(m)
+				// 归一后可能撞键（旧文件里两种拼写各一条）：保留截止更晚的那条，
+				// 冷却语义是「更保守者优先」——宁可多等一会儿，也不要提前放行。
+				if prev, exists := e.modelCooldowns[key]; exists && prev.Until.After(mc.Until) {
+					continue
+				}
+				e.modelCooldowns[key] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
 			}
 		}
 		// 成本账本：惰性过滤过期（modelCostTTL 外不恢复）+ 剔除结构破损条目
 		// （负 per1k / 零 LastSeen——上游异常或旧文件手改产生的脏数据）。
+		//
+		// 键同样归一；撞键时保留样本数更多的观测（它带着更多实测证据），
+		// 样本数相同则保留更新的那条。
 		if len(s.ModelCosts) > 0 {
 			for m, mc := range s.ModelCosts {
 				if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL || mc.CostPer1k < 0 {
@@ -216,10 +236,22 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				if e.modelCost == nil {
 					e.modelCost = map[string]modelCostEntry{}
 				}
-				e.modelCost[m] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
+				key := modelKey(m)
+				if prev, exists := e.modelCost[key]; exists {
+					if prev.Samples > mc.Samples ||
+						(prev.Samples == mc.Samples && !prev.LastSeen.Before(mc.LastSeen)) {
+						continue
+					}
+				}
+				e.modelCost[key] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
 			}
 		}
-		p.byUID[uid] = e
+		// byUID 的键恒为复合键（"backend:uid"）：落盘键对 CodeBuddy 是裸 uid、
+		// 对 Trae 已带前缀，这里统一补全，保证内存索引与查找口径一致。
+		e.acc = p.placeholderAccount(backend, uid)
+		idxKey := backend + ":" + uid
+		p.byUID[idxKey] = e
+		p.uidIndex[uid] = append(p.uidIndex[uid], idxKey)
 	}
 }
 
@@ -234,6 +266,9 @@ func (p *Pool) adoptSnapshot(s snapshot) {
 }
 func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.byUID = map[string]*entry{}
+	// uidIndex 必须一起重置：否则指向已删除条目的旧键会残留，
+	// lookupLocked 反查时命中不存在的复合键，表现为账号"查不到"。
+	p.uidIndex = map[string][]string{}
 	p.applyAccountsLocked(s.Accounts)
 	p.restoreSchedulingLocked(s.Scheduling)
 }
@@ -291,7 +326,14 @@ func (p *Pool) notePersistFail(err error) {
 func (p *Pool) stateOverviewLocked() stateFile {
 	now := time.Now()
 	sf := stateFile{Accounts: map[string]stateAccount{}, Scheduling: p.scheduling}
-	for uid, e := range p.byUID {
+	for _, e := range p.byUID {
+		uid := e.acc.UID()
+		// 落盘键：CodeBuddy 保持裸 uid（旧 state.json 直接读得回来，零迁移），
+		// 其他上游带 backend 前缀（"trae:xxx"）避免 uid 撞车互相覆盖。
+		key := uid
+		if e.acc != nil && e.acc.Backend() != "" && e.acc.Backend() != BackendCodeBuddy {
+			key = gateway.QualifiedUID(e.acc)
+		}
 		s := stateAccount{
 			Credits:                  e.credits,
 			CreditsTotal:             e.creditsTotal,
@@ -349,7 +391,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 				s.ModelCosts[m] = stateModelCost{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
 			}
 		}
-		sf.Accounts[uid] = s
+		sf.Accounts[key] = s
 	}
 	return sf
 }

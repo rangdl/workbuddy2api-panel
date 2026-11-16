@@ -22,10 +22,21 @@ func (p *Panel) getConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "load config: "+err.Error())
 		return
 	}
+	// checkin_backends_available：账号池里**实际存在**的上游列表，供配置页渲染
+	// 「各上游自动签到」勾选项。由池提供而不是读配置——配置里列着但没账号的上游
+	// 列出来只是噪音；新加账号的上游即使配置没提也必须出现（缺键 = 启用）。
+	var avail []string
+	if p.cfg.Pool != nil {
+		avail = p.cfg.Pool.Backends()
+	}
+	if avail == nil {
+		avail = []string{}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":     true,
-		"path":   p.cfg.ConfigPath,
-		"config": cfg,
+		"ok":                         true,
+		"path":                       p.cfg.ConfigPath,
+		"config":                     cfg,
+		"checkin_backends_available": avail,
 	})
 }
 

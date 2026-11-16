@@ -11,8 +11,8 @@ import (
 // 不落盘——状态接口与 List() 必须都能透出。
 func TestStatusExposesEnterpriseFlag(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "ent", Nickname: "企业号", EnterpriseID: "e1"})
-	p.Add(&auth.Auth{UID: "per", Nickname: "个人号"})
+	p.Add(WrapAuth(&auth.Auth{UID: "ent", Nickname: "企业号", EnterpriseID: "e1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "per", Nickname: "个人号"}))
 
 	ent, ok := p.Status("ent")
 	if !ok {

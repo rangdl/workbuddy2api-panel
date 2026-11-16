@@ -76,7 +76,6 @@ func enterpriseTestScheduler(t *testing.T, enterprise bool) (*Scheduler, *record
 		a.EnterpriseID = "ent-1"
 	}
 	p := pool.New("")
-	p.Add(a)
 
 	up := &upstream.Client{
 		HTTP:          srv.Client(),
@@ -84,7 +83,8 @@ func enterpriseTestScheduler(t *testing.T, enterprise bool) (*Scheduler, *record
 		BillingBaseCN: srv.URL,
 		WebBaseCN:     srv.URL,
 	}
-	s := New(Config{Pool: p, Upstream: up})
+	p.Add(cbAccount(up, a))
+	s := New(Config{Pool: p})
 	return s, r
 }
 

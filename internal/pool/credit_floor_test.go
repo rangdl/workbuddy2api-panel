@@ -19,8 +19,8 @@ func TestCreditFloorBlocksPaidBelowFloor(t *testing.T) {
 	p.SetCostExploreInterval(0)
 	p.SetCreditFloor(100)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
-	p.Add(&auth.Auth{UID: "poor"})
-	p.Add(&auth.Auth{UID: "rich"})
+	p.Add(WrapAuth(&auth.Auth{UID: "poor"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "rich"}))
 
 	// poor 触底 + 实测收费；rich 余额充足 + 实测收费。
 	p.SetCredits("poor", 30, 0)
@@ -33,7 +33,7 @@ func TestCreditFloorBlocksPaidBelowFloor(t *testing.T) {
 		if a == nil {
 			t.Fatalf("第 %d 次选号返回 nil，want rich（触底号被 floor 拦截，rich 应承接）", i)
 		}
-		if a.UID == "poor" {
+		if a.UID() == "poor" {
 			t.Fatalf("第 %d 次选中 poor（credits=30 < floor=100 且模型实测收费），floor 应拦截", i)
 		}
 	}
@@ -47,7 +47,7 @@ func TestCreditFloorAllowsFreeBelowFloor(t *testing.T) {
 	p.SetCostExploreInterval(0)
 	p.SetCreditFloor(100)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
-	p.Add(&auth.Auth{UID: "poor"})
+	p.Add(WrapAuth(&auth.Auth{UID: "poor"}))
 	p.SetCredits("poor", 30, 0)
 	p.NoteModelCost("poor", "hy4-preview", 0, 1000) // 实测免费
 
@@ -55,8 +55,8 @@ func TestCreditFloorAllowsFreeBelowFloor(t *testing.T) {
 	if a == nil {
 		t.Fatal("触底号对免费模型应照常可选，got nil")
 	}
-	if a.UID != "poor" {
-		t.Fatalf("选中 %v，want poor（免费模型不受 floor 限制）", a.UID)
+	if a.UID() != "poor" {
+		t.Fatalf("选中 %v，want poor（免费模型不受 floor 限制）", a.UID())
 	}
 }
 
@@ -69,7 +69,7 @@ func TestCreditFloorAllowsUnknownBelowFloor(t *testing.T) {
 	p.SetCostExploreInterval(0)
 	p.SetCreditFloor(100)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
-	p.Add(&auth.Auth{UID: "poor"})
+	p.Add(WrapAuth(&auth.Auth{UID: "poor"}))
 	p.SetCredits("poor", 30, 0)
 	// 无任何 NoteModelCost：hy4-preview 对 poor 是 tier 1。
 
@@ -77,8 +77,8 @@ func TestCreditFloorAllowsUnknownBelowFloor(t *testing.T) {
 	if a == nil {
 		t.Fatal("触底号对无观测模型应照常可选，got nil")
 	}
-	if a.UID != "poor" {
-		t.Fatalf("选中 %v，want poor（tier 1 不受 floor 限制）", a.UID)
+	if a.UID() != "poor" {
+		t.Fatalf("选中 %v，want poor（tier 1 不受 floor 限制）", a.UID())
 	}
 }
 
@@ -89,15 +89,15 @@ func TestCreditFloorAllBelowReturnsNil(t *testing.T) {
 	p := New("")
 	p.SetCostExploreInterval(0)
 	p.SetCreditFloor(100)
-	p.Add(&auth.Auth{UID: "a"})
-	p.Add(&auth.Auth{UID: "b"})
+	p.Add(WrapAuth(&auth.Auth{UID: "a"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "b"}))
 	for _, uid := range []string{"a", "b"} {
 		p.SetCredits(uid, 10, 0)
 		p.NoteModelCost(uid, "hy4-preview", 2.9, 1000)
 	}
 
 	if a := p.PickExcludingForRealm(nil, "hy4-preview", ""); a != nil {
-		t.Fatalf("全池触底且全 tier 2，want nil，got %v（floor 硬语义：不放行）", a.UID)
+		t.Fatalf("全池触底且全 tier 2，want nil，got %v（floor 硬语义：不放行）", a.UID())
 	}
 }
 
@@ -109,12 +109,12 @@ func TestCreditFloorRecoversAfterCheckin(t *testing.T) {
 	p.SetCostExploreInterval(0)
 	p.SetCreditFloor(100)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
-	p.Add(&auth.Auth{UID: "only"})
+	p.Add(WrapAuth(&auth.Auth{UID: "only"}))
 	p.SetCredits("only", 30, 0)
 	p.NoteModelCost("only", "hy4-preview", 2.9, 1000)
 
 	if a := p.PickExcludingForRealm(nil, "hy4-preview", ""); a != nil {
-		t.Fatalf("触底期应被拦，got %v", a.UID)
+		t.Fatalf("触底期应被拦，got %v", a.UID())
 	}
 	// 签到回血：权威余额刷新到 floor 之上。
 	p.SetCreditsDetailed("only", 500, 0, 0, time.Time{}, 0)
@@ -122,8 +122,8 @@ func TestCreditFloorRecoversAfterCheckin(t *testing.T) {
 	if a == nil {
 		t.Fatal("回血后（credits=500 ≥ floor=100）应恢复可选，got nil")
 	}
-	if a.UID != "only" {
-		t.Fatalf("选中 %v，want only", a.UID)
+	if a.UID() != "only" {
+		t.Fatalf("选中 %v，want only", a.UID())
 	}
 }
 
@@ -134,12 +134,12 @@ func TestCreditFloorZeroDisables(t *testing.T) {
 	p.SetCostExploreInterval(0)
 	// 不调用 SetCreditFloor：零值即默认关闭。
 	p.SetRandomSource(func(n int64) int64 { return 0 })
-	p.Add(&auth.Auth{UID: "poor"})
+	p.Add(WrapAuth(&auth.Auth{UID: "poor"}))
 	p.SetCredits("poor", 1, 0)
 	p.NoteModelCost("poor", "hy4-preview", 2.9, 1000)
 
 	a := p.PickExcludingForRealm(nil, "hy4-preview", "")
-	if a == nil || a.UID != "poor" {
+	if a == nil || a.UID() != "poor" {
 		t.Fatalf("floor=0 应关闭保底（触底收费号照常可选），got %v", a)
 	}
 }
@@ -152,13 +152,13 @@ func TestCreditFloorBoundaryAtFloor(t *testing.T) {
 	p.SetCostExploreInterval(0)
 	p.SetCreditFloor(100)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
-	p.Add(&auth.Auth{UID: "edge"})
+	p.Add(WrapAuth(&auth.Auth{UID: "edge"}))
 	p.NoteModelCost("edge", "hy4-preview", 2.9, 1000)
 	// 顺序注意：NoteModelCost 会实扣余额（本地插值），设置边界值必须放在观测之后。
 	p.SetCredits("edge", 100, 0)
 
 	a := p.PickExcludingForRealm(nil, "hy4-preview", "")
-	if a == nil || a.UID != "edge" {
+	if a == nil || a.UID() != "edge" {
 		t.Fatalf("credits=100 == floor=100 应放行（低于才拦），got %v", a)
 	}
 }
@@ -169,12 +169,12 @@ func TestCreditFloorBoundaryAtFloor(t *testing.T) {
 func TestCreditFloorStickyPathBlocked(t *testing.T) {
 	p := New("")
 	p.SetCreditFloor(100)
-	p.Add(&auth.Auth{UID: "sticky"})
+	p.Add(WrapAuth(&auth.Auth{UID: "sticky"}))
 	p.SetCredits("sticky", 30, 0)
 	p.NoteModelCost("sticky", "hy4-preview", 2.9, 1000)
 
 	if a := p.PickByUIDForModel("sticky", "hy4-preview"); a != nil {
-		t.Fatalf("粘性号触底 + 收费模型应被 floor 拦（want nil），got %v", a.UID)
+		t.Fatalf("粘性号触底 + 收费模型应被 floor 拦（want nil），got %v", a.UID())
 	}
 	// 免费模型不受影响：同一粘性号照常出票。
 	p.NoteModelCost("sticky", "free-model", 0, 1000)
@@ -212,7 +212,7 @@ func TestCreditFloorBlocksUnobservedPaidModelByCatalogRate(t *testing.T) {
 
 	g := &auth.Auth{UID: "poor"}
 	auth.BackfillRealmFor(g, "global")
-	p.Add(g)
+	p.Add(WrapAuth(g))
 	p.SetCredits("poor", 30, 0) // 触底
 	// 刻意**不**调 NoteModelCost：无实测观测（实案形态）。
 
@@ -241,11 +241,11 @@ func TestCreditFloorUnobservedFreeModelStillAllowed(t *testing.T) {
 
 	g := &auth.Auth{UID: "poor"}
 	auth.BackfillRealmFor(g, "global")
-	p.Add(g)
+	p.Add(WrapAuth(g))
 	p.SetCredits("poor", 30, 0)
 
 	a := p.PickExcludingForRealm(nil, "new-free", "global")
-	if a == nil || a.UID != "poor" {
+	if a == nil || a.UID() != "poor" {
 		t.Fatalf("目录倍率 x0.00 的免费模型应放行触底号，got %v", a)
 	}
 }
@@ -264,11 +264,11 @@ func TestCreditFloorUnknownRateStillAllowed(t *testing.T) {
 
 	g := &auth.Auth{UID: "poor"}
 	auth.BackfillRealmFor(g, "global")
-	p.Add(g)
+	p.Add(WrapAuth(g))
 	p.SetCredits("poor", 30, 0)
 
 	a := p.PickExcludingForRealm(nil, "unknown-model", "global")
-	if a == nil || a.UID != "poor" {
+	if a == nil || a.UID() != "poor" {
 		t.Fatalf("目录未覆盖的模型应放行（倍率未知不惩罚），got %v", a)
 	}
 }
@@ -283,11 +283,11 @@ func TestCreditFloorNoRateTableKeepsLegacyBehavior(t *testing.T) {
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	// 不调 SetModelRateOf。
 
-	p.Add(&auth.Auth{UID: "poor"})
+	p.Add(WrapAuth(&auth.Auth{UID: "poor"}))
 	p.SetCredits("poor", 30, 0)
 
 	a := p.PickExcludingForRealm(nil, "unobserved", "")
-	if a == nil || a.UID != "poor" {
+	if a == nil || a.UID() != "poor" {
 		t.Fatalf("未注入倍率表时应退化为放行（零回归），got %v", a)
 	}
 }
@@ -306,12 +306,12 @@ func TestCreditFloorLocalLedgerFreeBeatsCatalogPaid(t *testing.T) {
 
 	g := &auth.Auth{UID: "poor"}
 	auth.BackfillRealmFor(g, "global")
-	p.Add(g)
+	p.Add(WrapAuth(g))
 	p.SetCredits("poor", 30, 0)
 	p.NoteModelCost("poor", "hy4-preview-f", 0, 1000) // 实测免费（限免中）
 
 	a := p.PickExcludingForRealm(nil, "hy4-preview-f", "global")
-	if a == nil || a.UID != "poor" {
+	if a == nil || a.UID() != "poor" {
 		t.Fatalf("实测免费应优先于目录牌价收费，got %v", a)
 	}
 }
@@ -330,7 +330,7 @@ func TestCreditFloorBlocksFallbackPath(t *testing.T) {
 
 	poor := &auth.Auth{UID: "poor"}
 	auth.BackfillRealmFor(poor, "global")
-	p.Add(poor)
+	p.Add(WrapAuth(poor))
 	p.SetCredits("poor", 1, 0)
 	// 置入软冷却：让 healthy 候选为空，强制走兜底路径。
 	p.Cooldown("poor", CoolSoft, 2*time.Minute, "test")
@@ -351,7 +351,7 @@ func TestCreditFloorFallbackAllowsFreeModel(t *testing.T) {
 
 	poor := &auth.Auth{UID: "poor"}
 	auth.BackfillRealmFor(poor, "global")
-	p.Add(poor)
+	p.Add(WrapAuth(poor))
 	p.SetCredits("poor", 1, 0)
 	p.Cooldown("poor", CoolSoft, 2*time.Minute, "test")
 
@@ -373,7 +373,7 @@ func TestCreditFloorStickyBlockedByCatalogRate(t *testing.T) {
 
 	g := &auth.Auth{UID: "poor"}
 	auth.BackfillRealmFor(g, "global")
-	p.Add(g)
+	p.Add(WrapAuth(g))
 	p.SetCredits("poor", 30, 0)
 
 	if a := p.PickByUIDForModel("poor", "kimi-k3-1"); a != nil {

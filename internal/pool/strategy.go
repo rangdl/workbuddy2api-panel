@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 )
 
 const (
@@ -130,7 +132,7 @@ func (p *Pool) pickOrderedLocked(cands []*entry, tried map[string]bool, model, r
 		}
 		return a < b
 	}
-	sort.Slice(cands, func(i, j int) bool { return lessUID(cands[i].a.UID, cands[j].a.UID) })
+	sort.Slice(cands, func(i, j int) bool { return lessUID(cands[i].acc.UID(), cands[j].acc.UID()) })
 	key := realm + "\x1f" + model
 	cursor := p.scheduling[key]
 	if cursor.Strategy != strategy {
@@ -139,7 +141,7 @@ func (p *Pool) pickOrderedLocked(cands []*entry, tried map[string]bool, model, r
 	var selected *entry
 	if strategy == SequentialExhaust {
 		for _, e := range cands {
-			if e.a.UID == cursor.UID {
+			if e.acc.UID() == cursor.UID {
 				selected = e
 				break
 			}
@@ -149,7 +151,7 @@ func (p *Pool) pickOrderedLocked(cands []*entry, tried map[string]bool, model, r
 		selected = cands[0]
 		if cursor.UID != "" {
 			for _, e := range cands {
-				if lessUID(cursor.UID, e.a.UID) {
+				if lessUID(cursor.UID, e.acc.UID()) {
 					selected = e
 					break
 				}
@@ -158,15 +160,15 @@ func (p *Pool) pickOrderedLocked(cands []*entry, tried map[string]bool, model, r
 	}
 	advance := true
 	if strategy == SequentialExhaust && cursor.UID != "" {
-		current := p.byUID[cursor.UID]
-		if current != nil && current.a.Realm() == realm && current.healthyForModel(now, model) &&
+		current, _ := p.lookupLocked(cursor.UID)
+		if current != nil && current.acc.Realm() == realm && current.healthyForModel(now, model) &&
 			!p.floorBlockedForRealmModel(current, model, realm, now) &&
-			(explored || tried[cursor.UID] || p.inFlightFull(current)) {
+			(explored || tried[gateway.QualifiedUID(current.acc)] || p.inFlightFull(current)) {
 			advance = false
 		}
 	}
-	if advance && cursor.UID != selected.a.UID {
-		p.scheduling[key] = scheduleCursor{Strategy: strategy, UID: selected.a.UID}
+	if advance && cursor.UID != selected.acc.UID() {
+		p.scheduling[key] = scheduleCursor{Strategy: strategy, UID: selected.acc.UID()}
 		p.dirty.Store(true)
 	}
 	return selected

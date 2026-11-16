@@ -1,0 +1,554 @@
+// trae_ops.go 面板的 Trae 运维接口：签到（全部 / 单账号）、积分查询、签到结果查询。
+//
+// 与 trae_config.go 的分工：那边管配置与凭证，这边管对上游的主动操作。
+package panel
+
+import (
+	"context"
+	"errors"
+	"log"
+	"net/http"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+)
+
+// traeOpTimeout 单次运维操作的超时（签到含 status 预检 + claim，两个上游往返）。
+const traeOpTimeout = 60 * time.Second
+
+// traeCheckinAllTimeout 全量签到的总超时（账号间限速 800ms，账号多时耗时线性增长）。
+const traeCheckinAllTimeout = 10 * time.Minute
+
+// traeCheckinAll 触发全部 Trae 账号签到。
+//
+// 已并入账号池的统一签到流程：池遍历账号对象、逐个调 Checkin，记账（今日已签
+// 标记、日志）也由池负责。这里只做范围限定（只要 Trae 账号）与结果汇总。
+func (p *Panel) traeCheckinAll(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Pool == nil {
+		writeErr(w, http.StatusNotImplemented, "pool not available")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), traeCheckinAllTimeout)
+	defer cancel()
+	p.cfg.Pool.CheckinBackend(ctx, pool.BackendTrae, false)
+	p.invalidateCheckinCache() // 签到后状态已变，下次拉配置必须重新查
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// noteTraeCheckinDone 把 Trae 账号的「今日已签」写回账号池。
+//
+// 为什么必须做：首页账号表格的「签到/已签」按钮只读 pool.Status.CheckinDone
+// （源自 entry.lastCheckinDay），而 Trae 的签到链路（面板单号 / 批量 / 自动排程）
+// 走的是 internal/trae，此前从不写这个字段——于是签过之后按钮仍是「签到」。
+// Trae 配置页的签到标记走实时查询上游，两处口径因此长期不一致。
+//
+// uid 传裸 uid：lookupLocked 会按 uidIndex 反查复合键（"trae:xxx"）。
+func (p *Panel) noteTraeCheckinDone(uid string) {
+	if p.cfg.Pool == nil || uid == "" {
+		return
+	}
+	p.cfg.Pool.NoteCheckinDone(uid)
+}
+
+// traeAccountCheckin 单账号签到（面板 Trae 页按钮）。
+//
+// 走池的统一单号入口：账号自己实现 Checkin（含签到前续期、9004/9095 识别、
+// 回查确认），池负责记账。本函数只把结果翻译成面板需要的展示形状。
+//
+// 与 accountCheckin 的差别仅在响应体：Trae 页面需要 device_already/unverified
+// 这类设备维度信息，通用入口不展示它们。
+func (p *Panel) traeAccountCheckin(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Pool == nil {
+		writeErr(w, http.StatusNotImplemented, "pool not available")
+		return
+	}
+	uid := r.PathValue("uid")
+	ctx, cancel := context.WithTimeout(r.Context(), traeOpTimeout)
+	defer cancel()
+
+	res, err := p.cfg.Pool.CheckinOne(ctx, uid)
+	if errors.Is(err, pool.ErrNoSuchAccount) {
+		writeErr(w, http.StatusNotFound, "账号不存在: "+uid)
+		return
+	}
+	p.invalidateCheckinCache()
+	if err != nil {
+		// 错误分类后一并回传，便于面板给出可操作提示。
+		if apiErr, ok := err.(*trae.APIError); ok {
+			cls := apiErr.Classification()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": false, "uid": uid, "error_type": string(cls.Kind),
+				"message": cls.Message, "disable": cls.Disable,
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "uid": uid, "message": err.Error()})
+		return
+	}
+	if res == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "uid": uid, "message": "empty result"})
+		return
+	}
+	if p.cfg.TraeCooldowns != nil && !res.Already {
+		p.cfg.TraeCooldowns.Clear(uid) // 签到成功即清冷却
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "uid": uid, "already": res.Already,
+		"device_already": res.DeviceAlready, "unverified": res.Unverified,
+		"reward": res.Reward, "message": res.Message,
+	})
+}
+
+// traeAccountCredits 查询单账号积分包明细与汇总。
+func (p *Panel) traeAccountCredits(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.TraeClient == nil || p.cfg.TraePath == "" {
+		writeErr(w, http.StatusNotImplemented, "trae client not available")
+		return
+	}
+	cfg, err := trae.Load(p.cfg.TraePath, p.cfg.AuthDir)
+	if err != nil || cfg == nil {
+		writeErr(w, http.StatusBadRequest, "trae.json 不存在或无法读取")
+		return
+	}
+	uid := r.PathValue("uid")
+	acc := cfg.AccountByUID(uid)
+	if acc == nil {
+		writeErr(w, http.StatusNotFound, "账号不存在: "+uid)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), traeOpTimeout)
+	defer cancel()
+	sum, err := p.cfg.TraeClient.QueryCredits(ctx, cfg, acc)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "uid": uid, "message": err.Error()})
+		return
+	}
+	// 回写两处：
+	//   1) TraeStats —— 面板「Trae 签到」区块的积分列；
+	//   2) pool —— 账号池页面的积分列与选号权重都读它。
+	// 此前只写了前者，于是账号池里 Trae 账号的积分恒为 0。
+	if sum != nil {
+		if p.cfg.TraeStats != nil {
+			// 先取旧值算余额差（校准用），再写入新值。
+			if prev := p.cfg.TraeStats.Get(uid); prev.HasCredits && prev.CreditsAt != nil {
+				if delta := prev.Credits - sum.General; delta > 0 {
+					log.Printf("[trae] 余额差 acct=%s 上次=%.2f 当前=%.2f 消耗=%.2f",
+						uid, prev.Credits, sum.General, delta)
+				}
+			}
+			p.cfg.TraeStats.NoteCredits(uid, sum.General, sum.Work, sum.Total, sum.Limit)
+		}
+		// 与 CodeBuddy 同口径：credits 存"可用于对话的额度"。
+		// Trae 必须用 General（product_id != 209），不能用 Total——
+		// Total 含 Work 积分，而对话只消耗 IDE 额度，会让快耗尽的号看起来满额。
+		p.applyTraeCreditsToPool(uid, sum)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "credits": sum})
+}
+
+// traeCheckinStatus 返回 Trae 账号的签到状态概览。
+//
+// 统一签到流程后不再有「一轮批量签到的结果列表」——签到结果直接体现在池状态
+// （CheckinDone）里。这里按池状态汇总，与首页那颗「已签」按钮同一口径。
+func (p *Panel) traeCheckinStatus(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Pool == nil {
+		writeErr(w, http.StatusNotImplemented, "pool not available")
+		return
+	}
+	type row struct {
+		UID     string `json:"uid"`
+		Name    string `json:"name"`
+		Status  string `json:"status"`
+		Message string `json:"message"`
+	}
+	rows := make([]row, 0)
+	done := 0
+	for _, st := range p.cfg.Pool.List() {
+		if st.Backend != pool.BackendTrae {
+			continue
+		}
+		r := row{UID: st.UID, Name: st.Nickname}
+		switch {
+		case st.Disabled:
+			r.Status, r.Message = "skipped", "账号已禁用"
+		case st.CheckinDone:
+			r.Status, r.Message = "already", "今日已签到"
+			done++
+		default:
+			r.Status, r.Message = "pending", "今日尚未签到"
+		}
+		rows = append(rows, r)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "total": len(rows), "done": done, "results": rows,
+	})
+}
+
+// poolTraeAccounts 返回「池里未被禁用」的 Trae 账号凭证对象。
+//
+// 账号范围一律以池为准：池是权威列表（增删、禁用、暂停都在池里），trae.json
+// 只是凭证的存放处。直接遍历 cfg.Accounts 会绕过池的状态——例如已在池里禁用
+// 的账号仍会被打上游请求。
+//
+// 过滤规则与调度器一致：Disabled 的跳过（暂停选号不影响，保号任务照常）。
+// 账号对象取自 Pool.AccountsByBackend（与上游无关的池 API），凭证经装配期
+// 注入的 TraeCredential 取回——本包不 import backend/trae 的具体类型。
+func (p *Panel) poolTraeAccounts(cfg *trae.Config) []*trae.Account {
+	if p.cfg.Pool == nil || cfg == nil {
+		return nil
+	}
+	accs := p.cfg.Pool.AccountsByBackend(pool.BackendTrae)
+	out := make([]*trae.Account, 0, len(accs))
+	for _, acc := range accs {
+		if st, ok := p.cfg.Pool.Status(acc.UID()); ok && st.Disabled {
+			continue
+		}
+		if a, ok := p.traeCredential(acc).(*trae.Account); ok && a != nil && a.AccessToken != "" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// traeSyncProfiles 批量从上游拉取昵称并落盘。
+//
+// 为什么需要：Trae 的 JWT 里没有用户名字段，昵称只能来自 GetUserInfo。
+// 登录时已经自动拉过一次，但这个接口用于两类场景：
+//   - 手工导入/历史遗留的账号（当初没有昵称）；
+//   - 用户在上游改了昵称（与 CodeBuddy 的「昵称同步」同语义）。
+//
+// 与 CodeBuddy 的实现对齐：并发受限、失败不影响其它账号、只在变化时写盘。
+//
+// 账号范围取自**账号池**（不是 trae.json）：池才是账号的权威列表，人工在池里
+// 禁用/暂停的账号不该被这里绕过。trae.json 只用来查凭证对象。
+func (p *Panel) traeSyncProfiles(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.TraeClient == nil || p.cfg.TraePath == "" {
+		writeErr(w, http.StatusNotImplemented, "trae client not available")
+		return
+	}
+	cfg, err := trae.Load(p.cfg.TraePath, p.cfg.AuthDir)
+	if err != nil || cfg == nil {
+		writeErr(w, http.StatusBadRequest, "trae.json 不存在或无法读取")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), traeOpTimeout)
+	defer cancel()
+
+	var (
+		mu      sync.Mutex
+		wg      sync.WaitGroup
+		updated int
+		failed  int
+	)
+	sem := make(chan struct{}, 4)
+	for _, acc := range p.poolTraeAccounts(cfg) {
+		wg.Add(1)
+		go func(a *trae.Account) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			info, ierr := p.cfg.TraeClient.GetUserInfo(ctx, cfg, a)
+			if ierr != nil {
+				mu.Lock()
+				failed++
+				mu.Unlock()
+				return
+			}
+			name := strings.TrimSpace(info.Nickname)
+			if name == "" || name == a.Name {
+				return // 取不到或未变化：不写盘
+			}
+			a.Name = name
+			if serr := trae.SaveAccount(cfg.AuthDir, a); serr != nil {
+				log.Printf("WARN: [trae] 昵称落盘失败 %s: %v", a.UID, serr)
+				mu.Lock()
+				failed++
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			updated++
+			mu.Unlock()
+		}(acc)
+	}
+	wg.Wait()
+	if updated > 0 || failed > 0 {
+		log.Printf("[trae] 昵称同步：更新 %d 个，失败 %d 个（未变化不计数）", updated, failed)
+		p.reloadTrae()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "updated": updated, "failed": failed})
+}
+
+// syncTraeCreditsToPool 把 TraeStats 里缓存的积分同步进池。
+//
+// 为什么需要：池的 credits 字段是选号权重的第一因子，也是账号池页面积分列的
+// 数据源。CodeBuddy 由 scheduler 的余额刷新写入，Trae 的积分只能来自
+// GetCredits 接口（chat 流里没有扣费字段，只有 notify_usage 的剩余额度）。
+//
+// 刻意**不发上游请求**：本函数在每次 overview 轮询（5 秒）时被调用，
+// 打上游会白白消耗额度。真正刷新由「余额」按钮或对话中的 notify_usage 触发。
+func (p *Panel) syncTraeCreditsToPool() {
+	if p.cfg.TraeStats == nil || p.cfg.Pool == nil {
+		return
+	}
+	for _, st := range p.cfg.TraeStats.Snapshot() {
+		if !st.HasCredits {
+			continue // 从未查过：保持池里原值（可能是上次进程的持久化数据）
+		}
+		p.cfg.Pool.SetCredits(st.UID, int64(st.Credits), int64(st.CreditsLimit))
+	}
+}
+
+// traeCreditTTL 积分自动刷新的最小间隔。
+//
+// 目的：让账号池页面首次打开就能看到 Trae 积分，同时避免每 5 秒轮询都打上游。
+// 积分变化是分钟级的（对话扣费），5 分钟一次足够，且与 CodeBuddy 的余额
+// 后台刷新间隔同量级。
+const traeCreditTTL = 5 * time.Minute
+
+// traeCreditCache 逐账号积分刷新时刻（防止 overview 高频轮询打爆上游）。
+type traeCreditCache struct {
+	mu sync.Mutex
+	at map[string]time.Time
+}
+
+// refreshTraeCredits 在后台按需刷新 Trae 账号积分（非阻塞）。
+//
+// 由 overview 调用：过期的账号异步查一次，本次响应仍用缓存值（首次会显示 0，
+// 下一个 5 秒轮询就有了）。这样面板加载不会因为等上游而变慢。
+func (p *Panel) refreshTraeCredits() {
+	if p.cfg.TraeClient == nil || p.cfg.TraePath == "" || p.cfg.Pool == nil {
+		return
+	}
+	cfg, err := trae.Load(p.cfg.TraePath, p.cfg.AuthDir)
+	if err != nil || cfg == nil || !cfg.Enabled {
+		return
+	}
+	now := time.Now()
+	p.traeCredit.mu.Lock()
+	if p.traeCredit.at == nil {
+		p.traeCredit.at = make(map[string]time.Time)
+	}
+	var due []*trae.Account
+	// 账号范围取自池（见 poolTraeAccounts）：池里已禁用/已移除的账号不再打上游。
+	for _, a := range p.poolTraeAccounts(cfg) {
+		if now.Sub(p.traeCredit.at[a.UID]) < traeCreditTTL {
+			continue
+		}
+		p.traeCredit.at[a.UID] = now // 先占位，避免并发重复查询
+		due = append(due, a)
+	}
+	p.traeCredit.mu.Unlock()
+	if len(due) == 0 {
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), traeOpTimeout)
+		defer cancel()
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 3)
+		for _, a := range due {
+			wg.Add(1)
+			go func(acc *trae.Account) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				sum, qerr := p.cfg.TraeClient.QueryCredits(ctx, cfg, acc)
+				if qerr != nil || sum == nil {
+					// 失败：清掉占位让下次重试（可能 token 过期需人工处理）。
+					p.traeCredit.mu.Lock()
+					delete(p.traeCredit.at, acc.UID)
+					p.traeCredit.mu.Unlock()
+					return
+				}
+				if p.cfg.TraeStats != nil {
+					p.cfg.TraeStats.NoteCredits(acc.UID, sum.General, sum.Work, sum.Total, sum.Limit)
+				}
+				p.cfg.Pool.SetCredits(acc.UID, int64(sum.General), int64(sum.Limit))
+			}(a)
+		}
+		wg.Wait()
+	}()
+}
+
+// fillTraePackages 把 Trae 的积分包填进「积分构成」的行。
+//
+// 与 CodeBuddy 的差异：
+//   - 包按 product_id 分两类（208/其余 = IDE 通用积分，209 = Work 积分），
+//     面板上分开展示比混成一个数更有用；
+//   - 包是**周期制**（start_time/end_time），到期即失效，与一次性发放的包不同；
+//   - 上游给的是「已用」（usage.credits_amount），剩余 = 额度 - 已用。
+//
+// 失败只标 error 不影响其它账号——与本接口既有语义一致。
+// normalizeTraeTime 把上游的「2026-09-14 15:52:38」转成前端约定形态
+// 「2026-09-14T15:52:38」。
+//
+// 为什么必须转：前端对 created_at 做 slice(0,16).replace('T',' ')，
+// 对 end_time 做 slice(0,10)。原样串里第 10 位是空格而非 'T'，
+// 直接透传会让「发放日期」列显示成 "2026-09-14 15:52" 之外的东西
+// （多余内容被截掉或残留），与 CodeBuddy 的展示对不齐。
+// 解析失败时原样返回，由前端兜底显示。
+func normalizeTraeTime(s string) string {
+	t, ok := trae.ParsePackTime(s)
+	if !ok {
+		return s
+	}
+	return t.Format("2006-01-02T15:04:05")
+}
+
+// traePackExpiresAt 到期时刻的 Unix 毫秒值（前端按它排序与计算剩余天数）。
+// 解析失败返回 0，前端会回落到 EndTime 字符串。
+func traePackExpiresAt(s string) int64 {
+	t, ok := trae.ParsePackTime(s)
+	if !ok {
+		return 0
+	}
+	return t.UnixMilli()
+}
+
+func (p *Panel) fillTraePackages(it *packagesRow, uid string) {
+	if p.cfg.TraeClient == nil || p.cfg.TraePath == "" {
+		it.Error = "trae client not available"
+		return
+	}
+	cfg, err := trae.Load(p.cfg.TraePath, p.cfg.AuthDir)
+	if err != nil || cfg == nil {
+		it.Error = "trae.json 不存在或无法读取"
+		return
+	}
+	acc := cfg.AccountByUID(uid)
+	if acc == nil {
+		it.Error = "account not found in trae.json"
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), traeOpTimeout)
+	defer cancel()
+	sum, qerr := p.cfg.TraeClient.QueryCredits(ctx, cfg, acc)
+	if qerr != nil {
+		it.Error = qerr.Error()
+		return
+	}
+	packs := make([]upstream.CreditPackage, 0, len(sum.Packs))
+	for _, pk := range sum.Packs {
+		name := pk.GroupName
+		if name == "" {
+			name = "积分包"
+		}
+		// 标明 IDE / Work 归属：两者不可互换（对话只消耗 IDE 额度）。
+		if pk.IsWork() {
+			name += "（Work）"
+		} else {
+			name += "（通用）"
+		}
+		packs = append(packs, upstream.CreditPackage{
+			Name:   name,
+			Remain: int64(pk.Remaining()),
+			Used:   int64(pk.CreditsUsed),
+			Size:   int64(pk.CreditsLimit),
+			// 发放日期：Trae 的 StartTime 就是周期起算点（「2026-09-14 15:52:38」）。
+			// 前端按 created_at.slice(0,16) 展示，格式必须一致，否则会显示原样串。
+			CreatedAt: normalizeTraeTime(pk.StartTime),
+			// 到期日期：EndTime 同格式。
+			EndTime: normalizeTraeTime(pk.EndTime),
+			// ExpiresAt 是与 EndTime 同源的毫秒时间戳，供前端按精确剩余天数排序。
+			ExpiresAt: traePackExpiresAt(pk.EndTime),
+		})
+	}
+	it.Packages = packs
+	it.Remain = int64(sum.General) // 可用余额 = 通用积分（不含 Work）
+	it.Size = int64(sum.Limit)
+}
+
+// applyTraeCreditsToPool 把 Trae 的积分与**到期批次**写进池。
+//
+// 为什么不能只调 SetCredits：池里给面板用的还有「积分到期提醒」（首页卡片）
+// 与「积分构成」的到期排布，两者的数据源都是 Status.CreditsExpiryBuckets。
+// 只设余额不设批次，Trae 账号在这两处就永远显示「无近期到期批次」。
+//
+// 转换要点：
+//   - Trae 的包是**周期制**，EndTime 是「2026-09-14 15:52:38」这类上游原样
+//     字符串而非 RFC3339，需要单独解析（ParsePackTime 已处理多种形态）；
+//   - 只统计**通用积分**（product_id != 209）：Work 积分不能用于对话，
+//     混进到期提醒会让用户以为那部分也能抵扣对话；
+//   - 同一自然日的多个包合并成一个批次（与 CodeBuddy 的同口径聚合一致）；
+//   - 已过期或零剩余的包不计入。
+func (p *Panel) applyTraeCreditsToPool(uid string, sum *trae.CreditsSummary) {
+	if p.cfg.Pool == nil || sum == nil {
+		return
+	}
+	p.cfg.Pool.SetCreditsSnapshot(uid, traeCreditsSnapshot(sum, time.Now()))
+}
+
+// traeCreditsSnapshot 把 Trae 的积分包转换成池侧的余额快照。
+//
+// 抽成纯函数是为了可测：转换规则（只算通用积分、同日合并、跳过过期）
+// 每条都是易错的取舍，而 applyTraeCreditsToPool 依赖真实 Panel 与池。
+func traeCreditsSnapshot(sum *trae.CreditsSummary, now time.Time) pool.CreditsSnapshot {
+	snap := pool.CreditsSnapshot{
+		Remain: int64(sum.General),
+		Total:  int64(sum.Limit),
+	}
+	type dayAgg struct {
+		at     time.Time
+		remain int64
+	}
+	byDay := make(map[string]*dayAgg, len(sum.Packs))
+	for _, pk := range sum.Packs {
+		if pk.IsWork() {
+			continue // Work 积分不参与对话抵扣
+		}
+		remain := int64(pk.Remaining())
+		if remain <= 0 {
+			continue
+		}
+		at, ok := trae.ParsePackTime(pk.EndTime)
+		if !ok || !at.After(now) {
+			continue // 无到期时间或已过期：不进入到期提醒
+		}
+		day := at.Format("2006-01-02")
+		if a, exists := byDay[day]; exists {
+			a.remain += remain
+			if at.Before(a.at) {
+				a.at = at
+			}
+			continue
+		}
+		byDay[day] = &dayAgg{at: at, remain: remain}
+	}
+	days := make([]string, 0, len(byDay))
+	for d := range byDay {
+		days = append(days, d)
+	}
+	sort.Strings(days)
+	buckets := make([]pool.ExpiryBucket, 0, len(days))
+	for _, d := range days {
+		a := byDay[d]
+		buckets = append(buckets, pool.ExpiryBucket{
+			Date:     d,
+			ExpireAt: a.at,
+			Remain:   a.remain,
+		})
+	}
+	snap.ExpiryBuckets = buckets
+	if len(buckets) > 0 {
+		snap.EarliestAt = buckets[0].ExpireAt
+		snap.EarliestRemaining = buckets[0].Remain
+		// Expiring = 快过期窗口内的剩余，沿用池侧 7 天口径
+		// （与 CodeBuddy 的 ExpiringSoonWindow 语义对齐）。
+		const soonWindow = 7 * 24 * time.Hour
+		var expiring int64
+		for _, b := range buckets {
+			if b.ExpireAt.Sub(now) <= soonWindow {
+				expiring += b.Remain
+			}
+		}
+		snap.Expiring = expiring
+	}
+	return snap
+}

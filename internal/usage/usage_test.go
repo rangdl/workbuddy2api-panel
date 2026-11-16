@@ -12,11 +12,11 @@ import (
 func TestAddAndTotals(t *testing.T) {
 	r := New("")
 	now := time.Now()
-	r.Add(now, "cn", "uid1", "glm-5.2", Delta{PromptTokens: 100, HasPromptTokens: true, CompletionTokens: 50, HasCompletion: true, Credit: 1.5, HasCredit: true, ModelRate: "0.05", LatencyMs: 200, HasLatency: true}, true)
+	r.Add(now, "codebuddy", "cn", "uid1", "glm-5.2", Delta{PromptTokens: 100, HasPromptTokens: true, CompletionTokens: 50, HasCompletion: true, Credit: 1.5, HasCredit: true, ModelRate: "0.05", LatencyMs: 200, HasLatency: true}, true)
 	// 失败尝试：无 usage → 只计请求数与失败数，token 不加。
-	r.Add(now, "global", "uid1", "claude-4.6", Delta{}, false)
+	r.Add(now, "codebuddy", "global", "uid1", "claude-4.6", Delta{}, false)
 	// 上游没给 total 时用 pt+ct 兜底，保证总量口径连续。
-	r.Add(now, "cn", "uid1", "glm-5.2", Delta{PromptTokens: 10, HasPromptTokens: true, CompletionTokens: 5, HasCompletion: true}, true)
+	r.Add(now, "codebuddy", "cn", "uid1", "glm-5.2", Delta{PromptTokens: 10, HasPromptTokens: true, CompletionTokens: 5, HasCompletion: true}, true)
 
 	s := r.Snapshot(24, nil)
 	if s.Totals.Requests != 3 || s.Totals.Errors != 1 {
@@ -55,9 +55,9 @@ func TestAddAndTotals(t *testing.T) {
 func TestRollupIdempotent(t *testing.T) {
 	r := New("")
 	old := time.Now().AddDate(0, 0, -100) // 100 天前，超出 90 天小时保留
-	r.Add(old, "cn", "u", "m", Delta{PromptTokens: 7, HasPromptTokens: true}, true)
-	r.Add(old, "cn", "u", "m", Delta{PromptTokens: 7, HasPromptTokens: true}, true)
-	r.Add(time.Now(), "cn", "u", "m", Delta{PromptTokens: 1, HasPromptTokens: true}, true)
+	r.Add(old, "codebuddy", "cn", "u", "m", Delta{PromptTokens: 7, HasPromptTokens: true}, true)
+	r.Add(old, "codebuddy", "cn", "u", "m", Delta{PromptTokens: 7, HasPromptTokens: true}, true)
+	r.Add(time.Now(), "codebuddy", "cn", "u", "m", Delta{PromptTokens: 1, HasPromptTokens: true}, true)
 
 	r.Rollup(time.Now())
 	after := r.Snapshot(24, nil)
@@ -87,7 +87,7 @@ func TestRollupIdempotent(t *testing.T) {
 func TestFlushLoadRoundtrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "usage.json")
 	r1 := New(path)
-	r1.Add(time.Now(), "cn", "u1", "glm-5.2", Delta{PromptTokens: 42, HasPromptTokens: true, TotalTokens: 42, HasTotal: true}, true)
+	r1.Add(time.Now(), "codebuddy", "cn", "u1", "glm-5.2", Delta{PromptTokens: 42, HasPromptTokens: true, TotalTokens: 42, HasTotal: true}, true)
 	r1.Save()
 
 	r2 := New(path)
@@ -123,8 +123,8 @@ func TestLoadLegacyWithoutCredit(t *testing.T) {
 func TestCreditSurvivesRollup(t *testing.T) {
 	r := New("")
 	old := time.Now().AddDate(0, 0, -100)
-	r.Add(old, "cn", "u", "m", Delta{PromptTokens: 100, HasPromptTokens: true, TotalTokens: 100, HasTotal: true, Credit: 1.25, HasCredit: true, ModelRate: "0.5"}, true)
-	r.Add(old.Add(2*time.Hour), "cn", "u", "m", Delta{PromptTokens: 300, HasPromptTokens: true, TotalTokens: 300, HasTotal: true, Credit: 3.75, HasCredit: true, ModelRate: "0.5"}, true)
+	r.Add(old, "codebuddy", "cn", "u", "m", Delta{PromptTokens: 100, HasPromptTokens: true, TotalTokens: 100, HasTotal: true, Credit: 1.25, HasCredit: true, ModelRate: "0.5"}, true)
+	r.Add(old.Add(2*time.Hour), "codebuddy", "cn", "u", "m", Delta{PromptTokens: 300, HasPromptTokens: true, TotalTokens: 300, HasTotal: true, Credit: 3.75, HasCredit: true, ModelRate: "0.5"}, true)
 	r.Rollup(time.Now())
 	s := r.Snapshot(0, nil)
 	if s.Totals.Credits != 5 || s.Totals.CreditSamples != 2 || s.Totals.CreditTokens != 400 || s.Totals.CreditsPer1MTokens != 12500 {
@@ -139,9 +139,9 @@ func TestCreditSurvivesRollup(t *testing.T) {
 func TestCreditDimensionsRateGrouping(t *testing.T) {
 	r := New("")
 	now := time.Now()
-	r.Add(now, "cn", "u1", "cn:glm-5.2", Delta{TotalTokens: 100, HasTotal: true, Credit: 1, HasCredit: true, ModelRate: "0.5"}, true)
-	r.Add(now.Add(time.Hour), "cn", "u2", "glm-5.2", Delta{TotalTokens: 200, HasTotal: true, Credit: 2, HasCredit: true, ModelRate: "0.5"}, true)
-	r.Add(now.Add(2*time.Hour), "cn", "u2", "glm-5.2", Delta{TotalTokens: 300, HasTotal: true, Credit: 6, HasCredit: true, ModelRate: "0.8"}, true)
+	r.Add(now, "codebuddy", "cn", "u1", "cn:glm-5.2", Delta{TotalTokens: 100, HasTotal: true, Credit: 1, HasCredit: true, ModelRate: "0.5"}, true)
+	r.Add(now.Add(time.Hour), "codebuddy", "cn", "u2", "glm-5.2", Delta{TotalTokens: 200, HasTotal: true, Credit: 2, HasCredit: true, ModelRate: "0.5"}, true)
+	r.Add(now.Add(2*time.Hour), "codebuddy", "cn", "u2", "glm-5.2", Delta{TotalTokens: 300, HasTotal: true, Credit: 6, HasCredit: true, ModelRate: "0.8"}, true)
 
 	s := r.Snapshot(24, nil)
 	if len(s.CreditByAccount) != 2 || len(s.CreditByModel) != 2 {
@@ -160,8 +160,8 @@ func TestCreditDimensionsRateGrouping(t *testing.T) {
 func TestCreditLegacyRateFallback(t *testing.T) {
 	r := New("")
 	now := time.Now()
-	r.Add(now, "cn", "u1", "glm-5.2", Delta{TotalTokens: 100, HasTotal: true, Credit: 1, HasCredit: true}, true)
-	r.Add(now.Add(time.Hour), "cn", "u1", "glm-5.2", Delta{TotalTokens: 200, HasTotal: true, Credit: 2, HasCredit: true, ModelRate: "0.79"}, true)
+	r.Add(now, "codebuddy", "cn", "u1", "glm-5.2", Delta{TotalTokens: 100, HasTotal: true, Credit: 1, HasCredit: true}, true)
+	r.Add(now.Add(time.Hour), "codebuddy", "cn", "u1", "glm-5.2", Delta{TotalTokens: 200, HasTotal: true, Credit: 2, HasCredit: true, ModelRate: "0.79"}, true)
 
 	s := r.SnapshotWithRates(24, nil, func(realm, model string) string {
 		if realm == "cn" && model == "glm-5.2" {
@@ -180,8 +180,8 @@ func TestCreditLegacyRateFallback(t *testing.T) {
 func TestSnapshotWindowFilter(t *testing.T) {
 	r := New("")
 	now := time.Now()
-	r.Add(now.Add(-48*time.Hour), "cn", "u", "m", Delta{PromptTokens: 5, HasPromptTokens: true}, true) // 窗口(24h)外
-	r.Add(now, "cn", "u", "m", Delta{PromptTokens: 3, HasPromptTokens: true}, true)                    // 窗口内
+	r.Add(now.Add(-48*time.Hour), "codebuddy", "cn", "u", "m", Delta{PromptTokens: 5, HasPromptTokens: true}, true) // 窗口(24h)外
+	r.Add(now, "codebuddy", "cn", "u", "m", Delta{PromptTokens: 3, HasPromptTokens: true}, true)                    // 窗口内
 	s := r.Snapshot(24, nil)
 	if s.Totals.Requests != 1 || s.Totals.PromptTokens != 3 {
 		t.Fatalf("24h 窗口 totals = %d/%d, want 1/3（48h 前的数据应被过滤）", s.Totals.Requests, s.Totals.PromptTokens)
@@ -209,7 +209,7 @@ func TestSnapshotExplicitWindow(t *testing.T) {
 	r := New("")
 	base := time.Now().Truncate(time.Hour).Add(-5 * time.Hour)
 	for i := 0; i < 6; i++ {
-		r.Add(base.Add(time.Duration(i)*time.Hour), "cn", "u", "m",
+		r.Add(base.Add(time.Duration(i)*time.Hour), "codebuddy", "cn", "u", "m",
 			Delta{PromptTokens: 10, HasPromptTokens: true}, true)
 	}
 	// 只取中间两小时（base+2h、base+3h）。
@@ -296,7 +296,7 @@ func TestLifecycleFlush(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "usage.json")
 	r := New(path)
 	r.Start()
-	r.Add(time.Now(), "cn", "u", "m", Delta{PromptTokens: 9, HasPromptTokens: true}, true)
+	r.Add(time.Now(), "codebuddy", "cn", "u", "m", Delta{PromptTokens: 9, HasPromptTokens: true}, true)
 	r.Stop()
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("Stop 后应有落盘文件: %v", err)
@@ -308,12 +308,12 @@ func TestLifecycleFlush(t *testing.T) {
 func TestCacheHitRateAccumulation(t *testing.T) {
 	r := New(t.TempDir() + "/usage.json")
 	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.Local)
-	r.Add(base, "cn", "u1", "glm-5.3", Delta{
+	r.Add(base, "codebuddy", "cn", "u1", "glm-5.3", Delta{
 		PromptTokens: 1000, HasPromptTokens: true,
 		Credit: 1, HasCredit: true, TotalTokens: 1005, HasTotal: true,
 		HasCacheTokens: true, CacheHitTokens: 900, CacheMissTokens: 100,
 	}, true)
-	r.Add(base.Add(time.Minute), "cn", "u1", "glm-5.3", Delta{
+	r.Add(base.Add(time.Minute), "codebuddy", "cn", "u1", "glm-5.3", Delta{
 		PromptTokens: 1000, HasPromptTokens: true,
 		Credit: 2, HasCredit: true, TotalTokens: 1004, HasTotal: true,
 		HasCacheTokens: true, CacheHitTokens: 100, CacheMissTokens: 900,
@@ -331,7 +331,7 @@ func TestCacheHitRateAccumulation(t *testing.T) {
 
 	// 无缓存观测的桶：rate 零值。
 	r2 := New(t.TempDir() + "/usage2.json")
-	r2.Add(base, "cn", "u1", "m", Delta{PromptTokens: 10, HasPromptTokens: true, Credit: 1, HasCredit: true, TotalTokens: 12, HasTotal: true}, true)
+	r2.Add(base, "codebuddy", "cn", "u1", "m", Delta{PromptTokens: 10, HasPromptTokens: true, Credit: 1, HasCredit: true, TotalTokens: 12, HasTotal: true}, true)
 	if got := r2.Snapshot(0, nil).CreditByModel[0].CacheHitRate; got != 0 {
 		t.Fatalf("无缓存观测应 rate=0, got %v", got)
 	}
@@ -342,7 +342,7 @@ func TestCacheTokensPersistRoundtrip(t *testing.T) {
 	dir := t.TempDir()
 	r := New(dir + "/usage.json")
 	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.Local)
-	r.Add(base, "cn", "u1", "m", Delta{
+	r.Add(base, "codebuddy", "cn", "u1", "m", Delta{
 		Credit: 1, HasCredit: true, TotalTokens: 100, HasTotal: true,
 		HasCacheTokens: true, CacheHitTokens: 75, CacheMissTokens: 25,
 	}, true)

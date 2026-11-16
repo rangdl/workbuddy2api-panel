@@ -16,10 +16,10 @@ import (
 
 // Snapshot 一次读取的不可变配置视图。
 type Snapshot struct {
-	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
-	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
-	SanitizeFingerprints bool          // 出站请求体指纹脱敏
-	RecordClientInfo     bool          // 请求日志是否记录调用来源（客户端 IP / UA）
+	APIKey               string              // 网关/面板共同鉴权密钥；空 = 不鉴权
+	SoftCooldown         time.Duration       // 429 软冷却基数（<=0 时调用方回退内置默认）
+	SanitizeFingerprints bool                // 出站请求体指纹脱敏
+	RecordClientInfo     bool                // 请求日志是否记录调用来源（客户端 IP / UA）
 	HiddenModels         map[string]struct{} // 精确隐藏的模型 id（已归一化为 "cn:x"/"global:x" 全量形式）；nil = 不隐藏
 }
 
@@ -51,7 +51,15 @@ func (h *Holder) Store(s Snapshot) { h.p.Store(&s) }
 
 // NormalizeHiddenModels 把用户配置的 hidden 条目归一化为精确 id 集合。
 //
-// 条目带合法 "cn:"/"global:" 前缀 → 只隐藏该域；裸名 → 两域都隐藏。
+// 条目带合法 "cn:"/"global:" 前缀 → 只隐藏该域；带 "trae:cn:"/"trae:global:"
+// 三段式 → 只隐藏该上游该域；裸名 → 两域都隐藏。
+//
+// **归一化只产出两段式 "cn:x"/"global:x"**，因为下游的过滤点（server 的
+// /v1/models 与点名调用）都是按「域 + 裸名」查表的，上游维度在那两处不参与。
+// 三段式条目因此被折算成它对应的两段式——这也是历史缺陷的修法：改造前
+// 三段式会被当成裸名，生成 "cn:trae:cn:x" 这种永远不会命中的垃圾键，
+// 于是 Trae 模型从来没有被真正隐藏过。
+//
 // 大小写敏感（与 internal/server.resolveModel 的前缀规则对称：取第一个 ":",
 // 前段恰为 "cn"/"global" 才剥离）。返回的 map 只读共享，调用方不得修改。
 func NormalizeHiddenModels(hidden []string) map[string]struct{} {
@@ -64,7 +72,11 @@ func NormalizeHiddenModels(hidden []string) map[string]struct{} {
 		if m == "" {
 			continue
 		}
-		if prefix, bare, ok := strings.Cut(m, ":"); ok && (prefix == "cn" || prefix == "global") {
+		// 三段式 "trae:<realm>:<模型>"：剥掉上游段，再按两段式处理。
+		if rest, ok := strings.CutPrefix(m, "trae:"); ok {
+			m = rest
+		}
+		if prefix, bare, ok := strings.Cut(m, ":"); ok && (prefix == "cn" || prefix == "global") && bare != "" {
 			out[prefix+":"+bare] = struct{}{}
 		} else {
 			out["cn:"+m] = struct{}{}

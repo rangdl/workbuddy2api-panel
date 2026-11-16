@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 )
@@ -15,7 +16,7 @@ import (
 func creditPanel(t *testing.T, ledger *credithist.Ledger) *Panel {
 	t.Helper()
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", Nickname: "小明"})
+	p.Add(backendcb.WrapAuth(&auth.Auth{UID: "u1", Nickname: "小明"}))
 	return New(Config{Version: "test", APIKey: "test-key", Pool: p, CreditHistory: ledger})
 }
 

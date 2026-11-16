@@ -18,7 +18,7 @@ var acceptBatchGap = 1050 * time.Millisecond
 
 // accountByUID 取账号凭证；不存在时写 404 并返回 nil。
 func (p *Panel) accountByUID(w http.ResponseWriter, uid string) *auth.Auth {
-	a := p.cfg.Pool.AuthByUID(uid)
+	a := p.codeBuddyCredential(uid)
 	if a == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return nil

@@ -92,20 +92,20 @@ func TestUpgConcurrentFullRefreshLedgerConsistent(t *testing.T) {
 
 	p := pool.New(filepath.Join(dir, "data", "state.json"))
 	t.Cleanup(p.Close)
+	up := &upstream.Client{HTTP: fake.srv.Client(), ChatBaseCN: fake.srv.URL, BillingBaseCN: fake.srv.URL}
 	for _, uid := range uids {
-		p.Add(&auth.Auth{
+		p.Add(cbAccount(up, &auth.Auth{
 			UID:          uid,
 			AccessToken:  "at-" + uid,
 			RefreshToken: "rt-" + uid,
 			ExpiresAt:    time.Now().Add(24 * time.Hour).Unix(),
-		})
+		}))
 		fake.add(uid, 1000)
 	}
 
 	ledger := credithist.New(ledgerPath, 2000)
-	up := &upstream.Client{HTTP: fake.srv.Client(), ChatBaseCN: fake.srv.URL, BillingBaseCN: fake.srv.URL}
 	up.SetCreditObserver(ledger.Observe)
-	s := New(Config{Pool: p, Upstream: up})
+	s := New(Config{Pool: p})
 
 	// 首轮：全部建立基线，0 条流水
 	s.RunBalanceRefreshNow()

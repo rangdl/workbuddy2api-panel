@@ -251,6 +251,37 @@ func TestRepackToolResultBlocks(t *testing.T) {
 		})
 	})
 
+	t.Run("结果之前先出现正文：正文后移", func(t *testing.T) {
+		// Claude Code 中断后继续 / Codex 在调用与结果之间插入消息的形态：
+		// assistant(tool_calls) → user 正文 → tool(结果)。旧实现遇到首条非 tool
+		// 立即 break，原样出站 → 上游 11148。现在把正文挪到结果之后。
+		in := msgs(t, `[
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c00"}]},
+			{"role":"user","content":"继续"},
+			{"role":"tool","tool_call_id":"c00","content":"r0"}
+		]`)
+		out, changed := repackToolResultBlocks(in)
+		if !changed {
+			t.Fatal("changed=false，期望把正文后移")
+		}
+		assertSummary(t, summarize(out), []string{"assistant(c00)", "tool(c00)", "user(-)"})
+	})
+
+	t.Run("本批无结果时不重排", func(t *testing.T) {
+		// 调用被中断、没有回喂结果：插入消息保持原序，调用交给 cleanup 剔除。
+		in := msgs(t, `[
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c00"}]},
+			{"role":"user","content":"换个话题"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c10"}]},
+			{"role":"tool","tool_call_id":"c10","content":"r10"}
+		]`)
+		out, changed := repackToolResultBlocks(in)
+		if changed {
+			t.Error("changed=true，本批无结果时不应重排")
+		}
+		assertSummary(t, summarize(out), []string{"assistant(c00)", "user(-)", "assistant(c10)", "tool(c10)"})
+	})
+
 	t.Run("无可重排内容时零改动", func(t *testing.T) {
 		in := msgs(t, `[
 			{"role":"assistant","content":null,"tool_calls":[{"id":"c00"}]},

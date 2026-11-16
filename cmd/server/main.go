@@ -18,7 +18,10 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
+	backendtrae "github.com/linguo2625469/workbuddy2api-panel/internal/backend/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -27,6 +30,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
@@ -40,6 +44,8 @@ func usagePathFor(stateFile string) string { return stateSibling(stateFile, "usa
 
 // stateSibling 返回与 state 文件同目录的指定文件名路径（相对路径场景回落当前目录）。
 // usage.json（用量记录）与 output_probes.json（模型上限探测）共用本规则。
+// 注意：state 文件属于 data/ 类，副配置（responses/anthropic/...）不走这里，
+// 它们用 configFile 跟随 config/ 目录。
 func stateSibling(stateFile, name string) string {
 	dir := filepath.Dir(stateFile)
 	if dir == "" || dir == "." {
@@ -49,8 +55,22 @@ func stateSibling(stateFile, name string) string {
 }
 
 func main() {
-	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
+	cfgPath := flag.String("config", filepath.Join(configDirName, "config.json"),
+		"配置文件路径（默认 config/config.json；不存在时自动生成推荐配置并创建目录）")
 	flag.Parse()
+
+	// 布局与迁移：必须在 Load 之前。
+	//   - 旧版把配置文件平铺在启动目录，新版收进 config/ 与 data/。
+	//   - 只有用默认路径时才做迁移；显式 -config 是调用方的明确意图，不该被改写。
+	lay := newLayout(*cfgPath)
+	if err := lay.Ensure(); err != nil {
+		log.Printf("WARN: 创建配置目录失败（继续尝试启动）: %v", err)
+	}
+	if *cfgPath == filepath.Join(configDirName, "config.json") {
+		if n := lay.Migrate(); n > 0 {
+			log.Printf("[migrate] 共迁移 %d 个文件到 %s/ 与 %s/（旧文件已保留）", n, lay.ConfigDir, lay.DataDir)
+		}
+	}
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
@@ -72,6 +92,13 @@ func main() {
 			log.Fatalf("load config: %v", err)
 		}
 	}
+	// 副配置补齐：responses / anthropic / third_party / trae 缺失时写默认样例。
+	// 放在主配置加载之后（此时目录已确保存在），各 load*Config 之前。
+	// 上游配置的旧字段迁移必须**先于** ensureAllConfigs：后者会在文件不存在时
+	// 写一份默认 codebuddy.json，一旦写了，迁移就会因"目标文件已存在"而跳过，
+	// 旧配置的上游字段随之全部丢失（静默的配置丢失，最难发现）。
+	migrateLegacyUpstreamConfig(*cfgPath, backendcb.Path(*cfgPath))
+	ensureAllConfigs(*cfgPath)
 
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
@@ -90,8 +117,19 @@ func main() {
 		_ = store.Close()
 	}()
 	p.SetStore(store)
+	// 占位账号工厂：state 恢复时先建条目承载 credits/冷却等数据，真实账号
+	// 要等 SyncToDir 才到位。必须在 RestoreFromSnapshot 之前注入——否则占位
+	// 账号会退化成池里的 bareAccount，backend 分发路径取不到凭证，表现为
+	// 「账号在池里却报 account is not a CodeBuddy auth」。
+	p.SetPlaceholderFactory(func(backend, uid string) gateway.Account {
+		if backend == pool.BackendTrae {
+			return backendtrae.Placeholder(uid)
+		}
+		return backendcb.Placeholder(uid)
+	})
+	// 账号入池推迟到 upstream.Client 构造之后（见下方 syncCodeBuddyAccountsToPool）：
+	// 账号对象要持有 client 才能自己实现 Credits/Checkin/Keepalive。
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
-	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
 
 	// 熔断器 + 在途上限（含 global 分档）+ 连败降权 + 闲置补偿调优（从 config 注入，
 	// 非正值回退默认）。
@@ -136,6 +174,15 @@ func main() {
 
 	up := upstream.New()
 
+	// CodeBuddy 上游配置（codebuddy.json）。缺失时返回内置默认——
+	// 上游配置独立成文件后，主配置不再承载任何上游专有字段。
+	cbCfg := loadCodeBuddyConfig(*cfgPath)
+
+	// CodeBuddy 账号入池：账号对象持有 client，Credits/Checkin/Keepalive 由它
+	// 自己实现，池与调度器都不需要认识 upstream 包。
+	// 与 auths/ 目录对齐：新账号加入、已删除文件账号剔除（状态保留）。
+	p.SyncToDir(backendcb.WrapWithClient(auths, up, func() time.Duration { return cfg.ExpiringSoonDur }))
+
 	// 积分保底的「收费」兜底判据：接上游模型目录的积分倍率表。本地实测台账无观测
 	// 时用它判收费——否则「没学过」恒等于「放行」，高价新模型会把触底号一笔打穿
 	// （kimi-k3-1 实案：全池无观测 → 保底全放行 → 两笔打穿并硬冷却到次日 04:00）。
@@ -144,31 +191,38 @@ func main() {
 
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
-	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
+	// 聊天 SSE 首字节前（响应头）上限：cbCfg 已 normalize（缺省回落 timeout_seconds）。
 	up.HeaderTimeout = time.Duration(cfg.Upstream.HeaderTimeoutSeconds) * time.Second
 	if tr, ok := up.ChatHTTP.Transport.(*http.Transport); ok {
 		tr.ResponseHeaderTimeout = up.HeaderTimeout
 	}
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
-	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
+	up.SanitizeFingerprints.Store(cbCfg.SanitizeBlacklistFingerprints)
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
 	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
-	up.UserAgent = cfg.Upstream.UserAgent
-	up.ClientVersion = cfg.Upstream.ClientVersion
-	up.CliVersion = cfg.Upstream.CliVersion
-	up.ClientName = cfg.Upstream.ClientName
-	up.DeviceToken = cfg.Upstream.DeviceToken
-	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
-	up.PassthroughIP = cfg.Upstream.PassthroughIP
-	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
-	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
-	up.GlobalEnabled = cfg.Global.Enabled
-	up.ChatBaseGlobal = cfg.Global.ChatBase
-	up.BillingBaseGlobal = cfg.Global.BillingBase
-	applyCNChatBase(up, cfg)
-	auth.SetGlobalEnabled(cfg.Global.Enabled)
+	up.UserAgent = cbCfg.UserAgent
+	up.ClientVersion = cbCfg.ClientVersion
+	up.CliVersion = cbCfg.CliVersion
+	up.ClientName = cbCfg.ClientName
+	up.DeviceToken = cbCfg.DeviceToken
+	up.DeviceTokenFile = cbCfg.DeviceTokenFile
+	up.PassthroughIP = cbCfg.PassthroughIP
+	// global realm 路由（codebuddy.json 的 global 段）：上游侧开关（第一道闸）
+	// + base 覆盖；auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同源。
+	up.GlobalEnabled = cbCfg.Global.Enabled
+	// 空 = 不覆盖，让 upstream client 用内置默认（global 默认 www.workbuddy.ai）。
+	if b := cbCfg.ChatBaseFor("global"); b != backendcb.DefaultChatBaseGlobal {
+		up.ChatBaseGlobal = b
+	}
+	if b := cbCfg.BillingBaseFor("global"); b != backendcb.DefaultChatBaseGlobal {
+		up.BillingBaseGlobal = b
+	}
+	if b := cbCfg.ChatBaseFor("cn"); b != backendcb.DefaultChatBaseCN {
+		up.ChatBaseCN = b
+	}
+	auth.SetGlobalEnabled(cbCfg.Global.Enabled)
 	// DNS：Android 没有 /etc/resolv.conf，Go 的纯 Go 解析器会退回 127.0.0.1/::1，
 	// 于是查任何域名都变成"连本机 53 端口"（dial tcp: lookup copilot.tencent.com
 	// on [::1]:53: connection refused）。配了 dns_servers / WB2A_DNS 就显式指定。
@@ -182,13 +236,12 @@ func main() {
 		log.Printf("DNS: 出站解析用 %v（不走系统 /etc/resolv.conf）", cfg.DNSServers)
 	}
 	// model.json 本地缓存接线（context_length/max_output_tokens 四级查找链第 3 级）：
-	// 数据目录与 state.json 同风格（Docker volume 持久化路径）。首次缺失/损坏自动
-	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
-	upstream.SetModelCatalogPath(stateSibling(cfg.StateFile, "model.json"))
+	// 归到 config/ 而不是 data/——它虽是缓存，但用户会手改模型上限，属于「人读人改」类。
+	// 首次缺失/损坏自动回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
+	upstream.SetModelCatalogPath(lay.File(lay.ConfigDir, "model.json"))
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
-		Upstream:       up,
 		CheckinHours:   cfg.Schedule.CheckinHours,
 		TravelHours:    cfg.Schedule.TravelHours,
 		ActivityHours:  cfg.Schedule.ActivityHours,
@@ -198,6 +251,7 @@ func main() {
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
 		ExpiringSoonWindow: cfg.ExpiringSoonDur,
 		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
+		CheckinBackends:    cfg.Schedule.CheckinBackends,
 		TravelDisabled:     !cfg.Schedule.TravelEnabled,
 		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
 		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
@@ -206,6 +260,8 @@ func main() {
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
 	})
+	// 能量盲盒（缺省关闭）：独立 setter 挂载，避免继续膨胀 Reconfigure 的位置参数。
+	sch.SetTravelBlindbox(cfg.Schedule.TravelBlindboxEnabled, cfg.Schedule.TravelBlindboxMaxPerRun)
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
 		log.Printf("签到已禁用（schedule.checkin_enabled=false）")
@@ -216,7 +272,13 @@ func main() {
 	case !cfg.Schedule.TravelEnabled:
 		log.Printf("猫猫旅行已禁用（schedule.travel_enabled=false）")
 	default:
-		log.Printf("猫猫旅行已启用：%v 点（独立排程：领养 / 派出 / 领奖）", cfg.Schedule.TravelHours)
+		log.Printf("猫猫旅行已启用：%v 点（固定兜底）+ 到站定时器（按 arrive_at 精确唤醒）", cfg.Schedule.TravelHours)
+	}
+	switch {
+	case !cfg.Schedule.TravelBlindboxEnabled:
+		log.Printf("Buddy 能量盲盒自动开盒已禁用（schedule.travel_blindbox_enabled=false；面板「开能量盲盒」按钮可手工触发）")
+	default:
+		log.Printf("Buddy 能量盲盒已启用：每账号单趟至多 %d 次（消耗 energy，猫 idle 时执行）", cfg.Schedule.TravelBlindboxMaxPerRun)
 	}
 	switch {
 	case !cfg.Schedule.ActivityEnabled:
@@ -257,7 +319,7 @@ func main() {
 	live := livecfg.New(livecfg.Snapshot{
 		APIKey:               cfg.APIKey,
 		SoftCooldown:         cfg.SoftRateDur,
-		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
+		SanitizeFingerprints: cbCfg.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
 	})
@@ -285,6 +347,37 @@ func main() {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
 	}
 
+	// Trae 上游（可选；trae.json 缺失或 enabled=false 时不启用）。
+	// 冷却表在 main 构造：面板与 handler 需共用同一实例（前者展示、后者读写）。
+	traeCfg := loadTraeConfig(*cfgPath, cfg.AuthDir)
+	traeClient := trae.NewClient()
+	// 传输层超时与 CodeBuddy 共用同一份配置（config.json 的 upstream 段）：
+	// 两个上游的对话都是 SSE 长连接，首字节与流中空闲的语义完全相同。
+	// 此前 Trae 的首字节超时是硬编码常量、流中空闲完全没有监控。
+	traeClient.SetTimeouts(
+		time.Duration(cfg.Upstream.HeaderTimeoutSeconds)*time.Second,
+		time.Duration(cfg.Upstream.IdleTimeoutSeconds)*time.Second,
+	)
+	// Trae 的账号对象要能读到**当前**配置（热重载后换 base / 改设备号）。
+	traeConfigFn := func() *trae.Config {
+		tcfg, err := trae.Load(trae.ConfigPath(*cfgPath), cfg.AuthDir)
+		if err != nil || tcfg == nil {
+			return nil
+		}
+		tcfg.SaveAccount = saveTraeAccountFunc(tcfg.AuthDir)
+		return tcfg
+	}
+	// Trae 运行期计数：面板展示与 handler 记账必须是同一实例，所以在这里构造，
+	// 并在账号入池前注入（账号自己实现 StreamLifecycle / RemainObserver）。
+	traeStats := trae.NewStats()
+	// Trae 账号合进同一个池：选号时按 backend 维度区分上游。
+	// 必须在 handler 构造之前完成，否则启动初期的请求选不到 Trae 号。
+	if n := syncTraeAccountsToPool(p, traeCfg, traeClient, traeConfigFn, traeStats); n > 0 {
+		log.Printf("[trae] 已同步 %d 个账号进调度池", n)
+	}
+	traeCool := trae.NewCooldowns()
+	// handlerRef 供面板热重载闭包引用（panel 先于 handler 构造，闭包在保存时才调用）。
+	var handlerRef *server.Handler
 	// 积分历史：把每次真实查到的余额与上一次比对，变动即留痕（新账号首次只建
 	// 基线）。挂载在余额查询路径上（upstream 的余额观察者），签到 / 活跃上报 /
 	// 旅行 / 保活 / 面板手动刷新全覆盖——上游只在少数渠道落金额日志，比对余额
@@ -309,6 +402,42 @@ func main() {
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
 		ConfigPath: *cfgPath,
+		// Trae 上游：配置 + 登录 + 设备凭证导入 + 冷却状态展示。
+		CodeBuddyPath: backendcb.Path(*cfgPath),
+		TraePath:      trae.ConfigPath(*cfgPath),
+		TraeClient:    traeClient,
+		TraeCooldowns: traeCool,
+		TraeStats:     traeStats,
+		// 装配期注入上游包装/凭证访问：panel 不 import 具体 backend，
+		// 新增一个可登录的上游时只改这里。
+		WrapAccount: func(a *auth.Auth) []gateway.Account {
+			// expiringSoon 用闭包读调度器当前窗口：配置热改后立即生效，
+			// 不能在构造时取一次快照。
+			return backendcb.WrapWithClient([]*auth.Auth{a}, up, func() time.Duration {
+				return sch.ExpiringSoonWindow()
+			})
+		},
+		CredentialFor: func(uid string) *auth.Auth {
+			return backendcb.UnwrapAuth(p.Account(uid))
+		},
+		TraeCredential: func(acc gateway.Account) any {
+			if a := backendtrae.Unwrap(acc); a != nil {
+				return a
+			}
+			return nil
+		},
+		ReloadTrae: func() error {
+			if handlerRef == nil {
+				return nil
+			}
+			tcfg := loadTraeConfig(*cfgPath, cfg.AuthDir)
+			handlerRef.SetTraeConfig(tcfg)
+			// 账号变化（登录/删除/禁用）要反映到池里，否则新号选不到、
+			// 删掉的号还会被选中。
+			syncTraeAccountsToPool(p, tcfg, traeClient, traeConfigFn, traeStats)
+			removeStaleTraeAccounts(p, tcfg, traeClient)
+			return nil
+		},
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
@@ -327,9 +456,36 @@ func main() {
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
+	// 多上游注册表：CodeBuddy 始终注册（它是默认链路）；Trae 按 trae.json 的
+	// enabled 开关参与——Enabled() 运行期读配置，面板热重载后即时生效。
+	backends := gateway.NewRegistry()
+	// 降级状态机：backend 的 RetryHook 与 Handler 必须共享同一实例
+	//（后者用它判断「降级期直达 Degraded 提示词」）。
+	degradeGate := server.NewDegradeGate()
+	// PromptMode 缺省与 server.NewHandler 保持一致（custom）：两处取值不同会让
+	// RetryHook 的「只在 passthrough/append 降级重试」判断失效。
+	promptMode := cfg.Prompt.Mode
+	if promptMode == "" {
+		promptMode = "custom"
+	}
+	backends.Register(server.NewCodeBuddyBackend(up, func() bool { return true },
+		func() ([]*auth.Auth, error) { return auth.LoadDir(cfg.AuthDir) },
+		degradeGate, promptMode))
+	backends.Register(backendtrae.New(traeClient, func() *trae.Config {
+		tcfg, err := trae.Load(trae.ConfigPath(*cfgPath), cfg.AuthDir)
+		if err != nil {
+			return nil
+		}
+		return tcfg
+	}))
+
+	// Trae 原始事件转储（TRAE_RAW_DUMP=1 时开启，排障用）。
+	server.InitTraeRawDump()
+
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
+		Backends:     backends,
 		APIKey:       cfg.APIKey,
 		Session:      sessRouter,
 		StickyCount:  sessCount,
@@ -340,20 +496,31 @@ func main() {
 		Usage:        rec,
 		RequestLog:   requestLog,
 		PromptMode:   cfg.Prompt.Mode,
+		DegradeGate:  degradeGate,
 		PromptText:   cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
-		GlobalEnabled: cfg.Global.Enabled,
+		GlobalEnabled: cbCfg.Global.Enabled,
+		// Trae 上游：同样独立，与 /v1/* 互不影响。
+		Trae:          traeCfg,
+		TraeClient:    traeClient,
+		TraeCooldowns: traeCool,
+		TraeStats:     traeStats,
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
 		// Live 为 nil 的裸用/测试路径。
 		ModelsHidden: cfg.Models.Hidden,
 	})
+	handlerRef = h
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	// 猫猫旅行到站定时器：按各账号 travel/status 的 arrive_at 精确唤醒（固定 hours
+	// 只作兜底）。首轮自带启动补跑，覆盖关机期间已到站未领的行程。
+	go sch.RunTravelTimer(ctx)
+	// Trae 签到调度（独立于 CodeBuddy 的 scheduler：两者账号体系与排程配置互不相干）。
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
 
@@ -411,7 +578,7 @@ func warmModelRates(ctx context.Context, up *upstream.Client, p *pool.Pool) {
 	}
 	// CN：有可用 CN 账号才拉（与面板 models 同口径，避免无谓上游调用）。
 	if uids := p.AvailableUIDsForRealm("cn"); len(uids) > 0 {
-		if a := p.AuthByUID(uids[0]); a != nil {
+		if a := backendcb.UnwrapAuth(p.Account(uids[0])); a != nil {
 			if _, err := up.FetchModels(a); err != nil {
 				log.Printf("WARN: [upstream] warm model rates (cn): %v", err)
 			} else {
@@ -422,7 +589,7 @@ func warmModelRates(ctx context.Context, up *upstream.Client, p *pool.Pool) {
 	// global：独立目录端点（workbuddy.ai），倍率按 "global" 域键存储。
 	if up.GlobalEnabled && ctx.Err() == nil {
 		if uids := p.AvailableUIDsForRealm("global"); len(uids) > 0 {
-			if a := p.AuthByUID(uids[0]); a != nil {
+			if a := backendcb.UnwrapAuth(p.Account(uids[0])); a != nil {
 				// FetchGlobalModelInfos 无错误返回（内部负缓存自行节流），
 				// 仅按结果条数判断是否拿到目录。
 				if infos := up.FetchGlobalModelInfos(a); len(infos) == 0 {
@@ -460,6 +627,13 @@ func panelListenPath(listen string) string {
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
 func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+	// 上游专有字段已不在 config.json 里，但它们仍需参与"保存后热应用"：
+	// 从磁盘重新读一次 codebuddy.json。面板对上游配置的写入走
+	// /panel/api/codebuddy_config，这里只关心脱敏开关的热生效。
+	cbCfg, cbErr := backendcb.Load(backendcb.Path(path))
+	if cbErr != nil {
+		cbCfg = backendcb.Default()
+	}
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -522,11 +696,11 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
 		SoftCooldown:         newCfg.SoftRateDur,
-		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
+		SanitizeFingerprints: cbCfg.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 	})
-	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	up.SanitizeFingerprints.Store(cbCfg.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
@@ -549,16 +723,10 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+	sch.SetTravelBlindbox(newCfg.Schedule.TravelBlindboxEnabled, newCfg.Schedule.TravelBlindboxMaxPerRun)
+	sch.SetCheckinBackends(newCfg.Schedule.CheckinBackends) // 分上游自动签到开关热生效
 
 	return restartRequiredFields(newCfg), nil
-}
-
-// applyCNChatBase 把 config cn.chat_base 装配进上游 client；空则保留内置默认，
-// 老配置（无 cn 段）行为不变。
-func applyCNChatBase(up *upstream.Client, cfg *Config) {
-	if cfg.CN.ChatBase != "" {
-		up.ChatBaseCN = cfg.CN.ChatBase
-	}
 }
 
 // restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。
@@ -575,13 +743,11 @@ func restartRequiredFields(c *Config) []string {
 	if c.StateFile != "" {
 		out = append(out, "state_file")
 	}
+	// 传输层超时：装配期写进 HTTP client，之后不再读取。
 	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds")
-	// upstream.user_agent 在装配期被写进出站 client（main.go 的 up.UserAgent = ...），
-	// 之后不再读取——不在 livecfg 热快照里，也无法热改。此前漏列，导致面板改完
-	// 显示"已保存"却不提示需要重启，用户以为没生效（issue #102 附带发现 2）。
-	out = append(out, "upstream.user_agent")
-	// cn.chat_base 同样只在装配期写进 up.ChatBaseCN（请求路径并发读取，不做热改）。
-	out = append(out, "cn.chat_base")
+	// 注意 upstream.user_agent 与 cn/global.chat_base **不在这里**：
+	// 它们已迁到 codebuddy.json，由 /panel/api/codebuddy_config 负责提示重启。
+	// 列在这里会对一个 config.json 里不存在的字段报警，误导用户去改错地方。
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}

@@ -30,6 +30,10 @@ import "strings"
 //	assistant tool_calls=[c00 c01] | tool c00 | X | tool c01
 //	→ assistant tool_calls=[c00 c01] | tool c00 | tool c01 | X
 //
+// 结果之前就出现的正文（assistant(tool_calls) → user 文本 → tool 结果）同样被挪到
+// 结果之后——Claude Code 中断后继续、Codex 在 function_call 与输出之间插入消息都会
+// 产生该形态；本批扫不到任何结果时保持原序（调用交给 cleanupOrphanToolCalls 剔除）。
+//
 // 结果顺序保持不变（同批 tool_call 的原相对顺序 = 结果顺序），不引入新的顺序敏感
 // 问题。无插入消息时零改动零分配（返回原 slice）。
 func repackToolResultBlocks(messages []any) ([]any, bool) {
@@ -65,7 +69,6 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
 		i++
 		var results []any
 		var between []any
-		sawNonTool := false
 		for i < len(messages) {
 			mm, ok := messages[i].(map[string]any)
 			if !ok {
@@ -78,14 +81,8 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
 					break
 				}
 				results = append(results, messages[i])
-				if sawNonTool {
-					changed = true
-				}
 				i++
 				continue
-			}
-			if len(results) == 0 {
-				break // assistant 后没有结果：交由 cleanupOrphanToolCalls 处理
 			}
 			// 下一组 assistant.tool_calls 是新的组头，绝不能当插入物吞掉：一旦被收进
 			// between，它永远不再被外层循环当作组头处理，它自己那批结果也就永远得不
@@ -95,13 +92,29 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
 					break
 				}
 			}
-			// 同批结果尚未收齐时，中间消息视为插入物，暂存待后移。
+			// 结果之前/之间出现的非 tool 消息都视为插入物，暂存待后移。
+			//
+			// 此前这里在「首条不是 tool」时直接 break：于是
+			//   assistant(tool_calls) → user 文本 → tool(结果)
+			// 原样出站，上游判 11148 顶死整条会话。该形态来自两类客户端——
+			// Claude Code 中断工具调用后继续（tool_result 与 text 同条 user 消息）、
+			// Codex 在 function_call 与 function_call_output 之间插入消息。
+			// 改为继续向后扫：本批结果出现就把插入物移到结果之后；扫不到结果
+			// （调用被中断、没有回喂）则保持原序，不重排。
 			between = append(between, messages[i])
-			sawNonTool = true
 			i++
+		}
+		if len(results) == 0 {
+			// 无本批结果：不重排，按原序输出已消费的插入物；调用本身随后由
+			// cleanupOrphanToolCalls 剔除。
+			out = append(out, between...)
+			continue
 		}
 		out = append(out, results...)
 		out = append(out, between...)
+		if len(between) > 0 {
+			changed = true
+		}
 	}
 	if !changed {
 		return messages, false

@@ -16,15 +16,15 @@ import (
 // 且带出账号数、最早解封时间与上游原因。
 func TestModelBlockedAllAccountsCooled(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	base := time.Now()
 	// 两个号对同一模型都有冷却，解封时间不同 → 应取最早的。
 	p.mu.Lock()
-	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+	p.byUID["codebuddy:u1"].modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: base.Add(2 * time.Hour), Reason: "11102 model [glm-5.3] service info not found"},
 	}
-	p.byUID["u2"].modelCooldowns = map[string]modelCooldown{
+	p.byUID["codebuddy:u2"].modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: base.Add(1 * time.Hour), Reason: "11102 model [glm-5.3] service info not found"},
 	}
 	p.mu.Unlock()
@@ -49,10 +49,10 @@ func TestModelBlockedAllAccountsCooled(t *testing.T) {
 // ——否则会把「在途占满/积分保底」导致的选号失败误报成模型问题。
 func TestModelBlockedOneAccountStillServes(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.mu.Lock()
-	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+	p.byUID["codebuddy:u1"].modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: time.Now().Add(time.Hour), Reason: "11102 ..."},
 	}
 	p.mu.Unlock()
@@ -62,7 +62,7 @@ func TestModelBlockedOneAccountStillServes(t *testing.T) {
 	}
 	// 但 u2 对该模型无冷却这一点必须是真的（防止测试自身构造错误）。
 	p.mu.RLock()
-	cooled := p.byUID["u2"].modelCooled(time.Now(), "glm-5.3")
+	cooled := p.byUID["codebuddy:u2"].modelCooled(time.Now(), "glm-5.3")
 	p.mu.RUnlock()
 	if cooled {
 		t.Fatalf("测试构造有误：u2 不该对该模型冷却")
@@ -73,9 +73,9 @@ func TestModelBlockedOneAccountStillServes(t *testing.T) {
 // 掩盖本域全锁：global 两个号都被 11158 锁住时，即使 CN 号未锁也应返回 Blocked。
 func TestModelBlockedForRealmIgnoresOtherRealm(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"})
-	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
-	p.Add(&auth.Auth{UID: "g2", Domain: "www.workbuddy.ai"})
+	p.Add(WrapAuth(&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "g2", Domain: "www.workbuddy.ai"}))
 	p.BlockModelBackoff("g1", "gpt-5.6-sol", "11158 model not allowed for account type")
 	p.BlockModelBackoff("g2", "gpt-5.6-sol", "11158 model not allowed for account type")
 
@@ -103,13 +103,13 @@ func TestModelBlockedForRealmIgnoresOtherRealm(t *testing.T) {
 // 既不构成"还能服务"的证明，也不该被算进被挡账号数。
 func TestModelBlockedDisabledDoesNotCount(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.mu.Lock()
-	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+	p.byUID["codebuddy:u1"].modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: time.Now().Add(time.Hour), Reason: "11102 ..."},
 	}
-	p.byUID["u2"].disabled = true // 唯一还能服务的号被禁用了
+	p.byUID["codebuddy:u2"].disabled = true // 唯一还能服务的号被禁用了
 	p.mu.Unlock()
 
 	st := p.ModelBlocked("glm-5.3")
@@ -125,9 +125,9 @@ func TestModelBlockedDisabledDoesNotCount(t *testing.T) {
 // ——口径必须与选号的 modelCooled 一致，否则会把"其实能调"的模型报成不可用。
 func TestModelBlockedAuditOnlyNotBlocking(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.mu.Lock()
-	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+	p.byUID["codebuddy:u1"].modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: time.Now().Add(time.Hour), Reason: "audit", AuditOnly: true},
 	}
 	p.mu.Unlock()
@@ -140,9 +140,9 @@ func TestModelBlockedAuditOnlyNotBlocking(t *testing.T) {
 // TestModelBlockedExpiredNotBlocking 已过期的冷却不算阻塞。
 func TestModelBlockedExpiredNotBlocking(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	p.mu.Lock()
-	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+	p.byUID["codebuddy:u1"].modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: time.Now().Add(-time.Minute), Reason: "11102 ..."},
 	}
 	p.mu.Unlock()
@@ -161,7 +161,7 @@ func TestModelBlockedEmptyInputs(t *testing.T) {
 		t.Fatalf("空池不应判定为模型阻塞：%+v", st)
 	}
 	// 空模型名
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 	if st := p.ModelBlocked(""); st.Blocked {
 		t.Fatalf("空模型名不应判定为模型阻塞：%+v", st)
 	}
@@ -171,7 +171,7 @@ func TestModelBlockedEmptyInputs(t *testing.T) {
 // BlockModelClear 清除后应恢复——覆盖真实的写入/清除通道，而不是只手搓 map。
 func TestModelBlockedThenClear(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
 
 	p.BlockModelBackoff("u1", "glm-5.3", "11102 model [glm-5.3] service info not found")
 	st := p.ModelBlocked("glm-5.3")
@@ -193,13 +193,13 @@ func TestModelBlockedThenClear(t *testing.T) {
 // 否则一个暂停的健康号会掩盖「其余号全被模型级冷却挡住」）。
 func TestModelBlockedPausedDoesNotMaskBlock(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(WrapAuth(&auth.Auth{UID: "u1"}))
+	p.Add(WrapAuth(&auth.Auth{UID: "u2"}))
 	p.mu.Lock()
-	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+	p.byUID["codebuddy:u1"].modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: time.Now().Add(time.Hour), Reason: "11102 ..."},
 	}
-	p.byUID["u2"].paused = true // 唯一「健康」的号在暂停让位
+	p.byUID["codebuddy:u2"].paused = true // 唯一「健康」的号在暂停让位
 	p.mu.Unlock()
 
 	st := p.ModelBlocked("glm-5.3")

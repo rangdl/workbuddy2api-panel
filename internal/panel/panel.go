@@ -11,7 +11,9 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -23,11 +25,13 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
@@ -69,6 +73,34 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// CodeBuddyPath codebuddy.json 路径（配置页的 WorkBuddy 上游区块读写用；
+	// 空 = 不提供该接口）。
+	CodeBuddyPath string
+	// TraePath trae.json 路径（配置页的 Trae 上游区块读写用；空 = 不提供该接口）。
+	TraePath string
+	// ReloadTrae 保存 trae.json 后触发热重载（由 main 注入）。
+	ReloadTrae func() error
+	// TraeClient Trae 上游客户端（OAuth 换取 token 用；nil = 登录接口返回 501）。
+	TraeClient *trae.Client
+	// TraeCooldowns Trae 账号冷却表（展示与清理用；nil = 不展示冷却信息）。
+	// 与 server 侧共用同一实例。
+	TraeCooldowns *trae.Cooldowns
+	// TraeStats Trae 账号运行期计数（成功/失败/在途/用量展示用）。
+	// 与 server 侧共用同一实例；nil = 不展示运行期统计。
+	TraeStats *trae.Stats
+
+	// ── 装配期注入的上游包装/凭证访问（面板不 import 具体 backend）──
+
+	// WrapAccount 把 CodeBuddy 账号包装成带能力的池账号（登录/导入后入池用）。
+	// nil = 不入池（测试裸用；调用方自行 pool.Add）。
+	WrapAccount func(a *auth.Auth) []gateway.Account
+	// CredentialFor 按 uid 取 CodeBuddy 原始凭证（成长任务/余额/积分包接口）。
+	// nil = 这些接口视为账号不存在。
+	CredentialFor func(uid string) *auth.Auth
+	// TraeCredential 从池账号取 Trae 原始凭证（签到/积分查询/补签）。
+	// nil = 视为不是 Trae 账号。
+	TraeCredential func(acc gateway.Account) any
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -83,6 +115,12 @@ type Panel struct {
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
 	loginMu sync.Mutex
 	logins  map[string]loginSession
+
+	// traeCheckin Trae 逐账号签到状态缓存（见 trae_config.go 的
+	// fillTraeCheckinStatus）：切视图会重新拉配置，缓存避免重复打上游。
+	traeCheckin traeCheckinCache
+	// traeCredit Trae 积分自动刷新的节流表（见 trae_ops.go 的 refreshTraeCredits）。
+	traeCredit traeCreditCache
 
 	// taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 	// （单任务 / 全量）同时只允许一条在跑。重复点击直接返回 409"仍在执行"，
@@ -152,7 +190,7 @@ func (p *Panel) Logs() *Ring { return p.logs }
 
 func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
-	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
+	p.mux.HandleFunc("GET /panel/js/{name}", p.jsScript)
 	p.mux.HandleFunc("GET /panel/mobile.css", p.mobileStyle)
 	p.mux.HandleFunc("GET /panel/mobile.js", p.mobileScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
@@ -184,6 +222,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
+	p.mux.HandleFunc("POST /panel/api/blindbox_all", p.withAuth(p.blindboxAll))
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
@@ -193,6 +232,19 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	p.mux.HandleFunc("GET /panel/api/codebuddy_config", p.withAuth(p.getCodeBuddyConfig))
+	p.mux.HandleFunc("POST /panel/api/codebuddy_config", p.withAuth(p.saveCodeBuddyConfig))
+	p.mux.HandleFunc("GET /panel/api/trae_config", p.withAuth(p.getTraeConfig))
+	p.mux.HandleFunc("POST /panel/api/trae_config", p.withAuth(p.saveTraeConfig))
+	p.mux.HandleFunc("POST /panel/api/trae/import", p.withAuth(p.importTraeDevice))
+	p.mux.HandleFunc("POST /panel/api/trae/login/start", p.withAuth(p.traeLoginStart))
+	p.mux.HandleFunc("POST /panel/api/trae/login/finish", p.withAuth(p.traeLoginFinish))
+	p.mux.HandleFunc("POST /panel/api/trae/accounts/{uid}/remove", p.withAuth(p.removeTraeAccount))
+	p.mux.HandleFunc("POST /panel/api/trae/checkin_all", p.withAuth(p.traeCheckinAll))
+	p.mux.HandleFunc("POST /panel/api/trae/sync_profiles", p.withAuth(p.traeSyncProfiles))
+	p.mux.HandleFunc("POST /panel/api/trae/accounts/{uid}/checkin", p.withAuth(p.traeAccountCheckin))
+	p.mux.HandleFunc("POST /panel/api/trae/accounts/{uid}/credits", p.withAuth(p.traeAccountCredits))
+	p.mux.HandleFunc("GET /panel/api/trae/checkin_status", p.withAuth(p.traeCheckinStatus))
 	p.mux.HandleFunc("GET /panel/api/compensation", p.withAuth(p.compensation))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/compensation", p.withAuth(p.accountCompensationClaim))
 	p.mux.HandleFunc("POST /panel/api/compensation_all", p.withAuth(p.compensationAll))
@@ -255,6 +307,11 @@ func poolExpiryBuckets(in []upstream.ExpiryBucket) []pool.ExpiryBucket {
 func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	// 用 WithPaused 而不是 CountsDetailed：后者把暂停号并进 disabled（/status 的
 	// 「不可用」口径），而概况卡片要分开展示（issue #125）。
+	// 把 Trae 账号的已知积分同步进池（不发上游请求，只用 TraeStats 里已有的
+	// 缓存值）。没有这一步，Trae 账号在账号池页面恒显示 0——它的积分来自
+	// GetCredits 接口，而池的 credits 字段只有 CodeBuddy 的余额刷新在写。
+	p.syncTraeCreditsToPool()
+	p.refreshTraeCredits()
 	total, healthy, cooling, disabled, paused, inFlightFull := p.cfg.Pool.CountsDetailedWithPaused()
 	sticky := 0
 	if p.cfg.StickyCount != nil {
@@ -278,8 +335,8 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"model_locks": p.cfg.Pool.ModelLockView(),
 		// 到期提醒快照的节奏与年龄：界面轮询是 5 秒级，但卡片数据只随余额后台刷新
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
-		"balance_refresh_sec":    p.balanceRefreshSec(),
-		"balance_refreshed_at":   p.balanceRefreshedAt(),
+		"balance_refresh_sec":  p.balanceRefreshSec(),
+		"balance_refreshed_at": p.balanceRefreshedAt(),
 	})
 }
 
@@ -299,9 +356,33 @@ func (p *Panel) balanceRefreshedAt() time.Time {
 	return p.cfg.Scheduler.BalanceRefreshedAt()
 }
 
-// logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
+// logsHandler 返回日志环形缓冲。
+//
+// 无参数时保持旧行为（全量快照，时间升序）——面板之外的脚本可能依赖它。
+// 带 limit/cursor/ch/q 时走分页查询，返回 {entries, next_cursor, total}：
+//   - limit 默认由前端传；不带 limit 的请求仍返回全量
+//   - cursor 是上一页返回的 next_cursor，用于往回翻历史
+//   - ch 筛频道（task/chat/sys），q 为关键词（空格分词 AND）
 func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.Snapshot()})
+	q := r.URL.Query()
+	limitRaw, cursorRaw := q.Get("limit"), q.Get("cursor")
+	// 兼容路径：没有任何分页/筛选参数 → 全量快照。
+	if limitRaw == "" && cursorRaw == "" && q.Get("ch") == "" && q.Get("q") == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.Snapshot()})
+		return
+	}
+	var cur uint64
+	if cursorRaw != "" {
+		cur, _ = strconv.ParseUint(cursorRaw, 10, 64)
+	}
+	limit, _ := strconv.Atoi(limitRaw)
+	page := p.logs.Query(LogQuery{
+		Ch:     q.Get("ch"),
+		Q:      q.Get("q"),
+		Limit:  limit,
+		Cursor: cur,
+	})
+	writeJSON(w, http.StatusOK, page)
 }
 
 // requestMetrics 返回进程内请求指标、最近 100 条与归档状态。
@@ -414,46 +495,41 @@ func (p *Panel) nicknames() map[string]string {
 	return nicks
 }
 
-// models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
-// 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
-// 与 /v1/models 同口径的双域输出：CN 域模型加 "cn:" 前缀、global 域加 "global:" 前缀
-// （gateway 路由协议，前端显示的 id 就是调用时要填的完整 model 值）。
-// 各域独立探测、独立容错：某域无可用账号则整域跳过；两域全空时才报错
-// （有错误明细回 502，一个账号都没有回 503）。
+// models 拉取所有上游的模型目录与常 reasoning 档位。
+//
+// 数据来自池的 CatalogAll（gateway.Cataloger 可选能力），本函数只做两件事：
+// 给裸 ID 加路由前缀、把条目摊平成前端认的字段名。**不再直连任何上游**——
+// 改造前三段各自 FetchModels / FetchGlobalModelInfos / FetchRemoteModels，
+// 每段自己挑账号、自己缓存，于是面板与 /v1/models 机制上就允许不一致。
+//
+// 前缀规则即路由协议：CN 加 "cn:"、global 加 "global:"、Trae 加 "trae:cn:"
+// （前端显示的 id 就是调用时要填的完整 model 值）。每条都带 upstream 字段
+// 标明所属上游，前端据此做徽标与筛选。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
-	out := make([]map[string]any, 0)
+	results := p.cfg.Pool.CatalogAll(r.Context())
+	hidden := p.cfg.Live.Load().HiddenModels
+	out := make([]map[string]any, 0, 64)
 	var fetchErrs []string
-
-	// CN 域：有可用 CN 账号才查（此前无条件 Pool.Pick()+FetchModels——选中 global
-	// 账号时打 CN 端点必然失败，混合池表现为偶发 502，纯 global 池必炸）。
-	if uids := p.cfg.Pool.AvailableUIDsForRealm("cn"); len(uids) > 0 {
-		if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
-			infos, err := p.cfg.Upstream.FetchModels(acct)
-			if err != nil {
-				fetchErrs = append(fetchErrs, "cn: "+err.Error())
-			} else {
-				for _, mi := range infos {
-					out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
-				}
+	for _, res := range results {
+		if res.Err != nil {
+			// ErrUnsupported = 该上游不提供目录（未启用 Trae 等），不是失败，
+			// 不该让整页 502；只有真的拉取报错才进错误明细。
+			if !errors.Is(res.Err, gateway.ErrUnsupported) {
+				fetchErrs = append(fetchErrs, res.Backend+": "+res.Err.Error())
 			}
+			continue
 		}
-	}
-
-	// global 域：路由开关开且有可用 global 账号才查（独立目录端点，FetchGlobalModelInfos；
-	// Upstream.GlobalEnabled 是探测侧同一道闸，与 main 装配的 config global.enabled 一致）。
-	if p.cfg.Upstream.GlobalEnabled {
-		if uids := p.cfg.Pool.AvailableUIDsForRealm("global"); len(uids) > 0 {
-			if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
-				infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
-				if len(infos) == 0 {
-					fetchErrs = append(fetchErrs, "global: 上游未返回可用模型")
-				} else {
-					efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
-					for _, mi := range infos {
-						out = append(out, panelModelEntry("global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
-					}
-				}
-			}
+		prefix := panelPrefixFor(res.Backend, res.Realm)
+		for _, m := range res.Models {
+			entry := panelCatalogEntry(res.Backend, prefix, m)
+			// 真实域与黑名单标记：面板要能把「客户端实际调不到」的条目显示出来。
+			//
+			// 此前面板完全没有应用 models.hidden，于是「页面看得见、客户端调不到」
+			// ——以最坏的方式误导人。这里不直接过滤掉，而是打标记让前端标灰：
+			// 运维页面上「被藏了什么」本身是需要知道的信息。
+			entry["realm"] = panelRealmOf(res.Realm)
+			entry["hidden"] = panelModelHidden(hidden, res.Backend, res.Realm, m.ID)
+			out = append(out, entry)
 		}
 	}
 
@@ -465,58 +541,366 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"models": out,
+		// merged：按**归一后的裸模型名**去重后的一行一模型视图。
+		//
+		// 为什么要后端算而不是前端拼：去重必须用归一后的小写名（上游目录里
+		// 同一个模型可能写作 DeepSeek-V4.1-Flash，而另一个上游写全小写），
+		// 这个归一规则只在 Go 侧有一份权威实现（gateway.NormalizeModel）。
+		// 前端自己写一遍 `toLowerCase()` 看着等价，但一旦归一规则变化
+		// （比如将来要剥 __dev 后缀）两处就会漂移。
+		"merged": panelMergeModels(out),
+	})
 }
 
-// panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），
-// context_length / max_output_tokens 走四级查找链，effort 档位按 realm 域取
-// EffortListing（远端权威 ∪ 静态兜底表）——与 /v1/models 同一口径，两侧不再漂移。
-func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string, remoteDefault string, httpc *http.Client) map[string]any {
-	entry := map[string]any{
-		"id":                   realm + ":" + mi.ID,
-		"name":                 mi.Name,
-		"default_effort":       mi.DefaultEffort,
-		"supported_efforts":    mi.Efforts,
-		"can_disable_thinking": mi.CanDisableThinking,
-		"supports_reasoning":   mi.SupportsReasoning,
-		"supports_images":      mi.SupportsImages,
-		"credits":              mi.Credits,
-		"description":          mi.Description,
-		"tags":                 mi.Tags,
-		"vendor":               mi.Vendor,
-		"is_default":           mi.IsDefault,
-		"supports_tool_call":   mi.SupportsToolCall,
-		"only_reasoning":       mi.OnlyReasoning,
-		"reasoning_effort":     mi.ReasoningEffort,
-		"reasoning_summary":    mi.ReasoningSummary,
+// panelRealmOf 域值兜底：空域按 CN（与 gateway.DefaultRealm 同口径）。
+func panelRealmOf(realm string) string {
+	if realm == "" {
+		return gateway.DefaultRealm
 	}
-	// 限时优惠（modelPromotions）：credits 是牌价，promo_* 是当前生效折扣
-	//（WorkBuddy 客户端显示的就是这个生效价）。前端据此显示「生效价+标签+划线牌价」。
-	if mi.PromoFactor != nil {
-		entry["promo_factor"] = *mi.PromoFactor
-		entry["promo_credits"] = mi.PromoCredits
+	return realm
+}
+
+// panelModelHidden 报告某条目录项是否被 models.hidden 隐藏。
+//
+// 这里的键形态必须与 /v1/models 的过滤逻辑逐字一致，否则面板显示「未隐藏」
+// 而客户端实际拿不到。两种 id 形态都要覆盖：
+//
+//	CodeBuddy: "cn:<模型>"          （两段）
+//	Trae:      "trae:<realm>:<模型>" （三段）
+//
+// **Trae 的三段式正是历史缺陷所在**：livecfg.NormalizeHiddenModels 只产出
+// "cn:x"/"global:x" 两段式，所以 `hidden["trae:cn:x"]` 永远不命中，Trae 模型
+// 从来没有被真正隐藏过。这里按「域+裸名」查（即 cn:x），与归一化输出对齐；
+// 同时兼容用户直接写三段式全名的情况。
+func panelModelHidden(hidden map[string]struct{}, backend, realm, bareModel string) bool {
+	if len(hidden) == 0 {
+		return false
 	}
-	if mi.PromoLabel != "" {
-		entry["promo_label"] = mi.PromoLabel
-	}
-	if mi.PromoNote != "" {
-		entry["promo_note"] = mi.PromoNote
-	}
-	if mi.MaxAllowedSize > 0 {
-		entry["max_allowed_size"] = mi.MaxAllowedSize
-	}
-	entry["context_length"] = upstream.ContextWindowListingV4(mi.ID, mi.ContextWindow, httpc)
-	if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, httpc); ok {
-		entry["max_output_tokens"] = mo
-	}
-	if efforts, def := upstream.EffortListing(realm, mi.ID, remoteEfforts, remoteDefault); efforts != nil {
-		entry["supported_efforts"] = efforts
-		if def != "" {
-			entry["default_effort"] = def
+	realm = panelRealmOf(realm)
+	if backend == panelUpstreamTrae {
+		// 三段式全名（用户可能显式写 trae:cn:x）。
+		if _, ok := hidden[panelUpstreamTrae+":"+realm+":"+bareModel]; ok {
+			return true
 		}
+	}
+	// 两段式（NormalizeHiddenModels 的实际输出形态）。
+	_, ok := hidden[realm+":"+bareModel]
+	return ok
+}
+
+// panelMergeModels 把逐个「上游×域」的条目按裸模型名聚合，一行一模型。
+//
+// 聚合口径（每一处都是刻意的取舍）：
+//   - **去重键**用 gateway.NormalizeModel（小写+去空白）：Trae 目录里的
+//     `DeepSeek-V4.1-Flash` 与 CodeBuddy 的 `deepseek-v4.1-flash` 必须合成一行，
+//     否则「deepseek 显示一条」这个需求根本没实现；
+//   - **上下文/输出上限**取各来源的**最大值**（见下），能力取**并集**，但
+//     每个来源自己的值完整保留在 providers[] 里——主行不撒谎，细节可查；
+//   - **价格**不合并：不同来源的倍率是各自计的，合并成一个数会误导计费预期，
+//     所以 providers[] 里各带各的 credits。
+func panelMergeModels(entries []map[string]any) []map[string]any {
+	type group struct {
+		key       string
+		bareID    string // 首次出现的裸名（保留原始拼写，展示用）
+		name      string // 显示名（非空优先）
+		providers []map[string]any
+		// 能力并集
+		supportsTool, supportsImages, supportsReasoning, canDisable, onlyReasoning bool
+		// 上限取最大
+		contextLen, contextBase, maxOutput, maxAllowed int64
+		efforts                                        []string
+		effortSeen                                     map[string]bool
+		defaultEffort                                  string
+		hiddenAll                                      bool
+	}
+	order := make([]string, 0, len(entries))
+	byKey := make(map[string]*group, len(entries))
+
+	for _, e := range entries {
+		rawID, _ := e["id"].(string)
+		backend, _ := e["upstream"].(string)
+		realm, _ := e["realm"].(string)
+		bare := panelBareModelID(rawID)
+		key := gateway.NormalizeModel(bare)
+		if key == "" {
+			continue
+		}
+		g, seen := byKey[key]
+		if !seen {
+			g = &group{key: key, bareID: bare, effortSeen: map[string]bool{}, hiddenAll: true}
+			byKey[key] = g
+			order = append(order, key)
+		}
+		if g.name == "" {
+			if n, _ := e["name"].(string); n != "" {
+				g.name = n
+			}
+		}
+		prov := map[string]any{
+			"upstream": backend,
+			"realm":    realm,
+			"id":       rawID,
+		}
+		// 每个来源自己的数值原样带上（主行取并集/最大，细节在悬停里看）。
+		for _, k := range []string{"context_length", "context_length_base", "max_output_tokens",
+			"max_allowed_size", "credits", "promo_credits", "promo_label", "promo_factor"} {
+			if v, ok := e[k]; ok {
+				prov[k] = v
+			}
+		}
+		if v, _ := e["hidden"].(bool); v {
+			prov["hidden"] = true
+		} else {
+			g.hiddenAll = false // 只要有一个来源没被藏，这个模型就还能调到
+		}
+		g.providers = append(g.providers, prov)
+
+		// 能力并集：任一来源支持即算支持（主行不因此断言「每个来源都支持」，
+		// 来源粒度的差异在 providers[] 里可查）。
+		if v, _ := e["supports_tool_call"].(bool); v {
+			g.supportsTool = true
+		}
+		if v, _ := e["supports_images"].(bool); v {
+			g.supportsImages = true
+		}
+		if v, _ := e["supports_reasoning"].(bool); v {
+			g.supportsReasoning = true
+		}
+		if v, _ := e["can_disable_thinking"].(bool); v {
+			g.canDisable = true
+		}
+		if v, _ := e["only_reasoning"].(bool); v {
+			g.onlyReasoning = true
+		}
+		// 上限取最大：同一模型在 A 源能开 1M、B 源只有 200K 时，主行显示 1M，
+		// 但点开来源能看到 B 只有 200K——用户据此决定用哪个来源调用。
+		g.contextLen = maxInt64(g.contextLen, int64Of(e["context_length"]))
+		g.contextBase = maxInt64(g.contextBase, int64Of(e["context_length_base"]))
+		g.maxOutput = maxInt64(g.maxOutput, int64Of(e["max_output_tokens"]))
+		g.maxAllowed = maxInt64(g.maxAllowed, int64Of(e["max_allowed_size"]))
+		if eff, ok := e["supported_efforts"].([]string); ok {
+			for _, x := range eff {
+				if !g.effortSeen[x] {
+					g.effortSeen[x] = true
+					g.efforts = append(g.efforts, x)
+				}
+			}
+		}
+		if g.defaultEffort == "" {
+			if v, _ := e["default_effort"].(string); v != "" {
+				g.defaultEffort = v
+			}
+		}
+	}
+
+	out := make([]map[string]any, 0, len(order))
+	for _, key := range order {
+		g := byKey[key]
+		// 提供者按 (上游, 域) 稳定排序：同一份数据每次渲染顺序一致，
+		// 否则用户在列表里找同一个来源时位置会跳。
+		sort.SliceStable(g.providers, func(i, j int) bool {
+			ui, _ := g.providers[i]["upstream"].(string)
+			uj, _ := g.providers[j]["upstream"].(string)
+			if ui != uj {
+				return ui < uj
+			}
+			ri, _ := g.providers[i]["realm"].(string)
+			rj, _ := g.providers[j]["realm"].(string)
+			return ri < rj
+		})
+		m := map[string]any{
+			// id 用归一后的裸名：前端拿它做 key 与搜索，天然大小写不敏感。
+			"id":                   g.key,
+			"bare_id":              g.bareID,
+			"providers":            g.providers,
+			"provider_count":       len(g.providers),
+			"hidden_all":           g.hiddenAll,
+			"supports_tool_call":   g.supportsTool,
+			"supports_images":      g.supportsImages,
+			"supports_reasoning":   g.supportsReasoning,
+			"can_disable_thinking": g.canDisable,
+			"only_reasoning":       g.onlyReasoning,
+		}
+		if g.name != "" {
+			m["name"] = g.name
+		}
+		if g.contextLen > 0 {
+			m["context_length"] = g.contextLen
+		}
+		if g.contextBase > 0 {
+			m["context_length_base"] = g.contextBase
+		}
+		if g.maxOutput > 0 {
+			m["max_output_tokens"] = g.maxOutput
+		}
+		if g.maxAllowed > 0 {
+			m["max_allowed_size"] = g.maxAllowed
+		}
+		if len(g.efforts) > 0 {
+			m["supported_efforts"] = g.efforts
+		}
+		if g.defaultEffort != "" {
+			m["default_effort"] = g.defaultEffort
+		}
+		out = append(out, m)
+	}
+	// 多来源优先：被两个上游同时提供的模型更值得关注（可切换、可容灾）。
+	sort.SliceStable(out, func(i, j int) bool {
+		ci, _ := out[i]["provider_count"].(int)
+		cj, _ := out[j]["provider_count"].(int)
+		if ci != cj {
+			return ci > cj
+		}
+		return out[i]["id"].(string) < out[j]["id"].(string)
+	})
+	return out
+}
+
+// panelBareModelID 从带前缀的完整 id 里剥出裸模型名。
+//
+//	"cn:glm-5.2"          → "glm-5.2"
+//	"trae:cn:glm-5.2"     → "glm-5.2"
+//	"glm-5.2"             → "glm-5.2"
+func panelBareModelID(id string) string {
+	if rest, ok := strings.CutPrefix(id, panelUpstreamTrae+":"); ok {
+		id = rest
+	}
+	if i := strings.IndexByte(id, ':'); i >= 0 {
+		if p := id[:i]; p == "cn" || p == "global" {
+			return id[i+1:]
+		}
+	}
+	return id
+}
+
+// int64Of 宽容取 JSON 数值（面板条目里是 int64，但测试可能注入 float64）。
+func int64Of(v any) int64 {
+	switch n := v.(type) {
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	case float64:
+		return int64(n)
+	default:
+		return 0
+	}
+}
+
+func maxInt64(a, b int64) int64 {
+	if b > a {
+		return b
+	}
+	return a
+}
+
+// panelPrefixFor 该条目在面板上的 ID 前缀（即客户端调用时要填的 model 值前缀）。
+//
+// Trae 的 ID 形态是 "trae:<realm>:<模型>"（三段），CodeBuddy 是 "<realm>:<模型>"。
+// 两者的域段位置不同，所以前缀不能一套规则套到底。
+//
+// 域段用条目的真实域：Trae 国际版接入后同一个上游会有 cn / global 两组目录，
+// 硬编码 "trae:cn:" 会让国际模型的 ID 谎报自己的域，客户端按它调用会被
+// 域过滤挡掉。
+func panelPrefixFor(backend, realm string) string {
+	if realm == "" {
+		realm = gateway.DefaultRealm
+	}
+	if backend == panelUpstreamTrae {
+		return panelUpstreamTrae + ":" + realm + ":"
+	}
+	return realm + ":"
+}
+
+// panelCatalogEntry 统一目录条目 → 面板 JSON。
+//
+// 字段名与改造前保持一致（context_length / supported_efforts / default_effort /
+// supports_*），前端无需改动。
+func panelCatalogEntry(backend, prefix string, m gateway.CatalogModel) map[string]any {
+	entry := map[string]any{
+		"id":       prefix + m.ID,
+		"upstream": backend,
+		"name":     m.Name,
+	}
+	if m.ContextLength > 0 {
+		entry["context_length"] = m.ContextLength
+	}
+	if m.ContextLengthBase > 0 {
+		entry["context_length_base"] = m.ContextLengthBase
+	}
+	if m.MaxOutputTokens > 0 {
+		entry["max_output_tokens"] = m.MaxOutputTokens
+	}
+	if len(m.Efforts) > 0 {
+		entry["supported_efforts"] = m.Efforts
+	}
+	if m.DefaultEffort != "" {
+		entry["default_effort"] = m.DefaultEffort
+	}
+	if m.SupportsReasoning {
+		entry["supports_reasoning"] = true
+	}
+	if m.CanDisableThinking {
+		entry["can_disable_thinking"] = true
+	}
+	if m.SupportsImages {
+		entry["supports_images"] = true
+	}
+	if m.SupportsToolCall {
+		entry["supports_tool_call"] = true
+	}
+	if m.IsDefault {
+		entry["is_default"] = true
+	}
+	if m.Credits != "" {
+		entry["credits"] = m.Credits
+	}
+	if m.Description != "" {
+		entry["description"] = m.Description
+	}
+	if m.Vendor != "" {
+		entry["vendor"] = m.Vendor
+	}
+	if len(m.Tags) > 0 {
+		entry["tags"] = m.Tags
+	}
+	if m.OnlyReasoning {
+		entry["only_reasoning"] = true
+	}
+	if m.ReasoningEffort != "" {
+		entry["reasoning_effort"] = m.ReasoningEffort
+	}
+	if m.ReasoningSummary != "" {
+		entry["reasoning_summary"] = m.ReasoningSummary
+	}
+	if m.MaxAllowedSize > 0 {
+		entry["max_allowed_size"] = m.MaxAllowedSize
+	}
+	// 限时优惠：credits 是牌价，promo_* 是当前生效折扣。
+	if m.PromoFactor != nil {
+		entry["promo_factor"] = *m.PromoFactor
+		entry["promo_credits"] = m.PromoCredits
+	}
+	if m.PromoLabel != "" {
+		entry["promo_label"] = m.PromoLabel
+	}
+	if m.PromoNote != "" {
+		entry["promo_note"] = m.PromoNote
 	}
 	return entry
 }
+
+// 上游标识（模型条目的 upstream 字段，前端据此显示徽标与做筛选）。
+const (
+	panelUpstreamCodeBuddy = "codebuddy"
+	panelUpstreamTrae      = "trae"
+)
+
+// panelTraeRealm Trae 的缺省域（用于无域信息时的兜底展示，不再代表"只有一个域"）。
+const panelTraeRealm = "cn"
 
 // modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out
 // 写入的契约文件），供前端在「模型与档位」的实测列做风险标注。
@@ -610,95 +994,98 @@ func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
+// accountCheckin 单号签到：签到 + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
 // 与 scheduler.RunCheckinNow 的单号语义一致。
+//
+// 走池的统一单号入口（CheckinOne / RefreshCreditsOne）：账号自己实现 Checkin/Credits，
+// 池负责记账与快照写回。CodeBuddy 与 Trae 因此是同一段代码——不再按 backend 分流
+// 到两条不同的实现。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.cfg.Pool.AuthByUID(uid)
-	if a == nil {
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	res, err := p.cfg.Pool.CheckinOne(ctx, uid)
+	resp := map[string]any{"ok": true}
+	checkinMsg := ""
+	switch {
+	case errors.Is(err, pool.ErrNoSuchAccount):
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
-	}
-	checkinMsg := ""
-	checkinDone := false
-	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
-	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
-	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
-	if a.IsEnterprise() {
-		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
-	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
-		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
-		if upstream.IsAlreadyCheckin(err) {
-			p.cfg.Pool.NoteCheckinDone(uid)
-			checkinDone = true
+	case err != nil:
+		checkinMsg = err.Error() // 业务错误照常查余额
+	default:
+		// res.Already / Message 非空都已在 CheckinOne 内部标记「今日已签」。
+		resp["checkin_done"] = res != nil && !res.Skipped
+		if res != nil && res.Skipped {
+			checkinMsg = res.Message // 企业版等「不参与」的说明
+			resp["enterprise"] = true
 		}
-	} else {
-		p.cfg.Pool.NoteCheckinDone(uid)
-		checkinDone = true
-	}
-	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
-	if a.IsEnterprise() {
-		resp["enterprise"] = true
 	}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}
-	remain, total, expiring, earliestAt, earliestRemaining, buckets, err := p.cfg.Upstream.UserResourceSnapshot(a, p.expiringSoonWindow())
-	if err != nil {
-		resp["balance_error"] = err.Error()
+
+	credits, cerr := p.cfg.Pool.RefreshCreditsOne(ctx, uid)
+	if cerr != nil {
+		resp["balance_error"] = cerr.Error()
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
-	p.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{
-		Remain:            remain,
-		Total:             total,
-		Expiring:          expiring,
-		EarliestAt:        earliestAt,
-		EarliestRemaining: earliestRemaining,
-		ExpiryBuckets:     poolExpiryBuckets(buckets),
-	})
-	resp["credits"] = remain
-	resp["credits_total"] = total
-	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
+	if credits != nil {
+		resp["credits"] = int64(credits.Available)
+		resp["credits_total"] = int64(credits.Limit)
+		log.Printf("panel: checkin uid=%s msg=%q credits=%v/%v", uid, checkinMsg,
+			int64(credits.Available), int64(credits.Limit))
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // accountBalance 单号余额刷新：更新余额与到期快照，不触碰冷却状态。
 func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.cfg.Pool.AuthByUID(uid)
-	if a == nil {
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	credits, err := p.cfg.Pool.RefreshCreditsOne(ctx, uid)
+	if errors.Is(err, pool.ErrNoSuchAccount) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	remain, total, expiring, earliestAt, earliestRemaining, buckets, err := p.cfg.Upstream.UserResourceSnapshot(a, p.expiringSoonWindow())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
-	p.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{
-		Remain:            remain,
-		Total:             total,
-		Expiring:          expiring,
-		EarliestAt:        earliestAt,
-		EarliestRemaining: earliestRemaining,
-		ExpiryBuckets:     poolExpiryBuckets(buckets),
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "uid": uid,
+		"credits": int64(credits.Available), "credits_total": int64(credits.Limit),
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
 }
 
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
+// traeAuthDir Trae 账号凭证目录（与 CodeBuddy 共用 auths/，文件名前缀区分）。
+func (p *Panel) traeAuthDir() string {
+	if p.cfg.AuthDir != "" {
+		return p.cfg.AuthDir
+	}
+	return trae.DefaultAuthDir(p.cfg.TraePath)
+}
+
 func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.cfg.Pool.Remove(uid)
-	if a == nil {
+	acc := p.cfg.Pool.Remove(uid)
+	if acc == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+	// 按上游删各自的凭证文件：CodeBuddy 是 auths/workbuddy-<uid>.json，
+	// Trae 是 auths/trae-<uid>.json。只删池条目不删文件会让账号在下次
+	// 扫描/热重载时"复活"。
 	fileMsg := ""
-	if a.FilePath != "" {
+	if acc.Backend() == "trae" {
+		if err := trae.RemoveAccount(p.traeAuthDir(), acc.UID()); err != nil {
+			fileMsg = err.Error()
+		}
+	} else if a := p.codeBuddyCredential(acc.UID()); a != nil && a.FilePath != "" {
 		if err := os.Remove(a.FilePath); err != nil && !os.IsNotExist(err) {
 			fileMsg = err.Error()
 		}
@@ -723,7 +1110,7 @@ func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	go p.cfg.Scheduler.RunCheckinNow()
-	log.Printf("panel: 手动全量签到已触发（含猫猫旅行）")
+	log.Printf("panel: 手动全量签到已触发（CodeBuddy + Trae，旅行已独立为单独排程）")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
@@ -736,6 +1123,49 @@ func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
 	go p.cfg.Scheduler.RunTravelNow()
 	log.Printf("panel: 手动全量旅行巡检已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+}
+
+// blindboxAll 手动触发能量盲盒（同步执行并返回逐账号结果）。
+//
+// 默认 dry-run（query `apply=1` 才真正开盒）：开盒消耗能量且不可逆，按钮的
+// 第一下必须是「只看配额」，由用户确认能量与可开次数后再显式确认开盒。
+//
+// 同步而非异步：面板要直接展示「哪个账号、能量多少、为什么不给开、开了几次」，
+// 让用户去日志里翻是推卸责任。账号数有限（个位数），限速 800ms/号，
+// 最坏几秒返回，可以接受。
+func (p *Panel) blindboxAll(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	apply := r.URL.Query().Get("apply") == "1"
+	maxPerRun := 0
+	if v := r.URL.Query().Get("max"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			maxPerRun = n
+		}
+	}
+	results := p.cfg.Scheduler.RunBlindboxNow(apply, maxPerRun)
+	if apply {
+		log.Printf("panel: 手动开能量盲盒完成（真实开盒，%d 个账号）", len(results))
+	} else {
+		log.Printf("panel: 手动能量盲盒完成（dry-run，%d 个账号）", len(results))
+	}
+	// 汇总供前端直接展示，不用它自己再算一遍。
+	var canOpen, opened int
+	for _, x := range results {
+		if x.WillOpen > 0 {
+			canOpen++
+		}
+		if x.Opened {
+			opened++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "apply": apply,
+		"total": len(results), "can_open": canOpen, "opened": opened,
+		"results": results,
+	})
 }
 
 // activityAll 手动触发全量活跃上报（异步执行；点亮连登 + 解锁领养前置）。
@@ -802,12 +1232,12 @@ func (p *Panel) accountCompensationClaim(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	if res.Claimed {
+	if res.Outcome.ClaimedNow {
 		p.refreshCreditsQuiet(uid)
 	}
 	// ok 反映「是否拿到确定结论」：error 非空即 false。注意前端 api() 只看
 	// HTTP 状态码，这个字段是给日志/调用方看的，真正的分流依据是 result.error。
-	writeJSON(w, http.StatusOK, map[string]any{"ok": res.Error == "", "result": res})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": res.Err == nil, "result": res})
 }
 
 // compensationAll 手动全量领取补偿（逐号查状态后领取；无待领的号静默跳过）。
@@ -818,7 +1248,7 @@ func (p *Panel) compensationAll(w http.ResponseWriter, r *http.Request) {
 	}
 	results := p.cfg.Scheduler.ClaimCompensationNow()
 	for _, res := range results {
-		if res.Claimed {
+		if res.Outcome.ClaimedNow {
 			p.refreshCreditsQuiet(res.UID)
 		}
 	}
@@ -847,7 +1277,7 @@ func b2i(b bool) int {
 // 失败只记日志不返回：领取本身已经成功并落到上游，余额刷新失败只是展示滞后，
 // 前端紧接着还会拉一次 overview。静默吞掉会让「积分没变」看起来像没领到。
 func (p *Panel) refreshCreditsQuiet(uid string) {
-	a := p.cfg.Pool.AuthByUID(uid)
+	a := p.codeBuddyCredential(uid)
 	if a == nil {
 		return
 	}
@@ -875,7 +1305,7 @@ func (p *Panel) syncNicknames() {
 		if st.Disabled {
 			continue
 		}
-		if a := p.cfg.Pool.AuthByUID(st.UID); a != nil && a.AccessTokenValue() != "" {
+		if a := p.codeBuddyCredential(st.UID); a != nil && a.AccessTokenValue() != "" {
 			jobs = append(jobs, job{uid: st.UID, a: a})
 		}
 	}
@@ -995,18 +1425,20 @@ func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
 //
 // 逐个账号向上游查（并发有上限，避免瞬时打满上游限流），失败只在对应账号上
 // 标 error，不影响其它账号——一个号 token 失效不该让整页空白。
+// packagesRow 「积分构成」单账号一行。
+type packagesRow struct {
+	UID      string                   `json:"uid"`
+	Nickname string                   `json:"nickname"`
+	Realm    string                   `json:"realm"`
+	Remain   int64                    `json:"remain"`
+	Size     int64                    `json:"size"`
+	Packages []upstream.CreditPackage `json:"packages"`
+	Error    string                   `json:"error,omitempty"`
+}
+
 func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	accts := p.cfg.Pool.List()
-	type row struct {
-		UID      string                   `json:"uid"`
-		Nickname string                   `json:"nickname"`
-		Realm    string                   `json:"realm"`
-		Remain   int64                    `json:"remain"`
-		Size     int64                    `json:"size"`
-		Packages []upstream.CreditPackage `json:"packages"`
-		Error    string                   `json:"error,omitempty"`
-	}
-	out := make([]row, len(accts))
+	out := make([]packagesRow, len(accts))
 
 	sem := make(chan struct{}, 3)
 	var wg sync.WaitGroup
@@ -1017,8 +1449,15 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			it := row{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
-			a := p.cfg.Pool.AuthByUID(s.UID)
+			it := packagesRow{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
+			// Trae 账号走自己的积分接口：它的包结构与 CodeBuddy 完全不同
+			// （IDE/Work 双轨 product_id、周期制），不能共用 CreditPackages。
+			if s.Backend == "trae" {
+				p.fillTraePackages(&it, s.UID)
+				out[i] = it
+				return
+			}
+			a := p.codeBuddyCredential(s.UID)
 			if a == nil {
 				it.Error = "account not loaded"
 				out[i] = it

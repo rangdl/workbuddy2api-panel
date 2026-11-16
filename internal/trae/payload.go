@@ -1,0 +1,503 @@
+package trae
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// payload.go OpenAI Chat Completions 请求体 → Trae `llm_utils_chat` 请求体。
+//
+// 蓝本：TraeWorkAssistant 的 api_server/payload.rs（2026-09 实测固化）。
+// 转换是**纯函数**（除注入的 id 生成器外无副作用），便于表驱动单测。
+
+// function 取值：默认聊天通道是 solo_work_lite。
+const (
+	FunctionSoloWorkLite   = "solo_work_lite"
+	FunctionSoloWorkRemote = "solo_work_remote"
+	// FunctionSoloAgent 只在**目录查询**里使用，不能用于聊天。
+	//
+	// 保留这个常量是因为 catalog.go 还要按它询问目录（它列的条目最全）；
+	// 但任何 llm_utils_chat 请求都不得用它——实测会回 4011
+	// （dsh 2026-10-01，issue #19）。见 catalog.go 的 chatFunctions。
+	FunctionSoloAgent = "solo_agent"
+)
+
+// remoteOnlyModels 只在 solo_work_remote 下可聊天的模型（实测）。
+//
+// **注意不是 solo_agent**：历史上这张表写的是 solo_agent，但那个函数不能承载
+// 聊天（每个模型用它会回 4011）。这些模型在 solo_work_lite 下同样不可用
+// （报 4001「该 function 不服务这个模型」），而 solo_work_remote 可以。
+//
+// 这张表只是**目录拉取失败时的兜底**：正常情况下归属由目录给出
+// （Catalog.FunctionForConfigName），不要靠它维护模型清单。
+var remoteOnlyModels = map[string]bool{
+	"doubao-seed-code":    true,
+	"glm-5.3-flash":       true,
+	"qwen3.8-flash":       true,
+	"deepseek-v4.1-flash": true,
+	"kimi-k2.8-preview":   true,
+}
+
+// FunctionForModel 模型 → function（硬编码**兜底**；调用方传小写模型名）。
+//
+// 只在目录不可用时使用（Catalog.Live == false）。国际模型的归属不在表里，
+// 会落到默认的 solo_work_lite——国际侧大部分模型确实由它承载，部分只在
+// solo_agent_remote 下的模型需要靠目录给出。
+func FunctionForModel(modelLower string) string {
+	if remoteOnlyModels[strings.ToLower(strings.TrimSpace(modelLower))] {
+		return FunctionSoloWorkRemote
+	}
+	return FunctionSoloWorkLite
+}
+
+// modelPair 模型显示名 → (config_name, model_name)。
+// 未收录模型返回 ok=false，调用方按实证规律原样透传（model_name = config_name__dev）。
+var modelPairs = map[string][2]string{
+	"doubao-seed-evolving":       {"Doubao-Seed-Evolving", "Doubao-Seed-Evolving__dev"},
+	"doubao-seed-2.1-pro":        {"Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Pro__dev"},
+	"seed-code-pro-0430":         {"Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Pro__dev"},
+	"doubao-seed-2.1-turbo":      {"Doubao-Seed-2.1-Turbo", "Doubao-Seed-2.1-Turbo__dev"},
+	"doubao-seed-code":           {"Doubao-Seed-Code", "Doubao-Seed-Code__dev"},
+	"glm-5.3-flash":              {"glm-5.3-flash", "glm-5.3-flash__dev"},
+	"qwen3.8-flash":              {"qwen3.8-flash", "qwen3.8-flash__dev"},
+	"glm-5.2":                    {"glm-5.2", "glm-5.2__dev"},
+	"glm-5.3":                    {"glm-5.3", "glm-5.3__dev"},
+	"glm-5":                      {"glm-5", "glm-5__dev"},
+	"glm-5-turbo":                {"glm-5-turbo", "glm-5-turbo__dev"},
+	"deepseek-v4.1-flash":        {"deepseek-v4.1-flash", "deepseek-v4.1-flash__dev"},
+	"deepseek-v4-flash":          {"DeepSeek-V4-Flash", "deepseek_v4_flash__dev"},
+	"deepseek-v4-flash-official": {"DeepSeek-V4-Flash-Official", "DeepSeek-V4-Flash-Official__dev"},
+	"deepseek-v4-pro":            {"DeepSeek-V4-Pro", "deepseek_v4_pro__dev"},
+	"deepseek-v4-pro-official":   {"DeepSeek-V4-Pro-Official", "DeepSeek-V4-Pro-Official__dev"},
+	"kimi-k2.6":                  {"kimi-k2.6", "kimi-k2.6__dev"},
+	"kimi-k2.7-code":             {"kimi-k2.7-code", "kimi-k2.7-code__dev"},
+	"kimi-k2.8-preview":          {"kimi-k2.8-preview", "kimi-k2.8-preview__dev"},
+	"kimi-k3":                    {"kimi-k3", "kimi-k3__dev"},
+	"minimax-m3":                 {"minimax-m3", "minimax-m3__dev"},
+	"qwen3.8-max":                {"qwen3.8-max", "qwen3.8-max__dev"},
+	"qwen-3.7-plus":              {"qwen-3.7-plus", "qwen-3.7-plus__dev"},
+}
+
+// ModelPair 返回模型的 (config_name, model_name)；未收录时 ok=false。
+func ModelPair(model string) (configName, modelName string, ok bool) {
+	p, hit := modelPairs[strings.ToLower(strings.TrimSpace(model))]
+	if !hit {
+		return "", "", false
+	}
+	return p[0], p[1], true
+}
+
+// KnownModels 返回内置模型目录（config_name 列表，去重排序）。
+// 供模型列表在无账号、无法拉取上游目录时使用。
+func KnownModels() []string {
+	seen := make(map[string]bool, len(modelPairs))
+	out := make([]string, 0, len(modelPairs))
+	for _, p := range modelPairs {
+		if seen[p[0]] {
+			continue
+		}
+		seen[p[0]] = true
+		out = append(out, p[0])
+	}
+	sort.Strings(out)
+	return out
+}
+
+// PrepareOptions 请求体构造参数。
+type PrepareOptions struct {
+	// DefaultModel 请求体未给 model 时的兜底。
+	DefaultModel string
+	// UID 账号 user_id。
+	UID string
+	// DeviceID / MachineID 设备标识（出站体字段）。
+	DeviceID  string
+	MachineID string
+	// IDEVersion / IDEVersionCode / AppID 客户端身份字段。
+	IDEVersion     string
+	IDEVersionCode string
+	AppID          string
+	// Function 显式指定上游 function 名；空则按内置规则按模型推断。
+	//
+	// 为什么需要：不同模型归属不同 function（solo_work_lite / solo_agent / chat_v3…），
+	// 归属错了上游回 4001。上游目录（catalog.go）能给出权威归属，此处让调用方覆盖。
+	Function string
+	// NewID 生成 uuid-like 字符串；nil 用内置实现（测试可注入固定值）。
+	NewID func() string
+}
+
+// PrepareChatBody 把 OpenAI Chat 请求体改写为 llm_utils_chat 请求体。
+//
+// 转换内容（逐条对应参考实现）：
+//  1. messages[].content 字符串 → [{type:"text", text:...}]；
+//  2. assistant 消息的 tool_calls[].function → function_call（上游用旧字段名），
+//     并剔除 function_call.name 为空的调用（否则上游 400）；
+//  3. model → config_name + model_name（未收录时 model_name = config_name__dev）；
+//  4. tool_choice 归一化为字符串（对象形态上游报 400）；"none" 直接删除 tools；
+//  5. tools[].function.parameters 对象 → JSON 字符串（上游要求）；
+//  6. 注入 llm_utils_chat 必需字段（stream 恒 true、function、max_tokens、
+//     conversation_id/session_id/project_id、device_id/machine_id、ide_version 等）。
+//
+// 解析失败返回原样字节与 error（调用方决定是否放行原始体）。
+func PrepareChatBody(src []byte, opt PrepareOptions) ([]byte, error) {
+	var obj map[string]any
+	if err := json.Unmarshal(src, &obj); err != nil {
+		return src, fmt.Errorf("请求体不是合法 JSON: %w", err)
+	}
+	if opt.NewID == nil {
+		opt.NewID = genUUIDLike
+	}
+
+	rewriteMessages(obj)
+	normalizeToolChoice(obj)
+	normalizeTools(obj)
+	normalizeReasoningEffort(obj)
+
+	model := ""
+	if m, ok := obj["model"].(string); ok {
+		model = strings.TrimSpace(m)
+	}
+	if model == "" {
+		model = strings.TrimSpace(opt.DefaultModel)
+	}
+	configName, modelName, ok := ModelPair(model)
+	if !ok {
+		// 未收录模型（官方新上架等）原样透传：实证 model_name = config_name__dev。
+		configName = model
+		modelName = model + "__dev"
+	}
+
+	obj["config_name"] = configName
+	// model 与 config_name 必须同值：网关认 config_name 作 wire id，但部分
+	// 后端也会校验 model；不显式写入会保留客户端传来的原始值（可能是大写
+	// 显示名或别名），与 config_name 不一致。
+	obj["model"] = configName
+	obj["model_name"] = modelName
+	obj["stream"] = true
+	// function 归属：显式指定优先（上游目录给出的权威值），否则按内置规则推断。
+	// 归属错了上游回 4001（"该 config_name 不被这个 function 服务"）。
+	if opt.Function != "" {
+		obj["function"] = opt.Function
+	} else {
+		obj["function"] = FunctionForModel(strings.ToLower(model))
+	}
+	obj["max_tokens"] = maxTokensOf(obj)
+	obj["conversation_id"] = opt.NewID()
+	obj["session_id"] = opt.NewID()
+	obj["project_id"] = opt.NewID()
+	obj["user_id"] = opt.UID
+	obj["device_id"] = opt.DeviceID
+	obj["machine_id"] = opt.MachineID
+	obj["workspace_id"] = DefaultWorkspaceID
+	obj["prompt_max_tokens"] = DefaultPromptMaxTokens
+	obj["mode"] = "FunctionCall"
+	obj["ide_version"] = opt.IDEVersion
+	obj["ide_version_code"] = opt.IDEVersionCode
+	obj["app_id"] = opt.AppID
+	obj["package_type"] = "stable_cn"
+
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return src, fmt.Errorf("请求体序列化失败: %w", err)
+	}
+	return out, nil
+}
+
+// rewriteMessages content 数组化 + tool_calls 字段名归一。
+func rewriteMessages(obj map[string]any) {
+	msgs, _ := obj["messages"].([]any)
+	for _, raw := range msgs {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := m["role"].(string)
+		if role == "assistant" {
+			rewriteToolCalls(m)
+		}
+		if s, ok := m["content"].(string); ok {
+			m["content"] = []any{map[string]any{"type": "text", "text": s}}
+		}
+	}
+}
+
+// rewriteToolCalls 把 tool_calls[].function 改名为 function_call，并剔除空名调用。
+func rewriteToolCalls(m map[string]any) {
+	tcs, ok := m["tool_calls"].([]any)
+	if !ok {
+		return
+	}
+	kept := make([]any, 0, len(tcs))
+	for _, raw := range tcs {
+		tc, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if fn, exists := tc["function"]; exists {
+			tc["function_call"] = fn
+			delete(tc, "function")
+		}
+		fc, _ := tc["function_call"].(map[string]any)
+		name, _ := fc["name"].(string)
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		kept = append(kept, tc)
+	}
+	if len(kept) == 0 {
+		delete(m, "tool_calls")
+		return
+	}
+	m["tool_calls"] = kept
+}
+
+// normalizeToolChoice 把对象形态的 tool_choice 归一化为字符串；
+// "none" 同时删除 tools / functions（上游不认空工具集）。
+func normalizeToolChoice(obj map[string]any) {
+	tc, exists := obj["tool_choice"]
+	if !exists {
+		return
+	}
+	suppress := func() {
+		delete(obj, "tools")
+		delete(obj, "functions")
+		delete(obj, "tool_choice")
+	}
+	switch v := tc.(type) {
+	case string:
+		if strings.EqualFold(strings.TrimSpace(v), "none") {
+			suppress()
+		}
+	case map[string]any:
+		switch strings.ToLower(strings.TrimSpace(str(v["type"]))) {
+		case "none":
+			suppress()
+		case "auto", "required":
+			obj["tool_choice"] = strings.ToLower(strings.TrimSpace(str(v["type"])))
+		case "function":
+			name := ""
+			if fn, ok := v["function"].(map[string]any); ok {
+				name = strings.TrimSpace(str(fn["name"]))
+			}
+			if name == "" {
+				name = strings.TrimSpace(str(v["name"]))
+			}
+			if name == "" {
+				name = "auto"
+			}
+			obj["tool_choice"] = name
+		}
+	}
+}
+
+// normalizeTools 把 tools[].function.parameters 对象转成 JSON 字符串（上游要求），
+// 并丢弃缺 function 对象的条目；空列表直接删除字段。
+func normalizeTools(obj map[string]any) {
+	list, ok := obj["tools"].([]any)
+	if !ok {
+		return
+	}
+	if len(list) == 0 {
+		delete(obj, "tools")
+		return
+	}
+	out := make([]any, 0, len(list))
+	for _, raw := range list {
+		t, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, ok := t["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if params, ok := fn["parameters"].(map[string]any); ok {
+			// 先洗成 draft-4 再字符串化：DeepSeek 后端对整个 tools 批次做
+			// 严格校验，draft-3 的 property 级 required:true 会让整轮回
+			// `4027 invalid JSON Schema`（dsh issue #49 实测）；哪个模型走
+			// 哪个后端由上游路由决定，所以所有带 tools 的请求都要先洗。
+			normalizeJSONSchema(params)
+			if b, err := json.Marshal(params); err == nil {
+				fn["parameters"] = string(b)
+			}
+		}
+		out = append(out, t)
+	}
+	if len(out) == 0 {
+		delete(obj, "tools")
+		return
+	}
+	obj["tools"] = out
+}
+
+// maxTokensOf 取客户端显式 max_tokens / max_completion_tokens（>0 才采信），
+// 否则回落 DefaultMaxTokens——上游该字段必填。
+func maxTokensOf(obj map[string]any) int64 {
+	for _, k := range []string{"max_tokens", "max_completion_tokens"} {
+		switch v := obj[k].(type) {
+		case float64:
+			if v > 0 {
+				return int64(v)
+			}
+		case int64:
+			if v > 0 {
+				return v
+			}
+		case json.Number:
+			if n, err := v.Int64(); err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	return DefaultMaxTokens
+}
+
+// str 取字符串值（非字符串返回空串）。
+func str(v any) string {
+	return asString(v)
+}
+
+// genUUIDLike 生成 uuid-like 十六进制串（8-4-4-4-12），
+// 与参考实现同为"格式像 UUID 即可"的上游占位值。
+func genUUIDLike() string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		// 极端情况（系统熵源不可用）退化为全零——上游只校验格式。
+		buf = make([]byte, 16)
+	}
+	h := hex.EncodeToString(buf)
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// normalizeJSONSchema 把 JSON Schema 从 draft-3 归一为 draft-4 形态。
+//
+// 核心差异只有一处：draft-3 允许在**属性定义里**写 `"required": true`，而
+// draft-4 要求 `required` 是父级的**字符串数组**。DeepSeek 后端对整批 tools
+// 做严格校验，遇到 draft-3 形态会回 `4027 invalid JSON Schema`，且报错不指向
+// 具体哪个工具（dsh issue #49 实测）。
+//
+// 递归处理 properties / items / anyOf / oneOf / allOf / not / additionalProperties
+// ——组合关键字里同样可能出现 draft-3 的写法。
+func normalizeJSONSchema(node map[string]any) {
+	if node == nil {
+		return
+	}
+	// 1) 收集子级的 property 级 required:true，提升为父级 required 数组。
+	if props, ok := node["properties"].(map[string]any); ok {
+		var required []string
+		for name, raw := range props {
+			sub, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if req, ok := sub["required"]; ok {
+				if b, isBool := req.(bool); isBool {
+					// draft-3 属性级写法：删除并把名字提到父级。
+					delete(sub, "required")
+					if b {
+						required = append(required, name)
+					}
+				}
+			}
+			normalizeJSONSchema(sub)
+		}
+		if len(required) > 0 {
+			node["required"] = mergeRequired(node["required"], required)
+		}
+	}
+	// 2) 组合关键字里的子 schema。
+	for _, key := range []string{"anyOf", "oneOf", "allOf"} {
+		if list, ok := node[key].([]any); ok {
+			for _, item := range list {
+				if sub, ok := item.(map[string]any); ok {
+					normalizeJSONSchema(sub)
+				}
+			}
+		}
+	}
+	// 3) items 可能是单 schema 或 schema 数组。
+	switch items := node["items"].(type) {
+	case map[string]any:
+		normalizeJSONSchema(items)
+	case []any:
+		for _, item := range items {
+			if sub, ok := item.(map[string]any); ok {
+				normalizeJSONSchema(sub)
+			}
+		}
+	}
+	// 4) additionalProperties / not 也可能是 schema。
+	for _, key := range []string{"additionalProperties", "not"} {
+		if sub, ok := node[key].(map[string]any); ok {
+			normalizeJSONSchema(sub)
+		}
+	}
+}
+
+// mergeRequired 合并 required 数组并去重（保持首次出现顺序）。
+//
+// 返回 []string 而非 []any：调用方（含测试）直接按字符串切片读取；
+// JSON 序列化时两者都产出字符串数组，不影响出站形态。
+func mergeRequired(existing any, add []string) []string {
+	seen := make(map[string]bool, len(add))
+	out := make([]string, 0, len(add))
+	switch v := existing.(type) {
+	case []any:
+		for _, x := range v {
+			if s, ok := x.(string); ok && !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	case []string:
+		for _, s := range v {
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	for _, s := range add {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// reasoningEffortMap OpenAI 的 effort 档位 → Trae 原生档位。
+//
+// Trae 的 raw/新版端点只认 light / high / extra_high（实测），而 OpenAI
+// 客户端发的是 minimal/low/medium/high/xhigh。不归一的话上游要么忽略、
+// 要么当未知字段处理。
+var reasoningEffortMap = map[string]string{
+	"minimal": "light",
+	"low":     "light",
+	"medium":  "high",
+	"high":    "high",
+	"xhigh":   "extra_high",
+	"max":     "extra_high",
+}
+
+// normalizeReasoningEffort 把 reasoning_effort 归一成上游档位。
+// 无法识别的值直接删除（传未知档位不如不传，避免上游 4001）。
+func normalizeReasoningEffort(obj map[string]any) {
+	v, exists := obj["reasoning_effort"]
+	if !exists {
+		return
+	}
+	s, ok := v.(string)
+	if !ok {
+		delete(obj, "reasoning_effort")
+		return
+	}
+	if mapped, hit := reasoningEffortMap[strings.ToLower(strings.TrimSpace(s))]; hit {
+		obj["reasoning_effort"] = mapped
+		return
+	}
+	delete(obj, "reasoning_effort")
+}

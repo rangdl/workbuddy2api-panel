@@ -71,7 +71,7 @@ func TestCreditFloorBlocksPaidRequest(t *testing.T) {
 	p.SetCredits("poor", 30, 0)
 	p.NoteModelCost("poor", "paid-model", 2.9, 1000)
 	if a := p.PickExcludingForRealm(nil, "paid-model", ""); a != nil {
-		t.Fatalf("floor 应在 pool 层拦住触底号，got %v（拦截必须发生在选号层，而非靠上游报错）", a.UID)
+		t.Fatalf("floor 应在 pool 层拦住触底号，got %v（拦截必须发生在选号层，而非靠上游报错）", a.UID())
 	}
 
 	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
@@ -94,7 +94,7 @@ func TestCreditFloorAllowsFreeRequest(t *testing.T) {
 	p.NoteModelCost("poor", "free-model", 0, 1000)
 
 	// 选号层面必须出票（上游转发失败与否不在本用例关心范围，见 TestCreditFloor* 单测）。
-	if a := p.PickExcludingForRealm(nil, "free-model", ""); a == nil || a.UID != "poor" {
+	if a := p.PickExcludingForRealm(nil, "free-model", ""); a == nil || a.UID() != "poor" {
 		t.Fatalf("触底号打免费模型应选到号，got %v", a)
 	}
 	// pool 层与 handler 层口径一致（避免 handler 绕过 pool 的 floor 判定）。

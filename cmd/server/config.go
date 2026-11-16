@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -83,12 +84,24 @@ type Config struct {
 		//   - 开关与取值解耦：禁用时仍保留用户显式配的小时，重新启用无需补配。
 		//   - 无需猜测哨兵（[-1] 之类），非法小时一律报错并提示改用本开关。
 		// 旧 config 里的该键因 JSON 未知字段而自然忽略，不报错。
-		CheckinEnabled   bool `json:"checkin_enabled"`   // 缺省 true；false = 关签到
-		TravelEnabled    bool `json:"travel_enabled"`    // 缺省 true；false = 完全停猫猫旅行
-		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
-		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
-		BlackcatEnabled  bool `json:"blackcat_enabled"`  // 缺省 true；false = 关夜猫子
-		GrowthEnabled    bool `json:"growth_enabled"`    // 缺省 true；false = 关成长任务自动排程
+		CheckinEnabled bool `json:"checkin_enabled"` // 缺省 true；false = 关签到（总开关）
+		// CheckinBackends 自动签到**按上游**的开关（缺省全部启用）。
+		//
+		// 语义：CheckinEnabled 是总开关（定时任务本身跑不跑），这里是「跑的时候
+		// 对哪些上游的账号签到」。键是上游名（codebuddy / trae），值为 false 表示
+		// 该上游不参与自动签到；**键缺席或为 true 都表示启用**——这样新增上游时
+		// 无需改配置即可默认参与，也避免「配置里没有就当禁用」这种静默关停。
+		//
+		// 为什么需要它：Trae 与 CodeBuddy 的签到是两套完全不同的上游协议
+		// （Trae 按设备限额、CodeBuddy 按套餐），此前每个上游有各自的定时配置，
+		// 会出现「总开关开了但某个上游还单独关着」的分裂状态。收进同一个排程后，
+		// 用这张表表达「总开关 + 逐上游例外」。
+		CheckinBackends  map[string]bool `json:"checkin_backends"`
+		TravelEnabled    bool            `json:"travel_enabled"`    // 缺省 true；false = 完全停猫猫旅行
+		ActivityEnabled  bool            `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
+		KeepaliveEnabled bool            `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
+		BlackcatEnabled  bool            `json:"blackcat_enabled"`  // 缺省 true；false = 关夜猫子
+		GrowthEnabled    bool            `json:"growth_enabled"`    // 缺省 true；false = 关成长任务自动排程
 
 		// IncludeDisabledInTasks 让「保号类」定时任务（签到 / 活跃上报 / token 保活 /
 		// 余额刷新）对**已禁用（disabled）**的账号也执行。
@@ -117,62 +130,32 @@ type Config struct {
 		// 只做 accept/claim 两条幂等请求，不跑任何行为链路；分钟级开销可忽略。
 		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
 		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
+
+		// Buddy 能量盲盒（energy 唯一消耗出口）：猫 idle 时消耗能量开盒，产出猫/积分。
+		// 与 travel_enabled 独立（关旅行不影响盲盒开关的保存值）。
+		//
+		// 缺省 **false**：开盒不可逆（每次扣 cost_per_open 能量，单号 energy 有限、
+		// 补充依赖连登兑换），先手工触发一次确认产出正常，再决定是否自动执行。
+		TravelBlindboxEnabled bool `json:"travel_blindbox_enabled"` // 缺省 false；true = 旅行 idle 阶段自动开盒
+		// TravelBlindboxMaxPerRun 单趟开盒次数上限（与上游 affordable / max_open_count
+		// 取最小值）。缺省 5；<=0 回落 5；合法范围 1-20。
+		TravelBlindboxMaxPerRun int `json:"travel_blindbox_max_per_run"`
 	} `json:"schedule"`
 
-	Global struct {
-		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
-		// domain=workbuddy.ai 的账号判为 global 并路由 global base/路径。
-		// 显式 "enabled": false 关闭（逃生门，纯 CN 锁定：即便 auth 写了 realm=global
-		// 也不路由，auth.Realm() 双保险的第一道闸）。纯 CN 部署行为不变：CN 账号
-		// 恒判 cn，global base 只在 realm=global 的账号上被使用。
-		Enabled bool `json:"enabled"`
-		// ChatBase / BillingBase 国际版上游 base 覆盖；空 = 回落内置默认
-		// https://www.workbuddy.ai（internal/upstream.defaultGlobalBase）。
-		ChatBase    string `json:"chat_base"`
-		BillingBase string `json:"billing_base"`
-	} `json:"global"`
-
-	CN struct {
-		// ChatBase 国内版 chat/模型目录上游 base 覆盖；空 = 回落内置默认
-		// https://copilot.tencent.com（internal/upstream.New 的 ChatBaseCN）。
-		// copilot.tencent.com 对海外出口（如 Clash 全局 + TUN）的 TLS 握手直接复位，
-		// CN 模型目录与对话全部 EOF；官方 WorkBuddy 桌面端已改用 https://www.workbuddy.cn，
-		// 该域海外出口可达，/v2/chat/completions、/v3/config 与模型目录路径同构。
-		ChatBase string `json:"chat_base"`
-	} `json:"cn"`
-
+	// Upstream 传输层参数。**两个上游共用**：CodeBuddy 与 Trae 的对话都是
+	// SSE 长连接，都需要约束「首字节前等待」与「流中空闲」。
+	//
+	// 为什么在 config.json 而不是各上游的文件里：这几个参数描述的是**传输层
+	// 行为**，与上游协议无关。放进 codebuddy.json 会让人以为「只有 CodeBuddy
+	// 能配」，而 Trae 的流式对话同样需要这两个上限（此前它是硬编码常量）。
 	Upstream struct {
-		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
+		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限。
 		TimeoutSeconds int `json:"timeout_seconds"`
 		// HeaderTimeoutSeconds 聊天 SSE 首字节前（响应头）上限；<=0 回落 TimeoutSeconds。
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
-		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
+		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认。
 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
-		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
-		// 全部出站请求生效：chat/refresh/checkin/balance/report/travel/FetchModels。
-		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
-		UserAgent string `json:"user_agent"`
-		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与归属头
-		// X-IDE-Version）。空 = 内置默认（对齐官方 5.5.4 分发包）。
-		ClientVersion string `json:"client_version"`
-		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（官方内置 CLI 2.137.1）。
-		CliVersion string `json:"cli_version"`
-		// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
-		// 空 = 旧行为 X-Product="SaaS" 不设 X-IDE-*；配 "WorkBuddy" 则四头跟随。
-		ClientName string `json:"client_name"`
-		// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底；空 = 不注入。
-		// 每号 auth 文件的 device_token 键优先于本项。
-		DeviceToken string `json:"device_token"`
-		// DeviceTokenFile device token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
-		DeviceTokenFile string `json:"device_token_file"`
-		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
-		PassthroughIP bool `json:"passthrough_ip"`
 	} `json:"upstream"`
-
-	Features struct {
-		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
-		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
-	} `json:"features"`
 
 	Models struct {
 		// Hidden 不对外暴露的模型黑名单。裸名=两域都藏；"cn:xxx"/"global:xxx"=只藏该域。
@@ -302,14 +285,14 @@ func Default() *Config {
 	c.Schedule.BalanceRefreshMinutes = 5
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
+	// 盲盒缺省关闭（开盒消耗能量且不可逆，先手工验证产出）；单次上限缺省 5。
+	c.Schedule.TravelBlindboxEnabled = false
+	c.Schedule.TravelBlindboxMaxPerRun = 5
+	// 传输层超时：两个上游共用（对话都是 SSE 长连接）。
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
-	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
-	// ChatBase/BillingBase 缺省空（回落内置默认）。
-	c.Global.Enabled = true
-	c.Features.SanitizeBlacklistFingerprints = true
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.Strategy = pool.RegionStrategies{Domestic: pool.WeightedRandom, International: pool.WeightedRandom}
 	c.Pool.MaxInFlight = 3
@@ -431,6 +414,7 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_SOFT_RATE_MAX"); v != "" {
 		c.Cooldown.SoftRateMax = v
 	}
+	// 传输层超时（两个上游共用）。
 	if v := os.Getenv("WB2A_TIMEOUT_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Upstream.TimeoutSeconds = n
@@ -444,34 +428,6 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_IDLE_TIMEOUT_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Upstream.IdleTimeoutSeconds = n
-		}
-	}
-	if v := os.Getenv("WB2A_USER_AGENT"); v != "" {
-		c.Upstream.UserAgent = v
-	}
-	if v := os.Getenv("WB2A_CLIENT_VERSION"); v != "" {
-		c.Upstream.ClientVersion = v
-	}
-	if v := os.Getenv("WB2A_CLI_VERSION"); v != "" {
-		c.Upstream.CliVersion = v
-	}
-	if v := os.Getenv("WB2A_CLIENT_NAME"); v != "" {
-		c.Upstream.ClientName = v
-	}
-	if v := os.Getenv("WB2A_DEVICE_TOKEN"); v != "" {
-		c.Upstream.DeviceToken = v
-	}
-	if v := os.Getenv("WB2A_DEVICE_TOKEN_FILE"); v != "" {
-		c.Upstream.DeviceTokenFile = v
-	}
-	if v := os.Getenv("WB2A_PASSTHROUGH_IP"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.Upstream.PassthroughIP = b
-		}
-	}
-	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.Features.SanitizeBlacklistFingerprints = b
 		}
 	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
@@ -493,10 +449,31 @@ func applyEnv(c *Config) {
 	}
 }
 
+// knownUpstreams 当前支持的上游名（config 归一化与面板列勾选项用）。
+//
+// 与 pool 的 Backend* 常量同值：这里刻意不 import pool，因为 config 是纯数据层，
+// 不该为了两个字符串常量把一个调度包拉进依赖图。
+var knownUpstreams = []string{"codebuddy", "trae"}
+
 func (c *Config) normalize() error {
 	var err error
 	if c.Pool.Strategy, err = c.Pool.Strategy.Normalize(); err != nil {
 		return fmt.Errorf("pool.strategy: %w", err)
+	}
+	// 自动签到的分上游开关：把显式 false 之外的键都归一成 true。
+	//
+	// 为什么在 normalize 里补齐而不是在读取时判断：面板要能列出「当前账号池里
+	// 出现过的每个上游 + 各自的勾选状态」。若依赖 map 里「有键 = 启用」，新增
+	// 上游时面板会显示成未勾选（因为键不存在），用户看到的是「明明能签到却显示
+	// 关着」。这里把已知上游统一写成显式 true，缺省语义与显示语义就一致了。
+	// 未知键原样保留（未来上游不必改代码就能参与）。
+	if c.Schedule.CheckinBackends == nil {
+		c.Schedule.CheckinBackends = map[string]bool{}
+	}
+	for _, be := range knownUpstreams {
+		if _, ok := c.Schedule.CheckinBackends[be]; !ok {
+			c.Schedule.CheckinBackends[be] = true
+		}
 	}
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
@@ -595,11 +572,12 @@ func (c *Config) normalize() error {
 	if c.Pool.IdleWeightMax <= 0 {
 		c.Pool.IdleWeightMax = 5.0
 	}
+	// 传输层超时归一化（两个上游共用）。
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
 	}
 	// header 缺省回落 timeout（保"首字节前换号"既有语义）；idle 缺省走内置大值。
-	// 任务书约定：0 一律视为"未设置"走默认，真正的"禁用"留待后续（避免歧义）。
+	// 0 一律视为"未设置"走默认。
 	if c.Upstream.HeaderTimeoutSeconds <= 0 {
 		c.Upstream.HeaderTimeoutSeconds = c.Upstream.TimeoutSeconds
 	}
@@ -608,6 +586,27 @@ func (c *Config) normalize() error {
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
+	}
+	// listen 合法性：这行必须挡住**面板误填**。
+	//
+	// 背景：配置页的「监听地址」输入框会被浏览器自动填充（Safari 把用户昵称/
+	// 地址塞进 name="listen" 的框）。用户手滑保存后，config.json 里是一个非地址
+	// 字符串，进程下次启动直接 bind 失败、再也起不来——而面板此时也打不开，
+	// 只能手工改文件。前端已加 autocomplete 抑制（见 index.html），但那是
+	// 尽力而为（不同浏览器行为不一），落盘前的校验才是确定性防线。
+	//
+	// 用 net.SplitHostPort 而不是自己拼规则：它同时覆盖 ":7863"、
+	// "127.0.0.1:7863"、"[::1]:7863" 三种合法形态。
+	//
+	// 但它**不校验端口是不是数字**（":abc" 也能过），而 net.Listen 会因此失败，
+	// 所以端口单独再查一次：必须是 0~65535 的十进制整数。
+	_, port, err := net.SplitHostPort(c.Listen)
+	if err != nil {
+		return fmt.Errorf("listen 不是合法的监听地址（应为 :端口 或 主机:端口）：%q", c.Listen)
+	}
+	portNum, err := strconv.Atoi(port)
+	if err != nil || portNum < 0 || portNum > 65535 {
+		return fmt.Errorf("listen 的端口必须是 0~65535 的整数：%q", c.Listen)
 	}
 	// 空数组与 null 反序列化后覆盖掉 Default() 的排程值（键缺席才保留），在此补齐。
 	// 空 = 未配置 → 回落默认；「禁用」一律走 *_enabled=false，两者互不混淆。
@@ -642,6 +641,10 @@ func (c *Config) normalize() error {
 			c.Schedule.TaskSweepMinutes = 15
 		}
 		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
+	}
+	// 盲盒单次上限：<=0（含老配置缺键）回落 5；合法范围见 validateScheduleHours。
+	if c.Schedule.TravelBlindboxMaxPerRun <= 0 {
+		c.Schedule.TravelBlindboxMaxPerRun = 5
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err
@@ -696,6 +699,9 @@ func (c *Config) validateScheduleHours() error {
 	}
 	if err := checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours); err != nil {
 		return err
+	}
+	if n := c.Schedule.TravelBlindboxMaxPerRun; n < 1 || n > 20 {
+		return fmt.Errorf("schedule.travel_blindbox_max_per_run: %d 超出范围（1-20）；如要关闭盲盒请设 schedule.travel_blindbox_enabled=false", n)
 	}
 	return checkHourRange("schedule.growth_hours", "growth_enabled", c.Schedule.GrowthHours)
 }

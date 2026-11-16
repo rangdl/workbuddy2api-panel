@@ -42,32 +42,46 @@ const (
 )
 
 // fileVersion 是 usage.json 的当前格式版本。版本 2 增加积分观测字段，版本 3
-// 增加模型生效倍率分区，版本 4 增加前缀缓存命中/未命中累计；
-// 旧版本缺失字段按零值加载，旧数据不会丢弃。
-const fileVersion = 4
+// 增加模型生效倍率分区，版本 4 增加前缀缓存命中/未命中累计，版本 5 把
+// 「上游」从 realm 里拆出来独立成 Backend 字段（见下）。
+//
+// 旧版本缺失字段按零值加载，旧数据不会丢弃。版本 5 的升级由 migrateLegacyRealm
+// 处理：它把旧桶里误当 realm 存的上游名（"trae"）搬到 Backend，并把 realm
+// 修正为真实域，因此版本 4 及更早的数据读进来后语义正确。
+const fileVersion = 5
 
-// bucket 一个 (时间片, realm, uid, model, rate) 的累计量。
+// bucket 一个 (时间片, backend, realm, uid, model, rate) 的累计量。
 // JSON 字段名刻意取短，因为桶数量会随时间增长。
+//
+// **backend 与 realm 是两个正交维度，不能合并成一个字段。**
+// 曾经把上游名直接写进 Realm（Trae 账号 UsageLabel() 返回 "trae"），结果是
+// 面板「按域」看到 cn / global / trae 三行——把上游当成了与域同级的东西。
+// 真实关系是：CodeBuddy 有 cn、global 两个域；Trae 目前只有 cn 域。
+// 「按域」必须只按 realm 分组，「按上游」是另一个视图，两者各自成立。
+//
+// 旧数据的兼容：版本 4 及更早的桶里，Trae 的行是 Realm="trae"。加载时由
+// migrateLegacyRealm 把 Backend 置为 "trae"、Realm 置为账号真实域。
 type bucket struct {
-	Scope string  `json:"s"`            // "h:2006-01-02T15" 或 "d:2006-01-02"
-	Realm string  `json:"r"`            // cn / global
-	UID   string  `json:"u"`            // 账号 uid
-	Model string  `json:"m"`            // 上游裸模型名
-	Rate  string  `json:"x,omitempty"`  // 请求时生效积分倍率（规范化数值；旧桶为空）
-	Req   int64   `json:"q"`            // 请求数（含失败）
-	Err   int64   `json:"e"`            // 失败数
-	PT    int64   `json:"p"`            // prompt tokens
-	CT    int64   `json:"c"`            // completion tokens
-	TT    int64   `json:"t"`            // total tokens（上游给什么用什么的合计）
-	LatMs int64   `json:"l"`            // 延迟累计（ms）
-	LatN  int64   `json:"ln"`           // 延迟样本数
-	TPS   float64 `json:"v"`            // 吐字速率累计
-	TPSN  int64   `json:"vn"`           // 速率样本数
-	CR    float64 `json:"cr,omitempty"` // usage.credit 累计（仅明确存在的观测）
-	CRN   int64   `json:"cn,omitempty"` // usage.credit 样本数（区分缺字段与真实 0）
-	CRT   int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
-	CH    int64   `json:"ch,omitempty"` // 前缀缓存命中 token 累计（上游回该维度才累计）
-	CM    int64   `json:"cm,omitempty"` // 前缀缓存未命中 token 累计
+	Scope   string  `json:"s"`            // "h:2006-01-02T15" 或 "d:2006-01-02"
+	Backend string  `json:"b,omitempty"`  // 上游名（codebuddy / trae）；旧桶为空
+	Realm   string  `json:"r"`            // 域：cn / global
+	UID     string  `json:"u"`            // 账号 uid
+	Model   string  `json:"m"`            // 上游裸模型名
+	Rate    string  `json:"x,omitempty"`  // 请求时生效积分倍率（规范化数值；旧桶为空）
+	Req     int64   `json:"q"`            // 请求数（含失败）
+	Err     int64   `json:"e"`            // 失败数
+	PT      int64   `json:"p"`            // prompt tokens
+	CT      int64   `json:"c"`            // completion tokens
+	TT      int64   `json:"t"`            // total tokens（上游给什么用什么的合计）
+	LatMs   int64   `json:"l"`            // 延迟累计（ms）
+	LatN    int64   `json:"ln"`           // 延迟样本数
+	TPS     float64 `json:"v"`            // 吐字速率累计
+	TPSN    int64   `json:"vn"`           // 速率样本数
+	CR      float64 `json:"cr,omitempty"` // usage.credit 累计（仅明确存在的观测）
+	CRN     int64   `json:"cn,omitempty"` // usage.credit 样本数（区分缺字段与真实 0）
+	CRT     int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
+	CH      int64   `json:"ch,omitempty"` // 前缀缓存命中 token 累计（上游回该维度才累计）
+	CM      int64   `json:"cm,omitempty"` // 前缀缓存未命中 token 累计
 }
 
 // file 落盘结构。
@@ -149,22 +163,29 @@ type Delta struct {
 	HasCredit        bool
 	ModelRate        string
 	// CacheHitTokens / CacheMissTokens 前缀缓存命中/未命中观测（issue #92）。
-	HasCacheTokens   bool
-	CacheHitTokens   int64
-	CacheMissTokens  int64
-	LatencyMs        int64
-	HasLatency       bool
-	TokensPerSecond  float64
-	HasTPS           bool
+	HasCacheTokens  bool
+	CacheHitTokens  int64
+	CacheMissTokens int64
+	LatencyMs       int64
+	HasLatency      bool
+	TokensPerSecond float64
+	HasTPS          bool
 }
 
 // Add 记录一次请求尝试。
 //
 // ok=false 表示该次尝试失败（传输错误 / 上游 >=400 / 解析失败）。失败尝试通常
 // 没有 usage，但**仍要计入请求数与失败数**——重试放大正是靠这一列才看得出来。
-func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool) {
+//
+// backend 是上游名（codebuddy / trae），realm 是域（cn / global）。两者正交，
+// 绝不能拿上游名填 realm：那会让「按域」统计里冒出 trae 这种非域值（历史缺陷）。
+// backend 为空时退回 "codebuddy"——本字段出现前只有它一个上游，空值就是它。
+func (r *Recorder) Add(now time.Time, backend, realm, uid, model string, d Delta, ok bool) {
 	if r == nil {
 		return
+	}
+	if backend == "" {
+		backend = "codebuddy"
 	}
 	if realm == "" {
 		realm = "cn"
@@ -173,14 +194,14 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		model = "(unknown)"
 	}
 	scope := "h:" + now.Format(hourLayout)
-	key := scope + "|" + realm + "|" + uid + "|" + model + "|" + d.ModelRate
+	key := scope + "|" + backend + "|" + realm + "|" + uid + "|" + model + "|" + d.ModelRate
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	b := r.buckets[key]
 	if b == nil {
-		b = &bucket{Scope: scope, Realm: realm, UID: uid, Model: model, Rate: d.ModelRate}
+		b = &bucket{Scope: scope, Backend: backend, Realm: realm, UID: uid, Model: model, Rate: d.ModelRate}
 		r.buckets[key] = b
 	}
 	b.Req++
@@ -247,7 +268,7 @@ func (r *Recorder) Rollup(now time.Time) {
 			continue
 		}
 		day := "d:" + ts.Format(dayLayout)
-		moves = append(moves, move{from: k, to: day + "|" + b.Realm + "|" + b.UID + "|" + b.Model + "|" + b.Rate})
+		moves = append(moves, move{from: k, to: day + "|" + b.Backend + "|" + b.Realm + "|" + b.UID + "|" + b.Model + "|" + b.Rate})
 	}
 	for _, m := range moves {
 		src := r.buckets[m.from]
@@ -300,10 +321,60 @@ func (r *Recorder) load() error {
 	}
 	for i := range f.Buckets {
 		b := f.Buckets[i]
-		r.buckets[b.Scope+"|"+b.Realm+"|"+b.UID+"|"+b.Model+"|"+b.Rate] = &b
+		migrateLegacyRealm(&b)
+		r.buckets[bucketKey(&b)] = &b
 	}
 	log.Printf("[usage] 已恢复 %d 个用量桶（%s）", len(r.buckets), r.path)
 	return nil
+}
+
+// bucketKey 桶的内存键。六个维度必须与 Add 里拼的完全一致，
+// 否则「同一维度组合」会分裂成两个桶（重启后数据翻倍）。
+func bucketKey(b *bucket) string {
+	return b.Scope + "|" + b.Backend + "|" + b.Realm + "|" + b.UID + "|" + b.Model + "|" + b.Rate
+}
+
+// legacyUpstreamRealms 是历史上被误当作 realm 存下来的**上游名**。
+//
+// 版本 4 及更早，Trae 账号的 UsageLabel() 返回 "trae"，而那个值被直接写进了
+// 桶的 Realm 字段。于是「按域」统计里出现 cn / global / trae 三行——把上游
+// 与域混成了同一维度。凡是在这个集合里的旧 realm 值，都还原成 Backend。
+var legacyUpstreamRealms = map[string]string{
+	"trae":      "trae",
+	"codebuddy": "codebuddy",
+}
+
+// migrateLegacyRealm 把旧桶里「上游名充当 realm」的值搬回 Backend 字段。
+//
+// 迁移后 Realm 需要真实域，但旧桶没存过域。归到 "cn" 是**有依据的推断**：
+// 版本 4 期间 Trae 只有 cn 域（global 支持是 CodeBuddy 专有），所以那些桶
+// 的真实域必然是 cn。这一点由 backend/trae 的 UsageLabel 历史实现可证。
+//
+// **同时作废这些桶上的积分字段。** 旧版 Trae 的 credit 是用「token × 模型倍率」
+// 估算出来的，而 consumption_rate 是相对倍率（x0.06 那种）、不是每 token 积分数，
+// 结果虚高约 1500 倍（实测：152.28 积分 / 2538 token = 3.7 万积分/百万 token，
+// 而真实量级是个位数）。这些数字没有任何保留价值，留着会让「平均积分/1M token」
+// 这类派生指标永远失真。token 计数是真实观测，一律保留。
+//
+// 幂等：迁移后 backend 非空、realm 已是 cn/global，再跑一次不会改动。
+func migrateLegacyRealm(b *bucket) {
+	if b.Backend != "" {
+		return // 已经是新格式
+	}
+	if name, ok := legacyUpstreamRealms[b.Realm]; ok {
+		b.Backend = name
+		// 旧桶的 realm 是上游名，丢了真实域；当时只有单一域可选，回落 cn。
+		b.Realm = "cn"
+		if name == "trae" {
+			// 作废估算出来的积分（理由见上）。只清 Trae：CodeBuddy 的 credit
+			// 是上游在 usage 里直接给的实测值，一直是对的。
+			b.CR, b.CRN, b.CRT = 0, 0, 0
+		}
+		return
+	}
+	// 其余旧桶只有 CodeBuddy 一个上游，Backend 留空即由 Add/展示层按 codebuddy 处理；
+	// 这里显式补上，让内存里的桶字段完整（键也包含它）。
+	b.Backend = "codebuddy"
 }
 
 func (r *Recorder) flush(force bool) {
@@ -410,9 +481,13 @@ func (g *aggAcc) finish() Agg {
 
 // KeyedAgg 按某个维度聚合的一行。
 type KeyedAgg struct {
-	Key   string `json:"key"`
+	Key string `json:"key"`
+	// Realm 域（cn / global）；只有按账号维度用它做「域」列。
 	Realm string `json:"realm,omitempty"`
-	Extra string `json:"extra,omitempty"` // 账号行放昵称
+	// Backend 上游名（codebuddy / trae）。**与 Realm 正交**，展示层要分两列，
+	// 不能像历史上那样把上游名塞进 Realm（那会让「按域」出现 trae 行）。
+	Backend string `json:"backend,omitempty"`
+	Extra   string `json:"extra,omitempty"` // 账号行放昵称
 	Agg
 }
 
@@ -426,8 +501,10 @@ type Point struct {
 // CreditAgg 积分扣除统计的一行。Key 在账号维度是 UID，在模型维度是裸模型名；
 // Rate 仅模型维度使用；比例分母只统计与 credit 同时存在的 Token 样本。
 type CreditAgg struct {
-	Key                string  `json:"key"`
-	Realm              string  `json:"realm,omitempty"`
+	Key   string `json:"key"`
+	Realm string `json:"realm,omitempty"`
+	// Backend 上游名，与 Realm 正交（见 KeyedAgg 的同名字段注释）。
+	Backend            string  `json:"backend,omitempty"`
 	Nickname           string  `json:"nickname,omitempty"`
 	Rate               string  `json:"rate,omitempty"`
 	Requests           int64   `json:"requests"`
@@ -466,11 +543,19 @@ func (a *creditAcc) finish() CreditAgg {
 
 // Snapshot 面板一次拉取的全部用量视图数据。
 type Snapshot struct {
-	Totals          Agg         `json:"totals"`
-	ByRealm         []KeyedAgg  `json:"by_realm"`
-	ByAccount       []KeyedAgg  `json:"by_account"`
-	ByModel         []KeyedAgg  `json:"by_model"`
-	Series          []Point     `json:"series"`
+	Totals    Agg        `json:"totals"`
+	ByRealm   []KeyedAgg `json:"by_realm"`
+	ByBackend []KeyedAgg `json:"by_backend"`
+	ByAccount []KeyedAgg `json:"by_account"`
+	ByModel   []KeyedAgg `json:"by_model"`
+	Series    []Point    `json:"series"`
+	// ByRealmBackend 域 × 上游的交叉视图（可选展示）。
+	//
+	// 为什么需要交叉：域和上游正交后，「cn 域一共多少」与「Trae 一共多少」
+	// 是两个都对但都不完整的问题——同一个 cn 域里既有 CodeBuddy 也有 Trae。
+	// 按域看会看到 Trae 的流量被算进 cn，按上游看会看到 CodeBuddy 的 cn/global
+	// 被合并。交叉表让「cn 域里 Trae 占多少」这种问题可以直接回答。
+	ByRealmBackend  []KeyedAgg  `json:"by_realm_backend"`
 	CreditByAccount []CreditAgg `json:"credit_by_account"`
 	CreditByModel   []CreditAgg `json:"credit_by_model"`
 	Buckets         int         `json:"buckets"`
@@ -567,8 +652,11 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 
 	var total aggAcc
 	realmAgg := map[string]*aggAcc{}
+	backendAgg := map[string]*aggAcc{}
+	realmBackendAgg := map[string]*aggAcc{}
 	acctAgg := map[string]*aggAcc{}
 	acctRealm := map[string]string{}
+	acctBackend := map[string]string{}
 	modelAgg := map[string]*aggAcc{}
 	hourSeries := map[string]*aggAcc{}
 	daySeries := map[string]*aggAcc{}
@@ -606,14 +694,29 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 		}
 		realmAgg[b.Realm].add(b)
 
+		if backendAgg[b.Backend] == nil {
+			backendAgg[b.Backend] = &aggAcc{}
+		}
+		backendAgg[b.Backend].add(b)
+
+		// 域 × 上游交叉键用 "域/上游"（域在前：用户先问「cn 域」再问「谁在用」）。
+		rk := b.Realm + "/" + b.Backend
+		if realmBackendAgg[rk] == nil {
+			realmBackendAgg[rk] = &aggAcc{}
+		}
+		realmBackendAgg[rk].add(b)
+
 		if acctAgg[b.UID] == nil {
 			acctAgg[b.UID] = &aggAcc{}
 		}
 		acctAgg[b.UID].add(b)
-		// 一个账号只属于一个 realm，这里记下来供前端展示「域」列；
-		// keyed() 的 Realm 字段默认是空的（它按 key 分组，不知道 realm）。
+		// 一个账号只属于一个 (域, 上游)，这里记下来供前端展示两列；
+		// keyed() 的 Realm/Backend 字段默认是空的（它按 key 分组，不知道这两个维度）。
 		if acctRealm[b.UID] == "" {
 			acctRealm[b.UID] = b.Realm
+		}
+		if acctBackend[b.UID] == "" {
+			acctBackend[b.UID] = b.Backend
 		}
 
 		if modelAgg[b.Model] == nil {
@@ -640,6 +743,7 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 				ca = &creditAcc{CreditAgg: CreditAgg{
 					Key:      b.UID,
 					Realm:    b.Realm,
+					Backend:  b.Backend,
 					Nickname: nicks[b.UID],
 				}}
 				creditAcctAgg[b.UID] = ca
@@ -649,7 +753,9 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 			model := canonicalUsageModel(b.Model)
 			rate := b.Rate
 			if rate == "" && currentRate != nil {
-				cacheKey := b.Realm + "\x00" + model
+				// 倍率按 (上游, 域, 模型) 取：不同上游的同一模型名可能倍率不同，
+				// 只按域做键会让 Trae 的模型套上 CodeBuddy 的倍率。
+				cacheKey := b.Backend + "\x00" + b.Realm + "\x00" + model
 				if cached, ok := rateCache[cacheKey]; ok {
 					rate = cached
 				} else {
@@ -672,6 +778,9 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 		ByRealm: keyed(realmAgg, func(k string) (string, string) {
 			return k, ""
 		}),
+		ByBackend: keyed(backendAgg, func(k string) (string, string) {
+			return k, ""
+		}),
 		ByAccount: keyed(acctAgg, func(k string) (string, string) {
 			return k, nicks[k]
 		}),
@@ -681,8 +790,24 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 		Buckets:         matched,
 		Generated:       time.Now().Format(time.RFC3339),
 	}
+	// 交叉视图的 Key 是 "域/上游"，拆回两列给前端，免得再解析字符串。
+	for k, acc := range realmBackendAgg {
+		realm, backend, ok := strings.Cut(k, "/")
+		if !ok {
+			continue
+		}
+		row := KeyedAgg{Key: k, Realm: realm, Backend: backend, Agg: acc.finish()}
+		snap.ByRealmBackend = append(snap.ByRealmBackend, row)
+	}
+	sort.Slice(snap.ByRealmBackend, func(i, j int) bool {
+		if snap.ByRealmBackend[i].Realm != snap.ByRealmBackend[j].Realm {
+			return snap.ByRealmBackend[i].Realm < snap.ByRealmBackend[j].Realm
+		}
+		return snap.ByRealmBackend[i].Backend < snap.ByRealmBackend[j].Backend
+	})
 	for i := range snap.ByAccount {
 		snap.ByAccount[i].Realm = acctRealm[snap.ByAccount[i].Key]
+		snap.ByAccount[i].Backend = acctBackend[snap.ByAccount[i].Key]
 	}
 
 	// 日点（升序）+ 小时点（升序）拼成一条连续时序。

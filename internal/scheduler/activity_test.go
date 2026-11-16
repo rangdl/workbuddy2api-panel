@@ -5,21 +5,32 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
-// fastActivity 关闭活跃上报账号间限速，避免测试白等 800ms。
+// fastActivity 关闭活跃上报账号间限速与 streak 回读等待，避免测试白等。
+//
+// streak 等待发生在账号实现内部（backend/codebuddy），必须经它的 setter 关，
+// 改 scheduler 侧同名变量是无效的——那样每个账号会真等 8 秒。
 func fastActivity(t *testing.T) {
 	t.Helper()
 	old := activityAccountDelay
+	oldSettle := backendcb.ActivityStreakSettle()
 	activityAccountDelay = 0
-	t.Cleanup(func() { activityAccountDelay = old })
+	backendcb.SetActivityStreakSettle(0)
+	t.Cleanup(func() {
+		activityAccountDelay = old
+		backendcb.SetActivityStreakSettle(oldSettle)
+	})
 }
 
 // reportStub 记录 /v2/report 调用次数与 userId。
@@ -53,10 +64,10 @@ func TestRunActivityNowReportsEachAccount(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
-	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
-	s := New(Config{Pool: p, Upstream: up})
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, &auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	s := New(Config{Pool: p})
 
 	s.RunActivityNow()
 
@@ -76,12 +87,12 @@ func TestRunActivityNowSkipsDisabledAndNoToken(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "ok", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
-	p.Add(&auth.Auth{UID: "dis", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
-	p.Add(&auth.Auth{UID: "notoken", AccessToken: "", RefreshToken: "", ExpiresAt: 9999999999})
-	p.Disable("dis", "test")
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
-	s := New(Config{Pool: p, Upstream: up})
+	p.Add(cbAccount(up, &auth.Auth{UID: "ok", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, &auth.Auth{UID: "dis", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, &auth.Auth{UID: "notoken", AccessToken: "", RefreshToken: "", ExpiresAt: 9999999999}))
+	p.Disable("dis", "test")
+	s := New(Config{Pool: p})
 
 	s.RunActivityNow()
 
@@ -112,10 +123,10 @@ func TestRunActivityNowErrorDoesNotAbort(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "fail", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
-	p.Add(&auth.Auth{UID: "ok", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
-	s := New(Config{Pool: p, Upstream: up})
+	p.Add(cbAccount(up, &auth.Auth{UID: "fail", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, &auth.Auth{UID: "ok", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	s := New(Config{Pool: p})
 
 	s.RunActivityNow() // 不应 panic
 
@@ -161,9 +172,9 @@ func (s *activityStreakStub) handler() http.Handler {
 func activityStreakScheduler(t *testing.T, srv *httptest.Server) (*Scheduler, *pool.Pool) {
 	t.Helper()
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
-	return New(Config{Pool: p, Upstream: up}), p
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	return New(Config{Pool: p}), p
 }
 
 // TestRunActivityNowSelfCheckDaysNormal 上报成功后回读 streak：days>=1 → 无告警。
@@ -174,18 +185,16 @@ func TestRunActivityNowSelfCheckDaysNormal(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
-	s := New(Config{Pool: p, Upstream: up})
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	s := New(Config{Pool: p})
 
 	s.RunActivityNow()
 	if stub.reportCalls.Load() != 1 || stub.streakHits.Load() != 1 {
 		t.Errorf("report_calls=%d streak_hits=%d want 1/1", stub.reportCalls.Load(), stub.streakHits.Load())
 	}
-	// days>=1：checkActivityStreak 返回 false（无可疑）。
-	if s.checkActivityStreak(p.AuthByUID("u1")) {
-		t.Fatal("days>=1 不告警")
-	}
+	// days>=1：账号内部回读后不告警。回读发生在 ReportActivity 内，
+	// 上面已断言 streakHits==1（确实回读了）。
 }
 
 // TestRunActivityNowSelfCheckSilentDrop 上报 200 但 streak.days=0 → 告警（silent drop?）。
@@ -196,12 +205,13 @@ func TestRunActivityNowSelfCheckSilentDrop(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
-	s := New(Config{Pool: p, Upstream: up})
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 
-	if !s.checkActivityStreak(p.AuthByUID("u1")) {
-		t.Fatal("days=0 应告警（上报 200 但 silent drop?）")
+	// days=0 → 账号实现返回带 "silent drop?" 的说明。
+	out := reportActivityOf(t, p, "u1")
+	if !strings.Contains(out.Message, "silent drop") {
+		t.Errorf("days=0 应提示 silent drop，实际 message=%q", out.Message)
 	}
 }
 
@@ -213,13 +223,13 @@ func TestRunActivityNowSelfCheckGETFailure(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
-	s := New(Config{Pool: p, Upstream: up})
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
 
-	// 直接断言 checkActivityStreak：GET 失败 → 告警。
-	if !s.checkActivityStreak(p.AuthByUID("u1")) {
-		t.Fatal("streak GET 失败应告警（reported but unverifiable）")
+	// streak GET 失败 → 账号实现返回 "streak check failed"（上报本身已成功）。
+	out := reportActivityOf(t, p, "u1")
+	if !strings.Contains(out.Message, "streak check failed") {
+		t.Errorf("GET 失败应提示 unverifiable，实际 message=%q", out.Message)
 	}
 	// 回读是只读 oracle：GET 失败不影响已发生的上报本轮走通（遍历继续）。
 	if stub.streakHits.Load() != 1 {
@@ -244,9 +254,9 @@ func TestRunActivityNowSkipsSelfCheckOnReportFail(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
-	s := New(Config{Pool: p, Upstream: up})
+	p.Add(cbAccount(up, &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	s := New(Config{Pool: p})
 
 	s.RunActivityNow() // 不上报成功 → 无自检
 	if streakHits.Load() != 0 {
@@ -405,10 +415,8 @@ func TestRunDispatchesActivityAndTravel(t *testing.T) {
 	fastTravel(t)
 	// 空 pool → RunActivityNow/RunTravelNow 遍历 0 账号即返回，不阻塞。
 	p := pool.New("")
-	up := &upstream.Client{}
 	s := New(Config{
 		Pool:           p,
-		Upstream:       up,
 		CheckinHours:   []int{},
 		TravelHours:    []int{},
 		ActivityHours:  []int{},
@@ -474,7 +482,6 @@ func TestRunActivityNowReportsGlobalAccount(t *testing.T) {
 	defer globalSrv.Close()
 
 	p := pool.New("")
-	p.Add(globalAccount(t, "g1"))
 	// global base 单独指向另一台 server：断言路由按 realm 切，不碰 CN 端点。
 	up := &upstream.Client{
 		HTTP:              cnSrv.Client(),
@@ -484,7 +491,8 @@ func TestRunActivityNowReportsGlobalAccount(t *testing.T) {
 		ChatBaseGlobal:    globalSrv.URL,
 		BillingBaseGlobal: globalSrv.URL,
 	}
-	s := New(Config{Pool: p, Upstream: up})
+	p.Add(cbAccount(up, globalAccount(t, "g1")))
+	s := New(Config{Pool: p})
 
 	s.RunActivityNow()
 
@@ -518,8 +526,6 @@ func TestRunActivityNowMixedPoolReportsBoth(t *testing.T) {
 	defer globalSrv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "cn1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
-	p.Add(globalAccount(t, "g1"))
 	up := &upstream.Client{
 		HTTP:              cnSrv.Client(),
 		GlobalEnabled:     true,
@@ -528,7 +534,9 @@ func TestRunActivityNowMixedPoolReportsBoth(t *testing.T) {
 		ChatBaseGlobal:    globalSrv.URL,
 		BillingBaseGlobal: globalSrv.URL,
 	}
-	s := New(Config{Pool: p, Upstream: up})
+	p.Add(cbAccount(up, &auth.Auth{UID: "cn1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	p.Add(cbAccount(up, globalAccount(t, "g1")))
+	s := New(Config{Pool: p})
 
 	s.RunActivityNow()
 
@@ -560,8 +568,6 @@ func TestRunActivityNowGlobalErrorDoesNotSkipCN(t *testing.T) {
 	defer globalSrv.Close()
 
 	p := pool.New("")
-	p.Add(globalAccount(t, "g1"))
-	p.Add(&auth.Auth{UID: "cn1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 	up := &upstream.Client{
 		HTTP:              cnSrv.Client(),
 		GlobalEnabled:     true,
@@ -570,7 +576,9 @@ func TestRunActivityNowGlobalErrorDoesNotSkipCN(t *testing.T) {
 		ChatBaseGlobal:    globalSrv.URL,
 		BillingBaseGlobal: globalSrv.URL,
 	}
-	s := New(Config{Pool: p, Upstream: up})
+	p.Add(cbAccount(up, globalAccount(t, "g1")))
+	p.Add(cbAccount(up, &auth.Auth{UID: "cn1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}))
+	s := New(Config{Pool: p})
 
 	s.RunActivityNow() // 不应 panic
 
@@ -592,7 +600,6 @@ func TestCheckinStillSkipsGlobal(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(globalAccount(t, "g1"))
 	up := &upstream.Client{
 		HTTP:              srv.Client(),
 		GlobalEnabled:     true,
@@ -601,11 +608,34 @@ func TestCheckinStillSkipsGlobal(t *testing.T) {
 		ChatBaseGlobal:    srv.URL,
 		BillingBaseGlobal: srv.URL,
 	}
-	s := New(Config{Pool: p, Upstream: up})
+	p.Add(cbAccount(up, globalAccount(t, "g1")))
+	s := New(Config{Pool: p})
 
 	s.RunCheckinNow()
 
 	if n := hits.Load(); n != 0 {
 		t.Errorf("checkin global 上游调用=%d want 0（签到仍应跳过 global）", n)
 	}
+}
+
+// reportActivityOf 直接调账号的 ReportActivity（测试用）。
+//
+// 为什么不走 scheduler.checkActivityStreak：那个方法已删——回读逻辑现在在
+// 账号实现内部（backend/codebuddy 的 Account.ReportActivity），调度器只负责
+// 遍历。测试要断言「回读结果如何表述」，就得问账号对象本身。
+func reportActivityOf(t *testing.T, p *pool.Pool, uid string) gateway.ActivityOutcome {
+	t.Helper()
+	acc := p.Account(uid)
+	if acc == nil {
+		t.Fatalf("账号 %s 不在池中", uid)
+	}
+	rep, ok := acc.(gateway.ActivityReporter)
+	if !ok {
+		t.Fatalf("账号 %s 未实现 ActivityReporter", uid)
+	}
+	out, err := rep.ReportActivity(context.Background())
+	if err != nil {
+		t.Fatalf("ReportActivity: %v", err)
+	}
+	return out
 }

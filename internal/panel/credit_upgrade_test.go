@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -219,12 +220,14 @@ func upgNewEnv(t *testing.T, seeds ...upgSeed) *upgEnv {
 	}
 	e.pool = pool.New(stateFile)
 	t.Cleanup(e.pool.Close)
+	e.up = &upstream.Client{HTTP: fake.srv.Client(), ChatBaseCN: fake.srv.URL, BillingBaseCN: fake.srv.URL}
 	auths, err := auth.LoadDir(authDir)
 	if err != nil {
 		t.Fatalf("LoadDir: %v", err)
 	}
-	e.pool.SyncToDir(auths)
-	e.up = &upstream.Client{HTTP: fake.srv.Client(), ChatBaseCN: fake.srv.URL, BillingBaseCN: fake.srv.URL}
+	// 与生产同款包装：账号对象必须持有 client，否则 Credits/Checkin 恒返回
+	// ErrUnsupported（panel.WrapAuth 不带依赖，只用于纯占位场景）。
+	e.pool.SyncToDir(backendcb.WrapWithClient(auths, e.up, nil))
 	e.ledger = credithist.New(e.ledgerPath, 2000)
 	e.up.SetCreditObserver(e.ledger.Observe)
 	e.panel = New(Config{
@@ -260,7 +263,7 @@ func (e *upgEnv) addAccount(uid, nickname string) {
 	}
 	a.FilePath = path
 	e.fake.register(uid, 0)
-	e.pool.Add(a)
+	e.pool.Add(backendcb.WrapWithClient([]*auth.Auth{a}, e.up, nil)[0])
 }
 
 // balance 走面板单号余额刷新接口，触发一次真实上游余额查询（观察者由此留痕）。
@@ -603,17 +606,17 @@ func TestUpgRestartContinuesBaseline(t *testing.T) {
 	}
 	p2 := pool.New(e.stateFile)
 	t.Cleanup(p2.Close)
+	up2 := &upstream.Client{HTTP: e.fake.srv.Client(), ChatBaseCN: e.fake.srv.URL, BillingBaseCN: e.fake.srv.URL}
 	auths, err := auth.LoadDir(e.authDir)
 	if err != nil {
 		t.Fatalf("LoadDir: %v", err)
 	}
-	p2.SyncToDir(auths)
+	p2.SyncToDir(backendcb.WrapWithClient(auths, up2, nil))
 	st, ok := p2.Status("u1")
 	if !ok || st.Credits != 150 {
 		t.Fatalf("重启后余额快照应保留 150，得到 ok=%v %+v", ok, st)
 	}
 
-	up2 := &upstream.Client{HTTP: e.fake.srv.Client(), ChatBaseCN: e.fake.srv.URL, BillingBaseCN: e.fake.srv.URL}
 	up2.SetCreditObserver(l2.Observe)
 	pn2 := New(Config{Version: "test", APIKey: "test-key", Pool: p2, Upstream: up2, CreditHistory: l2, AuthDir: e.authDir})
 

@@ -145,7 +145,7 @@ func (r *Router) LookupForModel(key, model string) (string, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, found := r.entries[key]
-	if !found || expired(e, now, r.cfg.TTL) || !available[e.uid] {
+	if !found || expired(e, now, r.cfg.TTL) || !availableFor(available, e.uid) {
 		return "", false
 	}
 	r.entries[key] = entry{uid: e.uid, lastActive: now}
@@ -169,7 +169,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	e, found := r.entries[key]
 	r.mu.RUnlock()
 	if found && !expired(e, now, r.cfg.TTL) {
-		if available[e.uid] {
+		if availableFor(available, e.uid) {
 			r.touch(key, e.uid, now)
 			return e.uid, true
 		}
@@ -283,13 +283,36 @@ func (r *Router) gcOnce(now time.Time) int {
 }
 
 // availableSet 把 AvailableForModel(model) 的有序列表转集合（快路径命中校验用）。
+// availableSet 返回可用账号集合。
+//
+// 键同时收录裸 uid 与"带前缀"的等价形态：绑定值可能是 "backend:uid"
+// （多上游部署下用于锁定上游），而可用集来自 pool 的裸 uid 列表。
+// session 刻意**不解析** backend——它只做"这个绑定值是否仍可用"的集合查询，
+// 前缀是什么含义属于调用方（server 层）的事。
 func (r *Router) availableSet(model string) map[string]bool {
 	uids := r.availableSlice(model)
-	set := make(map[string]bool, len(uids))
+	set := make(map[string]bool, len(uids)*2)
 	for _, u := range uids {
 		set[u] = true
+		if i := strings.IndexByte(u, ':'); i >= 0 {
+			set[u[i+1:]] = true // 列表本身带前缀时也收裸形态
+		}
 	}
 	return set
+}
+
+// availableFor 报告绑定值 uid 是否在可用集内。
+//
+// 绑定值可能带 "backend:" 前缀；可用集是裸 uid。两者按裸 uid 比对——
+// 前缀只用于让调用方挑对上游，不参与"是否可用"的判定。
+func availableFor(set map[string]bool, uid string) bool {
+	if set[uid] {
+		return true
+	}
+	if i := strings.IndexByte(uid, ':'); i >= 0 {
+		return set[uid[i+1:]]
+	}
+	return false
 }
 
 // availableSlice 安全调用 AvailableForModel；未注入时回落 Available（nil 视空池）。

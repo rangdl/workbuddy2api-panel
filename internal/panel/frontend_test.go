@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -118,7 +119,7 @@ try {
 		t.Fatal(err)
 	}
 	hf.Close()
-	for _, hash := range []string{"#taskscenter", "#accounts", "#usage", "#models", "#config", "#logs", "#packages"} {
+	for _, hash := range []string{"#taskscenter", "#accounts", "#usage", "#models", "#config", "#upstream", "#logs", "#packages"} {
 		cmd := exec.Command(node, hf.Name(), "app.js")
 		cmd.Dir = "." // 测试工作目录 = internal/panel
 		cmd.Env = append(os.Environ(), "SMOKE_HASH="+hash)
@@ -384,7 +385,8 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function mdRateValue');
 const end = src.indexOf('function mdRowHtml');
 if (start < 0 || end < 0) throw new Error('model filter helpers not found');
-const ctx = { Number, String, Array, Object, isFinite, parseFloat };
+const ctx = { Number, String, Array, Object, isFinite, parseFloat,
+  BACKEND_LABEL: { codebuddy: 'WorkBuddy', trae: 'Trae' } };
 vm.createContext(ctx);
 vm.runInContext(src.slice(start, end) + '\nthis.mdMatch=mdMatch; this.mdSortList=mdSortList; this.mdRateValue=mdRateValue;', ctx);
 const models = [
@@ -448,6 +450,86 @@ process.stdout.write(JSON.stringify({
 		`"rateFree":0,"rateMissing":null}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("model filter=%s\nwant %s", out, want)
+	}
+}
+
+// 按上游筛选 + 上游徽标：Trae 的 ID 是 "trae:cn:<模型>"（三段），WorkBuddy 是
+// "<realm>:<模型>"（两段）。域筛选若只看 startsWith(realm+":")，Trae 的 CN 模型
+// 会被判成非 CN 而整片消失——这是加 Trae 后最容易踩的坑。
+//
+// 徽标文案断言 WorkBuddy·CN：展示名全站唯一一份（accounts.js 的 BACKEND_LABEL），
+// 这里注入的桩必须与那份一致，否则测的就不是真实文案。
+func TestAppJSModelUpstreamFilter(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; model upstream filter test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function mdRateValue');
+const end = src.indexOf('function mdRowHtml');
+if (start < 0 || end < 0) throw new Error('model filter helpers not found');
+const ctx = { Number, String, Array, Object, isFinite, parseFloat, esc: s => String(s),
+  fmtK: n => { n = Number(n || 0); return n >= 1000 ? Math.round(n / 1000) + 'K' : String(n); },
+  BACKEND_LABEL: { codebuddy: 'WorkBuddy', trae: 'Trae' } };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.mdMatch=mdMatch; this.mdSortList=mdSortList; this.mdUpstreamTag=mdUpstreamTag; this.mdUpstreamOf=mdUpstreamOf; this.mdRealmOf=mdRealmOf;', ctx);
+const models = [
+  { id: 'cn:glm-5.2', upstream: 'codebuddy', name: 'GLM-5.2' },
+  { id: 'global:hy3', upstream: 'codebuddy', name: 'Hy3 Global' },
+  { id: 'trae:cn:doubao-seed', upstream: 'trae', name: 'Doubao Seed' },
+  { id: 'trae:cn:deepseek-v4', upstream: 'trae', name: 'DeepSeek V4' },
+  // 无 upstream 字段的老条目：必须按 ID 前缀回退，而不是整片空白。
+  { id: 'trae:cn:legacy', name: 'Legacy Trae' },
+];
+const ids = list => list.map(m => m.id);
+const filter = f => ids(ctx.mdSortList(models.filter(m => ctx.mdMatch(m, f)), f));
+process.stdout.write(JSON.stringify({
+  all: ids(models),
+  traeOnly: filter({ upstream: 'trae' }),
+  buddyOnly: filter({ upstream: 'codebuddy' }),
+  cnRealm: filter({ realm: 'cn' }),
+  traeCnRealm: filter({ upstream: 'trae', realm: 'cn' }),
+  traeGlobalRealm: filter({ upstream: 'trae', realm: 'global' }),
+  legacyUpstream: ctx.mdUpstreamOf(models[4]),
+  realmOfTrae: ctx.mdRealmOf(models[2]),
+  realmOfBuddy: ctx.mdRealmOf(models[0]),
+  // 明细视图不再挂标签（ID 自带 cn: / trae:cn: 前缀），mdUpstreamTag 恒为空。
+  detailTagEmpty: ['cn:glm-5.2','global:hy3','trae:cn:doubao-seed'].every(id =>
+    ctx.mdUpstreamTag({ id }) === ''),
+  // 合并视图的来源徽标显示**可直填的调用前缀**（wb:cn / trae:global）。
+  provBuddyCn: ctx.mdProviderTag({upstream:'codebuddy',realm:'cn',id:'cn:x'}, false).replace(/<[^>]*>/g,''),
+  provTraeGlobal: ctx.mdProviderTag({upstream:'trae',realm:'global',id:'trae:global:x'}, false).replace(/<[^>]*>/g,''),
+  // 两个来源的外观必须完全一致：把色条类名与文字抹平后，HTML 应逐字相同。
+  sameLook: (() => {
+    const norm = h => h.replace(/up-(trae|codebuddy)/, 'UP').replace(/>[^<]*</g, '>TEXT<');
+    return norm(ctx.mdProviderTag({upstream:'trae',realm:'cn',id:'x'}, false)) ===
+           norm(ctx.mdProviderTag({upstream:'codebuddy',realm:'cn',id:'x'}, false));
+  })(),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "model-upstream-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("model upstream filter node test failed: %v\n%s", err, out)
+	}
+	const want = `{"all":["cn:glm-5.2","global:hy3","trae:cn:doubao-seed","trae:cn:deepseek-v4","trae:cn:legacy"],` +
+		`"traeOnly":["trae:cn:doubao-seed","trae:cn:deepseek-v4","trae:cn:legacy"],` +
+		`"buddyOnly":["cn:glm-5.2","global:hy3"],` +
+		`"cnRealm":["cn:glm-5.2","trae:cn:doubao-seed","trae:cn:deepseek-v4","trae:cn:legacy"],` +
+		`"traeCnRealm":["trae:cn:doubao-seed","trae:cn:deepseek-v4","trae:cn:legacy"],` +
+		`"traeGlobalRealm":[],` +
+		`"legacyUpstream":"trae","realmOfTrae":"cn","realmOfBuddy":"cn",` +
+		`"detailTagEmpty":true,"provBuddyCn":"wb:cn","provTraeGlobal":"trae:global","sameLook":true}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("model upstream filter=%s\nwant %s", out, want)
 	}
 }
 
@@ -811,7 +893,7 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("expiry summary node test failed: %v\n%s", err, out)
 	}
-	const want = `{"rows":[{"days":1,"credits":50},{"days":7,"credits":70}],"accountCount":3,"unavailable":1,"colorA":"#4f8cff","colorB":"#25b08b"}`
+	const want = `{"rows":[{"days":1,"credits":50},{"days":7,"credits":70}],"accountCount":3,"unavailable":1,"colorA":"#e2607a","colorB":"#25b08b"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry summary=%s want %s", out, want)
 	}
@@ -839,21 +921,37 @@ const mk = v => ({ type: 'text', value: v });
 const cfgForm = { elements: {
   listen: mk(''),
   api_key: mk('secret'),
-  user_agent: mk(''),
   prompt_file: mk(''),
   checkin_hours: mk(''),
 }};
+// user_agent 已迁到 codebuddy.json（上游配置独立成文件），由 collectCodeBuddyConfig
+// 处理；它对"空串 = 恢复内置默认"的语义与 collectConfig 的覆盖型字段一致。
+const cbEls = {
+  cbTimeout: mk(''), cbHeaderTimeout: mk(''), cbIdleTimeout: mk(''),
+  cbUserAgent: mk(''), cbClientVersion: mk(''), cbCliVersion: mk(''),
+  cbChatBase: mk(''), cbGlobalChatBase: mk(''),
+  cbGlobalEnabled: { type: 'checkbox', checked: true },
+  cbSanitize: { type: 'checkbox', checked: false },
+};
 const ctx = {
   Date, Number, String, Math, Map, Array, Object, isNaN, URLSearchParams, Set,
+  BACKEND_LABEL: { codebuddy: 'WorkBuddy', trae: 'Trae' },
   document: { getElementById: id => (id === 'cfgForm' ? cfgForm : null) },
-  $: id => (id === 'cfgForm' ? cfgForm : null),
+  $: id => (id === 'cfgForm' ? cfgForm : (cbEls[id] || null)),
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.collectConfig = collectConfig;', ctx);
+// collectCodeBuddyConfig 定义在 CFG_MAP 区间之外（它属于上游配置区块），
+// 单独按函数名截出来一起求值。
+const cbStart = src.indexOf('function collectCodeBuddyConfig()');
+const cbEnd = src.indexOf('/* loadTraeConfig', cbStart);
+if (cbStart < 0 || cbEnd < 0) throw new Error('collectCodeBuddyConfig region not found');
+vm.runInContext(src.slice(start, end) + '\n' + src.slice(cbStart, cbEnd) +
+  '\nthis.collectConfig = collectConfig; this.collectCodeBuddyConfig = collectCodeBuddyConfig;', ctx);
 const out = ctx.collectConfig();
+const cb = ctx.collectCodeBuddyConfig();
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
 process.stdout.write(JSON.stringify([
-  has(out.upstream, 'user_agent'), (out.upstream || {}).user_agent,
+  has(cb, 'user_agent'), (cb || {}).user_agent,
   has(out.prompt, 'file'), (out.prompt || {}).file,
   has(out, 'listen'),
   has(out.schedule, 'checkin_hours'),
@@ -1424,7 +1522,8 @@ func TestRegionSchedulingFormRoundTrip(t *testing.T) {
  }
  const cfg={pool:{strategy:{domestic:'round_robin',international:'sequential_exhaust'},account_order:{domestic:['c','a'],international:['y','x']}}};
  const nodes={cfgForm:{elements},cfgPath:{},cfgNote:{}};
- const ctx={cfgLoaded:null,api:async()=>({config:cfg}),$:id=>nodes[id],markDurationFields(){},toast(message){throw Error(message)}};
+ const ctx={cfgLoaded:null,api:async()=>({config:cfg}),$:id=>nodes[id],markDurationFields(){},toast(message){throw Error(message)},
+   BACKEND_LABEL:{codebuddy:'WorkBuddy',trae:'Trae'}};
  vm.createContext(ctx);
  vm.runInContext(src.slice(src.indexOf('const CFG_MAP ='),src.indexOf('/* Go 时长字段即时校验')),ctx);
  (async()=>{
@@ -1519,3 +1618,107 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// 日志分页与筛选：参数必须正确下推到服务端，否则「只拉了 50 条再本地筛」
+// 会让人以为更早的日志不存在。
+func TestAppJSLogQuery(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; log query test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const LOG_PAGE_SIZE');
+const end = src.indexOf("$('logChips')");
+if (start < 0 || end < 0 || end < start) throw new Error('log helpers not found');
+const ctx = {
+  URLSearchParams, String, Number, Date, Array, Object, Math, Set,
+  document: { getElementById: () => null, querySelectorAll: () => [] },
+  $: () => null,
+  esc: s => String(s == null ? '' : s),
+  clearTimeout, setTimeout,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.logQuery=logQuery; this.setLog=s=>{logCh=s.ch||"all";logQ=s.q||"";logCursor=s.cursor||0;};' +
+  '\nthis.getState=()=>({entries:logEntries,next:logNextCursor});', ctx);
+const q = s => {
+  ctx.setLog(s || {});
+  return Object.fromEntries(new URLSearchParams(ctx.logQuery(s && s.limit)));
+};
+const eq = (name, got, want) => {
+  if (JSON.stringify(got) !== JSON.stringify(want))
+    throw new Error(name + ': got ' + JSON.stringify(got) + ' want ' + JSON.stringify(want));
+};
+// 默认只取一页，不带 ch/q/cursor
+eq('默认', q({}), { limit: '50' });
+// 单频道 + 关键词一起下推
+eq('筛选', q({ ch: 'task', q: ' 签到 失败 ' }), { limit: '50', ch: 'task', q: '签到 失败' });
+// 翻历史页带游标
+eq('翻页', q({ cursor: 123 }), { limit: '50', cursor: '123' });
+// 自定义页大小
+eq('页大小', q({ limit: 200 }), { limit: '200' });
+console.log('OK');
+`
+	f, err := os.CreateTemp(t.TempDir(), "log-query-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("log query test failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "OK") {
+		t.Fatalf("unexpected output: %s", out)
+	}
+}
+
+// TestAccountColorStableAcrossSets 账号颜色只由 uid 决定，与集合里还有谁无关。
+//
+// 回归（用户反馈）：颜色曾按「排序后的下标」分配，只要有一个账号进出集合，
+// 后面所有人的颜色整体位移，图表图例就失效了。
+func TestAccountColorStableAcrossSets(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync('js/packages.js', 'utf8');
+const s = src.indexOf('const PK_ACCOUNT_COLORS');
+const e = src.indexOf('function pkBySource');
+const ctx = { Number, String, Math, Map, Array, Object, isFinite, isNaN };
+vm.createContext(ctx);
+vm.runInContext(src.slice(s, e) + '\nthis.pkAccountColorMap = pkAccountColorMap;', ctx);
+const only = ctx.pkAccountColorMap([{ uid: 'target' }]).get('target');
+const mixed = ctx.pkAccountColorMap([{ uid: 'aaa' }, { uid: 'target' }, { uid: 'zzz' }]).get('target');
+const reversed = ctx.pkAccountColorMap([{ uid: 'zzz' }, { uid: 'target' }, { uid: 'aaa' }]).get('target');
+process.stdout.write(JSON.stringify({ only, mixed, reversed }));`
+	f, err := os.CreateTemp(t.TempDir(), "color-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name()).CombinedOutput()
+	if err != nil {
+		t.Fatalf("color node test failed: %v\n%s", err, out)
+	}
+	var got struct{ Only, Mixed, Reversed string }
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("解析输出失败: %v (%s)", err, out)
+	}
+	if got.Only == "" {
+		t.Fatal("未取到颜色")
+	}
+	if got.Only != got.Mixed || got.Only != got.Reversed {
+		t.Fatalf("同一 uid 在不同集合里颜色应一致: only=%s mixed=%s reversed=%s",
+			got.Only, got.Mixed, got.Reversed)
+	}
+}

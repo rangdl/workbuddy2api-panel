@@ -67,12 +67,12 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(i int, uid string) {
 			defer wg.Done()
-			a := p.cfg.Pool.AuthByUID(uid)
+			a := p.codeBuddyCredential(uid)
 			if a == nil {
 				return
 			}
 			it := &items[i]
-			it.UID, it.Nickname = uid, a.Nickname
+			it.UID, it.Nickname = uid, a.NicknameValue()
 			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
 			if a.IsGlobal() {
 				return
@@ -210,7 +210,7 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 		if st.Disabled {
 			continue
 		}
-		a := p.cfg.Pool.AuthByUID(st.UID)
+		a := p.codeBuddyCredential(st.UID)
 		if a == nil {
 			continue
 		}
@@ -222,16 +222,12 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 			if a.IsGlobal() {
 				return
 			}
-			// 企业版门控：同上（企业版无个人成长体系，任务端点上游一律 403）。
-			// 企业切换会话（token_source=enterprise_switch）同跳：任务列表读得到，
-			// 但执行后行为事件被上游静默丢弃（200 不计分）——每项都是零收益白跑
-			// （含 expert_5 等真实对话配额），故不入队并给出重登指引（见
-			// auth.IsEnterpriseSession）。
-			if a.IsEnterprise() {
-				return
-			}
-			if a.IsEnterpriseSession() {
-				log.Printf("panel: WARN 队列跳过 uid=%s nickname=%q：凭证为企业切换会话（token_source=enterprise_switch），成长任务行为事件会被上游静默丢弃；请移除该账号，在浏览器退出企业切换（个人身份）后重新登录", a.UID, a.Nickname)
+			// 企业版门控：无个人成长体系，任务端点上游一律 403 / 行为事件不计分，
+			// 每项都是零收益白跑（含 expert_5 等真实对话配额），故不入队。
+			// 判据见 auth.SupportsPersonalGrowth（只认 enterpriseId，
+			// 不再用 token_source 判定——个人号也会带 enterprise_switch 章）。
+			if !a.SupportsPersonalGrowth() {
+				log.Printf("panel: 队列跳过 uid=%s nickname=%q：企业版无个人成长体系", a.UID, a.NicknameValue())
 				return
 			}
 			if growth {
@@ -273,7 +269,7 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	var items []queueItem
 	for _, one := range accts {
 		for _, t := range one.grow {
-			items = append(items, queueItem{UID: one.a.UID, Nickname: one.a.Nickname, Kind: "growth", Code: t.TaskCode, Status: "pending"})
+			items = append(items, queueItem{UID: one.a.UID, Nickname: one.a.NicknameValue(), Kind: "growth", Code: t.TaskCode, Status: "pending"})
 		}
 	}
 	if len(items) == 0 {
@@ -503,7 +499,7 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 		if st.Disabled {
 			continue // 未占位，行末统一压掉
 		}
-		a := p.cfg.Pool.AuthByUID(st.UID)
+		a := p.codeBuddyCredential(st.UID)
 		if a == nil {
 			continue
 		}
@@ -512,7 +508,7 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			it := row{UID: a.UID, Nickname: a.Nickname}
+			it := row{UID: a.UID, Nickname: a.NicknameValue()}
 			switch {
 			case a.IsGlobal():
 				it.Err = "global realm（无开学季活动）"

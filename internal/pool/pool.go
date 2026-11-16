@@ -8,14 +8,39 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 )
 
 type Pool struct {
-	mu      sync.RWMutex
-	byUID   map[string]*entry
-	stateFp string
-	dirty   atomic.Bool // 内存有变更待落盘
+	mu    sync.RWMutex
+	byUID map[string]*entry
+	// uidIndex 裸 uid → 复合键列表（反查用）。
+	//
+	// byUID 的键是 gateway.QualifiedUID（"backend:uid"）：两个上游的 uid 形态
+	// 可能相同（CodeBuddy 是 UUID、Trae 是数字串，但都不保证），裸 uid 作键会
+	// 让后加载的账号覆盖先加载的，表现为「账号凭空消失」。
+	// uidIndex 保留裸 uid → 全部候选，供只有 uid 的旧调用方（面板/调度器）
+	// 在**唯一匹配**时仍能查到账号。
+	uidIndex map[string][]string
+	// placeholder 占位账号工厂（持久化恢复时构造 entry.acc；nil = 只支持 CodeBuddy）。
+	placeholder func(backend, uid string) gateway.Account
+	// catalogFallback 目录兜底（账号未实现 gateway.Cataloger 时使用；nil = 不兜底）。
+	//
+	// 与 placeholder 同一模式：池不 import 具体上游，由 main 装配时把能力接进来。
+	catalogFallback CatalogFallback
+	// catalogMu / catalogCache 模型目录缓存（按 (上游,域) 分组，见 catalog.go）。
+	catalogMu    sync.Mutex
+	catalogCache map[catalogGroup]catalogCacheEntry
+	// nowFn 时钟注入（测试用；nil = time.Now）。
+	nowFn func() time.Time
+	// expiringSoonWindow 快过期积分窗口（SetExpiringSoonWindow 注入）。
+	//
+	// 为什么放在池里而不是各 backend 的 Credits 里：这是**调度策略**
+	// （多久算「快过期」），不是上游能力。放在池里，两个上游的 Expiring
+	// 口径天然一致，改配置即时生效。
+	expiringSoonWindow atomic.Int64
+	stateFp            string
+	dirty              atomic.Bool // 内存有变更待落盘
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
 	// SaveState/LoadState 经它接线，与本地 state.json 并存作启动恢复备份。
 	store StoreSnapshotter
@@ -85,6 +110,11 @@ type Pool struct {
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh chan struct{}
+	// travelRetry 旅行巡检的「当日不再重试」台账：uid → 自然日（CST）。
+	//
+	// 只记「今日重试无意义」的账号（如领养门槛未达）。运行态、不持久化：
+	// 进程重启后重试一次的成本可接受，而持久化会让「今天已经错过」跨重启残留。
+	travelRetry map[string]string
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
 }
@@ -93,6 +123,7 @@ type Pool struct {
 func New(stateFp string) *Pool {
 	p := &Pool{
 		byUID:              map[string]*entry{},
+		uidIndex:           map[string][]string{},
 		scheduling:         map[string]scheduleCursor{},
 		stateFp:            stateFp,
 		breakerThreshold:   defaultBreakerThreshold,
@@ -283,7 +314,7 @@ func (p *Pool) SetMaxInFlightGlobal(n int) {
 // inFlightLimit 报告账号的生效在途上限（global 分档优先，回落 maxInFlight）；
 // 0 = 不限。调用方需已持 p.mu（或快照过 limit，见 Acquire）。
 func (p *Pool) inFlightLimit(e *entry) int {
-	if p.maxInFlightGlobal > 0 && e.a.Realm() == "global" {
+	if p.maxInFlightGlobal > 0 && e.acc.Realm() == "global" {
 		return p.maxInFlightGlobal
 	}
 	return p.maxInFlight
@@ -305,7 +336,7 @@ func (p *Pool) SetStore(s StoreSnapshotter) {
 // （global 档 maxInFlightGlobal，P1-1；未设置回落 maxInFlight）。
 func (p *Pool) Acquire(uid string) bool {
 	p.mu.RLock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		p.mu.RUnlock()
 		return false
@@ -331,7 +362,7 @@ func (p *Pool) Acquire(uid string) bool {
 // Release 释放一个在途名额。幂等减到 0 为止（防重复释放扣成负数）。
 func (p *Pool) Release(uid string) {
 	p.mu.RLock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	p.mu.RUnlock()
 	if !ok {
 		return
@@ -356,28 +387,55 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
-func (p *Pool) Add(a *auth.Auth) {
+//
+// 必须置 dirty：否则新加入的账号（尤其是 Trae 这类不靠 SyncToDir 装载的）
+// 永远不会写进 state.json，其暂停/禁用等状态重启即丢。此前只调 upsertLocked，
+// 于是 Trae 账号在 state.json 里根本没有记录——面板暂停后重启变回未暂停。
+func (p *Pool) Add(a gateway.Account) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	before := len(p.byUID)
 	p.upsertLocked(a)
+	if len(p.byUID) != before {
+		p.dirty.Store(true) // 新账号：等待 flusher 落盘
+	}
 }
 
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
 // 剔除结果持久化回 state.json，避免已删账号在下次启动时被 load() 复活。
-func (p *Pool) SyncToDir(auths []*auth.Auth) {
+//
+// **作用域限定在同一批 backend**：Trae 账号不经 SyncToDir 装载（它由
+// syncTraeAccountsToPool → Add 单独注入），如果把「不在本次扫描列表里」
+// 一律当作已删除，Trae 账号会在启动时被清掉——连带它的 paused/disabled
+// 等状态一起丢。用户报的「暂停后重启变回未暂停」正是这条路径。
+func (p *Pool) SyncToDir(auths []gateway.Account) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// seen 用复合键：SyncToDir 的语义是「本次扫描到的账号集合」，
+	// 用裸 uid 会让两个上游的同名 uid 互相视为「已存在」而漏删。
 	seen := make(map[string]bool, len(auths))
+	// scoped 记录本次扫描涉及的 backend：只有这些 backend 的账号才参与剔除。
+	scoped := make(map[string]bool, 2)
 	for _, a := range auths {
-		seen[a.UID] = true
+		if a == nil {
+			continue
+		}
+		seen[gateway.QualifiedUID(a)] = true
+		scoped[a.Backend()] = true
 		p.upsertLocked(a)
 	}
 	changed := false
-	for uid := range p.byUID {
-		if !seen[uid] {
-			delete(p.byUID, uid)
-			changed = true
+	for key, e := range p.byUID {
+		if seen[key] {
+			continue
 		}
+		// 未出现在扫描列表里，且该 backend 本次被扫描过 → 判定为已删除。
+		// backend 未被扫描时（如 Trae）保持原状，不由本方法负责。
+		if e.acc != nil && !scoped[e.acc.Backend()] {
+			continue
+		}
+		p.removeIndexedLocked(key)
+		changed = true
 	}
 	if changed {
 		p.saveLocked()
@@ -387,27 +445,77 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 // Remove 从池中移除账号并立即落盘（管理面板用）。返回被移除账号的凭证
 // （含 FilePath，供调用方删除 auth 文件）；uid 不存在返回 nil。
 // 在途请求的 Release 对已删条目是 no-op，无需等待。
-func (p *Pool) Remove(uid string) *auth.Auth {
+func (p *Pool) Remove(uid string) gateway.Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return nil
 	}
-	delete(p.byUID, uid)
+	p.removeIndexedLocked(gateway.QualifiedUID(e.acc))
 	p.dirty.Store(true)
 	p.saveLocked()
-	return e.a
+	return e.acc
 }
 
 // upsertLocked 更新或插入单个账号；已存在则只换凭证、保留 credits/cooling 状态。
 // 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
-func (p *Pool) upsertLocked(a *auth.Auth) {
-	if e, ok := p.byUID[a.UID]; ok {
-		e.a = a // 保留 credits/cooling 状态
+func (p *Pool) upsertLocked(a gateway.Account) {
+	if a == nil {
 		return
 	}
-	p.byUID[a.UID] = &entry{a: a}
+	key := gateway.QualifiedUID(a)
+	if e, ok := p.byUID[key]; ok {
+		// 保留 credits/cooling 状态，只换账号对象。注意账号可能换了 backend
+		// 归属（不会发生，但键已包含 backend 所以旧键会残留——由 removeIndexed 清理）。
+		e.acc = a
+		return
+	}
+	p.byUID[key] = &entry{acc: a}
+	p.uidIndex[a.UID()] = append(p.uidIndex[a.UID()], key)
+}
+
+// lookupLocked 按 uid 查账号。
+//
+// 优先精确匹配复合键（"backend:uid"），其次按裸 uid 反查——后者仅在**唯一**
+// 匹配时返回，多个上游共用同一 uid 时返回 nil（有歧义时宁可查不到，也不要
+// 返回错误上游的账号）。调用方必须已持有 p.mu。
+func (p *Pool) lookupLocked(uid string) (*entry, bool) {
+	if uid == "" {
+		return nil, false
+	}
+	if e, ok := p.byUID[uid]; ok {
+		return e, true
+	}
+	keys := p.uidIndex[uid]
+	if len(keys) != 1 {
+		return nil, false // 无匹配或跨上游歧义
+	}
+	e, ok := p.byUID[keys[0]]
+	return e, ok
+}
+
+// removeIndexedLocked 删除账号并清理索引。调用方必须已持有 p.mu。
+func (p *Pool) removeIndexedLocked(key string) *entry {
+	e, ok := p.byUID[key]
+	if !ok {
+		return nil
+	}
+	delete(p.byUID, key)
+	bare := e.acc.UID()
+	list := p.uidIndex[bare]
+	for i, k := range list {
+		if k == key {
+			list = append(list[:i], list[i+1:]...)
+			break
+		}
+	}
+	if len(list) == 0 {
+		delete(p.uidIndex, bare)
+	} else {
+		p.uidIndex[bare] = list
+	}
+	return e
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。

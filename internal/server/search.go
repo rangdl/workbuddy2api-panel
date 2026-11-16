@@ -19,6 +19,9 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+
+	backendcb "github.com/linguo2625469/workbuddy2api-panel/internal/backend/codebuddy"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 )
 
 // searchToolLabel 搜索流量在请求日志「模型」列里的标识。
@@ -61,11 +64,17 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 	var lastKind upstream.ErrKind
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		acct := h.cfg.Pool.PickExcluding(tried)
-		if acct == nil {
+		acc := h.cfg.Pool.PickExcluding(tried)
+		if acc == nil {
 			break
 		}
-		tried[acct.UID] = true
+		// 搜索是 CodeBuddy 专有能力：非该上游的账号直接跳过（换下一个）。
+		acct := backendcb.Unwrap(acc)
+		if acct == nil {
+			tried[pool.TriedKey(acc)] = true
+			continue
+		}
+		tried[pool.TriedKey(acc)] = true
 		// 在途租约：与 chat 共用同一名额池。搜索也是真实上游调用，不占名额会让
 		// 搜索流量绕过 MaxInFlight 限流。
 		if !h.cfg.Pool.Acquire(acct.UID) {
@@ -96,13 +105,13 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 			if serr := acct.SaveAtomic(); serr != nil {
 				// 刷新成功但落盘失败：下次启动会拿旧 token，必须暴露。
 				log.Printf("ERR: [server] search refresh acct=%s: save auth failed: %v",
-					logfmt.Label(acct.UID, acct.Nickname), serr)
+					logfmt.Label(acct.UID, acct.NicknameValue()), serr)
 			}
 		}
 
 		// 记账：搜索没有 chatStat，账号信息直接写进 trace，面板才能看出「这次搜索用了哪个号」。
 		if tr := requestTraceFromContext(ctx); tr != nil {
-			tr.account = logfmt.Label(acct.UID, acct.Nickname)
+			tr.account = logfmt.Label(acct.UID, acct.NicknameValue())
 		}
 		// meta 在循环外构造（会话头透传 + 轮级聚合键），此处直接复用：
 		// 同一次搜索的换号重试属于同一请求，必须复用同一组会话 ID。

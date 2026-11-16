@@ -20,7 +20,7 @@ import "time"
 func (p *Pool) NoteFailures(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return
 	}

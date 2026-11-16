@@ -64,14 +64,18 @@ func TestCSPDisallowsInlineScriptAndFraming(t *testing.T) {
 }
 
 // 页面必须引用外部脚本（内联脚本会被上面的 CSP 拦掉，页面将完全不可用）。
+// 前端按视图拆成多个 js/*.js，逐个校验：漏引一个模块会整页白屏。
 func TestIndexReferencesExternalScript(t *testing.T) {
 	p := newTestPanel()
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
 	body := rec.Body.String()
 
-	if !strings.Contains(body, `<script src="app.js"></script>`) {
-		t.Error("index.html must load app.js externally (inline script is blocked by CSP)")
+	for _, name := range jsLoadOrder {
+		want := `<script src="js/` + name + `.js"></script>`
+		if !strings.Contains(body, want) {
+			t.Errorf("index.html 缺少 %s（内联脚本会被 CSP 拦截，漏引则页面不可用）", want)
+		}
 	}
 	// 反例保护：出现内联 <script>...</script> 内容块即为回归
 	if strings.Contains(body, "<script>\n") || strings.Contains(body, "<script> ") {
@@ -79,19 +83,36 @@ func TestIndexReferencesExternalScript(t *testing.T) {
 	}
 }
 
-// app.js 必须能作为同源脚本取到且类型正确（否则页面白屏）。
+// 每个 js/*.js 必须能作为同源脚本取到且类型正确（否则页面白屏）。
 func TestAppScriptServed(t *testing.T) {
 	p := newTestPanel()
-	rec := httptest.NewRecorder()
-	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/app.js", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code=%d want 200", rec.Code)
+	for _, name := range jsLoadOrder {
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/js/"+name+".js", nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s: code=%d want 200", name, rec.Code)
+			continue
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
+			t.Errorf("%s: Content-Type=%q want javascript", name, ct)
+		}
+		if rec.Body.Len() == 0 {
+			t.Errorf("%s: 内容为空", name)
+		}
 	}
-	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
-		t.Errorf("Content-Type=%q want javascript", ct)
-	}
-	if !strings.Contains(rec.Body.String(), "'use strict'") {
-		t.Error("app.js body looks wrong")
+}
+
+// 白名单之外的名字必须取不到内容（防路径穿越、也防误暴露 embed 里的其他文件）。
+// 注：含 ../ 的路径会被 ServeMux 规范化成 301 重定向，跟随后的目标同样是 404，
+// 故这里只断言「不是 200」。
+func TestJSUnknownNameBlocked(t *testing.T) {
+	p := newTestPanel()
+	for _, name := range []string{"../index", "nope", "core.js", "", "mobile", "core.js.js"} {
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/js/"+name+".js", nil))
+		if rec.Code == http.StatusOK {
+			t.Errorf("name=%q 不应返回 200（白名单外）", name)
+		}
 	}
 }
 

@@ -1,5 +1,5 @@
-# syntax=docker/dockerfile:1
 FROM golang:1.23-alpine AS build
+ENV GOPROXY=https://goproxy.cn,direct
 WORKDIR /src
 COPY go.mod ./
 # 防止因为直接使用官方源导致下载失败
@@ -15,8 +15,9 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/serve
 
 FROM alpine:3.20
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
-RUN apk add --no-cache wget ca-certificates tzdata python3 bash \
- && adduser -D -u 10001 app \
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories \
+ && apk add --no-cache wget ca-certificates tzdata python3 bash \
+ && adduser -D -u 1000 app \
  && mkdir -p /app/auths /app/data \
  && chown -R app:app /app
 WORKDIR /app
@@ -29,10 +30,12 @@ COPY --from=build /out/credit /app/credit
 COPY login.sh signin.sh credit.sh /app/
 COPY scripts/probe_active.py /app/scripts/probe_active.py
 RUN sed -i 's/\r$//' /app/login.sh /app/signin.sh /app/credit.sh && chmod 755 /app/login.sh /app/signin.sh /app/credit.sh
-# 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）
-COPY config.example.json /app/config.json
+# 镜像不带真实配置：落 example 作为 config/ 下的默认（生产由挂载卷覆盖）。
+# config/ 与 data/ 分离：前者用户手改、后者程序自写，挂载与备份可分别处理。
+COPY config.example.json /app/config/config.json
+RUN mkdir -p /app/config /app/data && chown -R app:app /app/config /app/data
 USER app
 EXPOSE 7863
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
   CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1
-ENTRYPOINT ["/app/wb2api", "-config", "/app/config.json"]
+ENTRYPOINT ["/app/wb2api", "-config", "/app/config/config.json"]

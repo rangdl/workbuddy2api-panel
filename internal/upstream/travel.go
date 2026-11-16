@@ -34,11 +34,21 @@ type Buddy struct {
 }
 
 // TravelState 猫猫旅行状态。
+//
+// DepartsAt/ArriveAt/ServerNow 是上游返回的行程时间（Unix 秒，实测）：
+//
+//	{"state":"arrived","record_id":28367071,"depart_at":1792803603,
+//	 "arrive_at":1792810803,"server_now":1794495151,"reward_credit":8}
+//
+// 三个字段都以上游时钟为准：用 ArriveAt-ServerNow 算剩余时长可免疫本机时钟偏差。
 type TravelState struct {
 	State             string `json:"state"`               // idle / traveling / arrived
 	DailyLimitReached bool   `json:"daily_limit_reached"` // 今日已派出过（自然日 00:00 CST 重置）
 	RecordID          int64  `json:"record_id"`           // 在途/到站记录 id，claim 必带
 	RewardCredit      int64  `json:"reward_credit"`       // 到站可领奖励积分
+	DepartAt          int64  `json:"depart_at"`           // 本次行程派出时刻（Unix 秒）
+	ArriveAt          int64  `json:"arrive_at"`           // 本次行程到站时刻（Unix 秒）
+	ServerNow         int64  `json:"server_now"`          // 上游当前时刻（Unix 秒），用于换算剩余时长
 }
 
 // growthJSON 发 growth 域请求并解信封；body 为 nil 时不带请求体。

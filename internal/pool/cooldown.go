@@ -13,7 +13,7 @@ import (
 func (p *Pool) SetCredits(uid string, credits, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		e.credits = credits
 		e.creditsTotal = total
 		p.dirty.Store(true)
@@ -28,26 +28,36 @@ func (p *Pool) SetNickname(uid, nickname string) bool {
 		return false
 	}
 	p.mu.RLock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	p.mu.RUnlock()
 	if !ok {
 		return false
 	}
-	a := e.a
-	a.Lock()
-	changed := a.Nickname != nickname
-	if changed {
-		a.Nickname = nickname
-	}
-	a.Unlock()
-	if !changed {
+	// 昵称写回由账号自身负责：pool 只认 gateway.Account 接口，不知道凭证
+	// 存在哪个文件、用什么格式。实现了 Nicknamer 的账号才会真的落盘。
+	n, ok := e.acc.(Nicknamer)
+	if !ok {
 		return false
 	}
-	if err := a.SaveAtomic(); err != nil {
+	if n.NicknameValue() == nickname {
+		return false
+	}
+	if err := n.SetNickname(nickname); err != nil {
 		log.Printf("WARN: [pool] nickname save %s: %v", uid, err)
 		return false
 	}
 	return true
+}
+
+// Nicknamer 可选能力：账号能持久化自己的昵称（回写凭证文件）。
+//
+// 做成可选接口而不是塞进 gateway.Account 的原因：昵称回写是**凭证文件**
+// 的操作，不是调度需要的能力。Trae 的账号文件结构完全不同，但同样可以
+// 实现它——不需要的 backend 不实现即可。
+type Nicknamer interface {
+	NicknameValue() string
+	// SetNickname 更新昵称并落盘。
+	SetNickname(name string) error
 }
 
 // NoteCheckinDone 标记账号今日已签到（签到成功与上游"今天已签到"幂等拒绝均算）。
@@ -55,7 +65,7 @@ func (p *Pool) SetNickname(uid, nickname string) bool {
 func (p *Pool) NoteCheckinDone(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		day := time.Now().Format("2006-01-02")
 		if e.lastCheckinDay != day {
 			e.lastCheckinDay = day
@@ -82,7 +92,7 @@ type CreditsSnapshot struct {
 func (p *Pool) SetCreditsSnapshot(uid string, s CreditsSnapshot) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return
 	}
@@ -190,7 +200,7 @@ func (p *Pool) ClearExpiringSnapshots() {
 func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		e.until = time.Now().Add(d)
 		e.coolKind = kind
 		e.reason = reason
@@ -216,14 +226,14 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		now := time.Now()
 		if !resetAt.IsZero() {
 			// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
 			if e.modelCooldowns == nil {
 				e.modelCooldowns = map[string]modelCooldown{}
 			}
-			e.modelCooldowns[model] = modelCooldown{
+			e.modelCooldowns[modelKey(model)] = modelCooldown{
 				Until:   p.cappedSoftUntilLocked(now, resetAt),
 				ResetAt: resetAt,
 				Reason:  reason,
@@ -253,12 +263,13 @@ func (p *Pool) RecordModelRateLimitAudit(uid, model, reason string) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return
 	}
 	now := time.Now()
-	if old, exists := e.modelCooldowns[model]; exists && !old.AuditOnly && old.Until.After(now) {
+	key := modelKey(model)
+	if old, exists := e.modelCooldowns[key]; exists && !old.AuditOnly && old.Until.After(now) {
 		return // 已有真实模型冷却，审计记录不得覆盖路由截止
 	}
 	until := e.until
@@ -268,7 +279,7 @@ func (p *Pool) RecordModelRateLimitAudit(uid, model, reason string) {
 	if e.modelCooldowns == nil {
 		e.modelCooldowns = make(map[string]modelCooldown)
 	}
-	e.modelCooldowns[model] = modelCooldown{
+	e.modelCooldowns[key] = modelCooldown{
 		Until:     until,
 		Reason:    reason,
 		AuditOnly: true,
@@ -313,14 +324,15 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok {
 		return
 	}
 	now := time.Now()
+	key := modelKey(model)
 	hits := 0
 	if e.modelCooldowns != nil {
-		hits = e.modelCooldowns[model].Hits
+		hits = e.modelCooldowns[key].Hits
 	}
 	hits++
 	ttl := modelBlockBaseTTL
@@ -332,7 +344,7 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	if e.modelCooldowns == nil {
 		e.modelCooldowns = map[string]modelCooldown{}
 	}
-	e.modelCooldowns[model] = modelCooldown{
+	e.modelCooldowns[key] = modelCooldown{
 		Until:  now.Add(ttl),
 		Reason: reason,
 		Hits:   hits,
@@ -349,15 +361,15 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+	e, ok := p.lookupLocked(uid)
 	if !ok || len(e.modelCooldowns) == 0 {
 		return
 	}
-	mc, exists := e.modelCooldowns[model]
+	mc, exists := e.modelCooldowns[modelKey(model)]
 	if !exists || (!strings.HasPrefix(mc.Reason, "11102") && !strings.HasPrefix(mc.Reason, "11158")) {
 		return
 	}
-	delete(e.modelCooldowns, model)
+	delete(e.modelCooldowns, modelKey(model))
 	if len(e.modelCooldowns) == 0 {
 		e.modelCooldowns = nil
 	}
@@ -403,7 +415,7 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 
 	var st ModelBlockStatus
 	for _, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
+		if realm != "" && e.acc.Realm() != realm {
 			continue
 		}
 		// 暂停选号（paused）号与禁用号同口径跳过：它此刻不可选，「能服务」的
@@ -416,7 +428,7 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 			return ModelBlockStatus{}
 		}
 		st.Count++
-		if mc, ok := e.modelCooldowns[model]; ok {
+		if mc, ok := e.modelCooldowns[modelKey(model)]; ok {
 			if st.Reason == "" {
 				st.Reason = mc.Reason
 			}
@@ -450,7 +462,7 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Time, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.lookupLocked(uid); ok {
 		now := time.Now()
 		if !resetAt.IsZero() {
 			e.until = p.cappedSoftUntilLocked(now, resetAt)

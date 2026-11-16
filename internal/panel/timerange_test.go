@@ -48,7 +48,7 @@ func TestUsageHandlerAcceptsExplicitRange(t *testing.T) {
 	rec := usage.New("")
 	base := time.Now().Truncate(time.Hour).Add(-5 * time.Hour)
 	for i := 0; i < 6; i++ {
-		rec.Add(base.Add(time.Duration(i)*time.Hour), "cn", "u1", "glm-5.2",
+		rec.Add(base.Add(time.Duration(i)*time.Hour), "codebuddy", "cn", "u1", "glm-5.2",
 			usage.Delta{PromptTokens: 10, HasPromptTokens: true}, true)
 	}
 	p := New(Config{Version: "test", APIKey: "k", Usage: rec, Pool: pool.New("")})

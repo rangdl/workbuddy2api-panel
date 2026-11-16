@@ -2,10 +2,11 @@
 package pool
 
 import (
+	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 )
 
 // degradeReason 连败降权（issue #114）写 reason 的固定文案：与冷却域的
@@ -84,37 +85,40 @@ type Status struct {
 	// 只有最早一批的旧字段无法表达「同一天多个包」「后续批次」「7 天内合计」。
 	CreditsExpiryBuckets []ExpiryBucket `json:"credits_expiry_buckets,omitempty"`
 	Cooling              bool           `json:"cooling"`
-	CoolKind                 string    `json:"cool_kind,omitempty"`
-	CoolRemaining            int64     `json:"cool_remaining_sec,omitempty"`
-	Until                    time.Time `json:"until,omitempty"`
-	Reason                   string    `json:"reason,omitempty"`
-	SoftStreak               int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	CoolKind             string         `json:"cool_kind,omitempty"`
+	CoolRemaining        int64          `json:"cool_remaining_sec,omitempty"`
+	Until                time.Time      `json:"until,omitempty"`
+	Reason               string         `json:"reason,omitempty"`
+	SoftStreak           int            `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
-	Realm           string     `json:"realm,omitempty"`
+	Realm string `json:"realm,omitempty"`
+	// Backend 账号所属上游（"codebuddy" / "trae"）。
+	// 多上游合池后面板据此分组，调用方据此挑对上游实现。
+	Backend string `json:"backend,omitempty"`
 	// Enterprise 企业版账号（auth.EnterpriseID 非空，计算值不落盘）。
 	// 企业版无个人成长体系（签到/成长任务/连登/旅行/夜猫子 上游均拒），
 	// 面板据此隐藏对应按钮；选号、保活、额度展示不受影响。
-	Enterprise      bool       `json:"enterprise,omitempty"`
-	Disabled        bool       `json:"disabled"`
-	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	Enterprise     bool   `json:"enterprise,omitempty"`
+	Disabled       bool   `json:"disabled"`
+	DisabledReason string `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
 	// Paused 暂停选号：退出选号候选（与 disabled 一样不参与选号），但**照常参与**
 	// 签到 / 活跃上报 / 保活 / 余额刷新四类保号任务。与 disabled 正交——disabled 是
 	// 「授权/session 终态，需人工 revive」，paused 是「运维临时让位」（多号轮换场景），
 	// 账号本身健康，只是暂不接流量。
-	Paused          bool       `json:"paused,omitempty"`
-	SuccessCount    int64      `json:"success_count,omitempty"`
-	ErrTotal        int64      `json:"err_total,omitempty"`
-	LastSuccessTime time.Time  `json:"last_success,omitempty"`
-	LastErrTime     time.Time  `json:"last_err,omitempty"`
+	Paused          bool      `json:"paused,omitempty"`
+	SuccessCount    int64     `json:"success_count,omitempty"`
+	ErrTotal        int64     `json:"err_total,omitempty"`
+	LastSuccessTime time.Time `json:"last_success,omitempty"`
+	LastErrTime     time.Time `json:"last_err,omitempty"`
 	// CheckinDone 本地今日已签到（签到成功或上游"今天已签到"幂等拒绝均算）。
 	// global 域账号无签到体系，恒为 false。面板签到按钮据此显示 签到/已签。
-	CheckinDone bool        `json:"checkin_done,omitempty"`
-	TokenUsage  TokenUsage  `json:"token_usage,omitempty"`
+	CheckinDone bool       `json:"checkin_done,omitempty"`
+	TokenUsage  TokenUsage `json:"token_usage,omitempty"`
 	// ModelCosts 每模型实测成本台账（P1-anti-monopoly 可观测性）：运维据此自查
 	//「为什么总选它」——tier 0（免费）垄断 / tier 2 单价排序一眼可见。
 	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
@@ -192,7 +196,12 @@ type modelCostEntry struct {
 	Samples   int
 }
 type entry struct {
-	a            *auth.Auth
+	// acc 账号身份（由 gateway.Account 抽象，pool 不感知具体上游）。
+	//
+	// 这里曾经是 *auth.Auth——换成接口后，pool 的调度状态机（权重、冷却、
+	// 熔断、降权、模型避让、在途租约）与上游协议彻底解耦，Trae 账号也能进池。
+	// pool 从不需要凭证，所以接口里只有身份字段。
+	acc          gateway.Account
 	credits      int64
 	creditsTotal int64 // 积分总额度（UserResource 聚合；0 = 未知）
 	// creditsExpiring 配置窗口内即将过期的可用积分子集，是 credits 的一部分。
@@ -204,11 +213,11 @@ type entry struct {
 	// expiryBuckets 全部未来到期批次按自然日聚合（升序）。供面板快照展示与
 	// NoteModelCost 的 FEFO 近似扣减；由 SetCreditsSnapshot 整体替换。
 	expiryBuckets []ExpiryBucket
-	successCount             int64      // 累计成功
-	errTotal                 int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
-	lastErr                  time.Time  // 最近一次错误时间
-	lastSuccess              time.Time  // 最近一次成功时间
-	tokenUsage               TokenUsage // 聊天请求 token 用量摘要（持久化）
+	successCount  int64      // 累计成功
+	errTotal      int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
+	lastErr       time.Time  // 最近一次错误时间
+	lastSuccess   time.Time  // 最近一次成功时间
+	tokenUsage    TokenUsage // 聊天请求 token 用量摘要（持久化）
 	// lastCheckinDay 最近一次签到成功的本地日期（"2006-01-02"）。签到成功与上游
 	// 幂等拒绝（"今天已签到"）都算；statusOf 据此输出 CheckinDone 供面板按钮显示
 	// 签到/已签。持久化：跨重启不丢当日状态。
@@ -219,9 +228,9 @@ type entry struct {
 	// paused 暂停选号：与 disabled 正交。置位后退出选号候选（healthy 判否），
 	// 但保号任务遍历只按 Disabled 过滤，故 paused 号天然继续参与签到 / 活跃上报 /
 	// 保活 / 余额刷新。持久化（state.json），跨重启不丢。
-	paused         bool
-	reason         string
-	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
+	paused   bool
+	reason   string
+	lastUsed time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
@@ -273,11 +282,15 @@ type entry struct {
 }
 
 // modelCostOf 返回该账号在指定 model 上的有效成本观测；无观测或观测过期返回 ok=false。
+//
+// 键归一后查（见 modelKey）：账本键与请求模型名的大小写可能不一致
+// （上游目录 `DeepSeek-V4.1-Flash` vs 客户端 `deepseek-v4.1-flash`），
+// 精确查会让成本分层与积分保底静默失效——免费号被当成「无观测」。
 func (e *entry) modelCostOf(model string, now time.Time) (modelCostEntry, bool) {
 	if model == "" || len(e.modelCost) == 0 {
 		return modelCostEntry{}, false
 	}
-	mc, ok := e.modelCost[model]
+	mc, ok := e.modelCost[modelKey(model)]
 	if !ok {
 		return modelCostEntry{}, false
 	}
@@ -325,15 +338,30 @@ func (e *entry) modelExempt() bool {
 
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
 // 空 reqModel / 未记录 → false（不因模型级维度限制账号）。
+//
+// 键归一后查（见 modelKey）：否则 `DeepSeek-V4.1-Flash` 打出的冷却管不住
+// `deepseek-v4.1-flash` 的请求，同号同模型会被反复重试并持续被上游限流。
 func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 	if reqModel == "" {
 		return false
 	}
-	mc, ok := e.modelCooldowns[reqModel]
+	mc, ok := e.modelCooldowns[modelKey(reqModel)]
 	if !ok || mc.AuditOnly {
 		return false
 	}
 	return !mc.Until.IsZero() && now.Before(mc.Until)
+}
+
+// modelKey 模型级台账（modelCooldowns / modelCost）的键。
+//
+// 为什么必须归一：这两个 map 的键来自**请求模型名**，而同一个模型在客户端与
+// 上游目录里的拼写可能不同大小写（`DeepSeek-V4.1-Flash` vs
+// `deepseek-v4.1-flash`）。键不归一会出现两套互不相干的台账：冷却只挡住其中
+// 一种写法，成本观测被拆成两份、样本数永远攒不够。
+//
+// 与 gateway.NormalizeModel 同义；pool 不 import 具体上游，本函数是唯一实现。
+func modelKey(model string) string {
+	return strings.ToLower(strings.TrimSpace(model))
 }
 
 // healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）：
@@ -443,10 +471,10 @@ type stateAccount struct {
 	SuccessCount int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
-	ErrTotal    int64      `json:"err_total,omitempty"`
-	ErrCount       int        `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
-	LastSuccess    time.Time  `json:"last_success,omitempty"`
-	LastErr        time.Time  `json:"last_err,omitempty"`
+	ErrTotal    int64     `json:"err_total,omitempty"`
+	ErrCount    int       `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
+	LastSuccess time.Time `json:"last_success,omitempty"`
+	LastErr     time.Time `json:"last_err,omitempty"`
 	// LastCheckinDay 最近一次签到成功的本地日期（entry.lastCheckinDay 同源）。
 	// 持久化以保留「当日已签」状态：签到后重启，面板按钮不回退成「签到」。
 	LastCheckinDay string     `json:"last_checkin_day,omitempty"`

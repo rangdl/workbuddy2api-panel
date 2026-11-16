@@ -1,173 +1,127 @@
-// travel.go 猫猫旅行巡检状态机：随旅行时点（travel_hours，默认 09 点）对池内每个可用账号单趟推进一次。
-// 无猫 → 同意协议 + 领养；有猫 → 按 travel/status 分派 派出 / 领奖 / 跳过。
+// travel.go 猫猫旅行巡检的排程入口。
+//
+// 状态机已搬到账号对象上（backend/codebuddy/features.go 的 Account.Travel）：
+// 池遍历所有实现了 gateway.Traveler 的账号逐个调用，账号自己完成
+// 「领养 / 派出 / 到站领奖 / 盲盒」的全部分支与门控（企业版 / global / 无凭证）。
+//
+// 本文件只保留调度器的职责：排程时点、并发互斥、以及到站定时器的唤醒信号。
 package scheduler
 
 import (
-	"fmt"
+	"context"
 	"log"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/gateway"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 )
 
-const (
-	// travelLocationID 派出地点固定 4（古镇客栈）：4 个地点收益/时长区间完全相同，无最优解。
-	travelLocationID = 4
+// blindboxDefaultMaxPerRun 面板不指定时的开盒次数上限。
+const blindboxDefaultMaxPerRun = 5
 
-	// travelStateIdle 空闲可派出；travelStateTraveling 在途；travelStateArrived 到站可领奖。
-	travelStateIdle      = "idle"
-	travelStateTraveling = "traveling"
-	travelStateArrived   = "arrived"
-)
-
-// travelAccountDelay 账号间限速：全量账号约 40s，避免上游风控。测试可置 0。
+// travelAccountDelay 账号间限速（防风控）。测试可置 0。
+//
+// 实际的等待发生在 pool 的批量调度层；这里每次巡检前把它同步给 pool，
+// 让既有测试仍能通过改写本变量关掉等待。
 var travelAccountDelay = 800 * time.Millisecond
 
-// activityAccountDelay 活跃上报账号间限速：与旅行同口径，避免上游风控。测试可置 0。
-var activityAccountDelay = 800 * time.Millisecond
-
-// adoptReportGap 领养前置上报后的等待：给上游事件处理留时间再发 buddy/first。
-// 对齐 scripts/task_first_buddy.py 实测的 1.05s 间隔口径。测试可置 0。
-var adoptReportGap = 1050 * time.Millisecond
-
-// cstZone 上游每日重置按自然日 00:00 CST（Asia/Shanghai）。中国无夏令时，固定 +8 即可，
-// 不依赖容器 tzdata。
-var cstZone = time.FixedZone("CST", 8*60*60)
-
-// travelDay 返回 t 所属的上游自然日（CST），格式 2006-01-02。
-func travelDay(t time.Time) string {
-	return t.In(cstZone).Format("2006-01-02")
-}
-
-// RunTravelNow 立即对池内所有可用账号执行一趟旅行巡检。
-// 禁用账号跳过；暂停选号（paused）账号照常参与——旅行是纯 RPC（状态/派出/
-// 领奖 + 领养前置上报），不发模型对话，与「让位防风控」不冲突；
-// 401/查询失败只跳过该账号本轮（不强刷 token，交 22:00 keepalive）；
-// 账号间限速 travelAccountDelay。
-func (s *Scheduler) RunTravelNow() {
-	first := true
-	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshTokenValue() == "" {
-			continue
-		}
-		if a.IsGlobal() {
-			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
-		}
-		if a.IsEnterpriseSession() {
-			continue // 企业版 / 企业切换会话门控：无成长体系（growth 端点企业号 403；切换会话不计分），不发起任何上游调用
-		}
-		if !first {
-			time.Sleep(travelAccountDelay)
-		}
-		first = false
-		s.travelOne(a)
-	}
-}
-
-// travelOne 单账号单趟状态机：查有无猫 + 查状态 + 最多一个动作，不轮询不等待。
-func (s *Scheduler) travelOne(a *auth.Auth) {
-	buddy, err := s.cfg.Upstream.BuddyInfo(a)
-	if err != nil {
-		log.Printf("travel %s: buddy-info: %v", logfmt.Label(a.UID, a.Nickname), err)
-		return
-	}
-	if buddy == nil {
-		s.travelAdopt(a)
-		return
-	}
-	ts, err := s.cfg.Upstream.TravelStatus(a)
-	if err != nil {
-		log.Printf("travel %s: status: %v", logfmt.Label(a.UID, a.Nickname), err)
-		return
-	}
-	switch ts.State {
-	case travelStateArrived:
-		s.travelClaim(a, ts)
-	case travelStateIdle:
-		s.travelDepart(a, ts)
-	case travelStateTraveling:
-		log.Printf("travel %s: skip (traveling record=%d)", logfmt.Label(a.UID, a.Nickname), ts.RecordID)
-	default:
-		log.Printf("travel %s: skip (unknown state %q)", logfmt.Label(a.UID, a.Nickname), ts.State)
-	}
-}
-
-// travelDepart 空闲且未达当日上限时派出（每日 1 次，自然日 00:00 CST 重置）。
-func (s *Scheduler) travelDepart(a *auth.Auth, ts *upstream.TravelState) {
-	if ts.DailyLimitReached {
-		log.Printf("travel %s: skip (daily limit reached)", logfmt.Label(a.UID, a.Nickname))
-		return
-	}
-	if err := s.cfg.Upstream.TravelDepart(a, travelLocationID); err != nil {
-		log.Printf("travel %s: depart: %v", logfmt.Label(a.UID, a.Nickname), err)
-		return
-	}
-	log.Printf("travel %s: depart ok location=%d", logfmt.Label(a.UID, a.Nickname), travelLocationID)
-}
-
-// travelClaim 到站领奖（必须带 record_id）。
-func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) {
-	if ts.RecordID == 0 {
-		log.Printf("travel %s: claim skipped (arrived but no record_id)", logfmt.Label(a.UID, a.Nickname))
-		return
-	}
-	reward, err := s.cfg.Upstream.TravelClaim(a, ts.RecordID)
-	if err != nil {
-		log.Printf("travel %s: claim record=%d: %v", logfmt.Label(a.UID, a.Nickname), ts.RecordID, err)
-		return
-	}
-	log.Printf("travel %s: claim ok record=%d reward=%d", logfmt.Label(a.UID, a.Nickname), ts.RecordID, reward)
-}
-
-// travelAdopt 无猫时领养，链路：report → agreement → buddy/first。
+// RunTravelNow 立即对池内所有适用账号执行一趟旅行巡检。
 //
-// report 必须先跑（scripts/task_first_buddy.py 实测）：一条 chat_request_send 上报
-// 点亮 growth 连登并**解锁 first_buddy 任务**；未上报时 buddy/first 会返回
-// 400 "first_buddy task not completed yet"——该门槛的真实来源是"当日无活跃上报"，
-// 不是账号问题（report.go 注释亦明确「解锁 first_buddy 任务（领养前置）」）。
-// conversation 门槛未达标仍属预期行为，记一次当日已试后静默跳过，不再重试。
-func (s *Scheduler) travelAdopt(a *auth.Auth) {
-	if s.adoptTriedToday(a.UID) {
+// paused 账号照常参与（旅行是纯 RPC，不发模型对话）；
+// 末尾 poke 到站定时器：本趟可能派出了新行程，定时器需要按新的 arrive_at 重算。
+func (s *Scheduler) RunTravelNow() {
+	s.RunTravelContext(context.Background())
+}
+
+// RunTravelContext 同 RunTravelNow，但随 ctx 取消立即退出（停机用）。
+func (s *Scheduler) RunTravelContext(ctx context.Context) {
+	s.travelMu.Lock()
+	defer s.travelMu.Unlock()
+	enabled, maxPerRun := s.travelBlindboxCfg()
+	ctx = pool.WithCapabilityDelay(ctx, travelAccountDelay)
+	s.cfg.Pool.TravelAllWith(ctx, gateway.TravelOptions{
+		BlindboxEnabled:   enabled,
+		BlindboxMaxPerRun: maxPerRun,
+	})
+	// 无条件 poke：本趟可能派出了新行程，定时器需要按新的 arrive_at 重算。
+	// 没派出时这次 poke 只让定时器重扫一遍状态，代价极小。
+	s.PokeTravelTimer()
+}
+
+// RunBlindboxNow 手动触发一轮能量盲盒（面板按钮）。
+//
+// apply=false 为 dry-run：只查状态 + quota 并给出决策，不消耗任何能量。
+// 同步返回逐账号结果——面板要直接展示「谁、为什么能开/不能开、开了几次」。
+func (s *Scheduler) RunBlindboxNow(apply bool, maxPerRun int) []pool.BlindboxResult {
+	if maxPerRun <= 0 {
+		maxPerRun = blindboxDefaultMaxPerRun
+	}
+	s.travelMu.Lock()
+	defer s.travelMu.Unlock()
+	ctx := pool.WithCapabilityDelay(context.Background(), travelAccountDelay)
+	results := s.cfg.Pool.BlindboxAll(ctx, apply, maxPerRun)
+	log.Printf("blindbox: 巡检 %d 个账号（apply=%v max=%d）", len(results), apply, maxPerRun)
+	return results
+}
+
+// travelOneByUID 对单个账号跑一趟旅行巡检（到站定时器用）。
+//
+// 定时器是「某账号的行程到站了」的精确唤醒，不走全池巡检——那会让每个到站
+// 事件都触发一次全量上游调用。调用方需持 travelMu。
+func (s *Scheduler) travelOneByUID(uid string) {
+	acc := s.cfg.Pool.Account(uid)
+	if acc == nil {
+		log.Printf("travel-timer %s: 唤醒时账号已不在池中，跳过", uid)
 		return
 	}
-	// 前置：解锁 first_buddy 任务（幂等；失败不阻塞，让 buddy/first 按既有错误路径暴露）。
-	if err := s.cfg.Upstream.ReportChatActivity(a, fmt.Sprintf("wb2api-adopt-%d", time.Now().UnixMilli()), ""); err != nil {
-		log.Printf("travel %s: adopt preflight report: %v", logfmt.Label(a.UID, a.Nickname), err)
-	} else {
-		time.Sleep(adoptReportGap) // 给上游事件处理留时间（对齐脚本实测的 1.05s 间隔口径）
-	}
-	if err := s.cfg.Upstream.BuddyAgreement(a); err != nil {
-		log.Printf("travel %s: agreement: %v", logfmt.Label(a.UID, a.Nickname), err)
+	t, ok := acc.(gateway.Traveler)
+	if !ok {
 		return
 	}
-	err := s.cfg.Upstream.BuddyFirst(a)
-	switch {
-	case err == nil:
-		log.Printf("travel %s: adopt ok (+300 credits)", logfmt.Label(a.UID, a.Nickname))
-	case upstream.IsBuddyTaskIncomplete(err):
-		s.markAdoptTried(a.UID)
-		log.Printf("travel %s: adopt skipped (conversation threshold not reached, retry tomorrow)", logfmt.Label(a.UID, a.Nickname))
-	default:
-		log.Printf("travel %s: adopt: %v", logfmt.Label(a.UID, a.Nickname), err)
+	log.Printf("travel-timer %s: 唤醒，执行巡检", logfmt.Label(uid, acc.Nickname()))
+	// 盲盒开关是调度策略，必须一并传入：到站 → 领奖 → 回 idle 是最常命中
+	// 「idle 阶段」的路径。不传的话一旦启用盲盒，这条路径永远不开盒。
+	blindboxEnabled, blindboxMax := s.travelBlindboxCfg()
+	outcome, err := t.Travel(context.Background(), gateway.TravelOptions{
+		BlindboxEnabled:   blindboxEnabled,
+		BlindboxMaxPerRun: blindboxMax,
+	})
+	if err != nil {
+		log.Printf("travel-timer %s: %v", uid, err)
+		return
+	}
+	// 派出成功 → 通知到站定时器去取这一趟的 arrive_at 并定时唤醒。
+	// 事件驱动模型下这是最主要的唤醒源（没有周期轮询兜底）。
+	// 状态机已搬到账号内部，所以「是否需要重算」由动作结果判定。
+	if outcome.Action == "departed" {
+		s.PokeTravelTimer()
 	}
 }
 
-// adoptTriedToday 该账号当日是否已判定领养门槛未达。
-func (s *Scheduler) adoptTriedToday(uid string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.adoptTried[uid] == travelDay(time.Now())
+// travelTimerAccounts 返回到站扫描所需的账号集合。
+//
+// 只挑实现了 Traveler 的账号：只有它们才可能有行程，因此不需要判断上游类型。
+// 含 paused——暂停选号不停止已有行程，到站奖励照常要领。
+func (s *Scheduler) travelTimerAccounts() []travelTimerAccount {
+	var out []travelTimerAccount
+	for _, m := range s.cfg.Pool.Members(pool.MemberFilter{IncludePaused: true}) {
+		t, ok := m.Acc.(gateway.Traveler)
+		if !ok {
+			continue
+		}
+		out = append(out, travelTimerAccount{
+			uid:  m.Acc.UID(),
+			nick: m.Acc.Nickname(),
+			t:    t,
+		})
+	}
+	return out
 }
 
-// markAdoptTried 记录该账号当日已尝试领养且未过门槛。
-func (s *Scheduler) markAdoptTried(uid string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.adoptTried[uid] = travelDay(time.Now())
+// travelTimerAccount 到站扫描所需的最小组合：身份 + 只读状态查询能力。
+type travelTimerAccount struct {
+	uid  string
+	nick string
+	t    gateway.Traveler
 }

@@ -6,20 +6,16 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
 // CN 模型目录拉取失败必须留下一行 WARN（此前静默，排障无线索），且负缓存期内
 // 的后续请求不重复记录。
+//
+// 日志由池打（缓存已收进池）：失败一行 `[pool] codebuddy/cn 模型目录拉取失败`，
+// 负缓存期内的后续请求不再打上游、也不再记。
 func TestModelsFetchFailureLogsOncePerCooldown(t *testing.T) {
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
-
 	var buf bytes.Buffer
 	prev := log.Writer()
 	log.SetOutput(&buf)
@@ -28,7 +24,8 @@ func TestModelsFetchFailureLogsOncePerCooldown(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 500, `boom`, false
 	})
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p := testPoolWithCatalog(t, up, &auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	resetCatalogCache(p)
 	h := NewHandler(Config{Pool: p, Upstream: up})
 
 	for i := 0; i < 3; i++ {
@@ -38,7 +35,7 @@ func TestModelsFetchFailureLogsOncePerCooldown(t *testing.T) {
 			t.Fatalf("req %d: code=%d", i, rec.Code)
 		}
 	}
-	const marker = "/v1/models: CN 模型目录拉取失败"
+	const marker = "模型目录拉取失败"
 	if got := strings.Count(buf.String(), marker); got != 1 {
 		t.Fatalf("want 1 failure log line, got %d; log:\n%s", got, buf.String())
 	}
