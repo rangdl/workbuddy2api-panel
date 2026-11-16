@@ -51,3 +51,32 @@ func TestNormalizeHiddenModels(t *testing.T) {
 		}
 	}
 }
+
+// TestNormalizeHiddenModelsTraeThreePart Trae 的三段式 id 必须被正确折算。
+//
+// 历史缺陷：三段式 "trae:cn:x" 被当成裸名，产出 "cn:trae:cn:x" / "global:trae:cn:x"
+// 这种永远不会命中的键——**Trae 的模型从来没有被真正隐藏过**。而下游的过滤点
+// 都是按「域 + 裸名」查表的，所以三段式必须折算成它对应的两段式。
+func TestNormalizeHiddenModelsTraeThreePart(t *testing.T) {
+	got := NormalizeHiddenModels([]string{"trae:cn:glm-5.2"})
+	if _, ok := got["cn:glm-5.2"]; !ok {
+		t.Errorf("三段式应折算为 %q，实际 %v", "cn:glm-5.2", got)
+	}
+	if _, ok := got["global:glm-5.2"]; ok {
+		t.Errorf("三段式指定 cn 域时不该隐藏 global，实际 %v", got)
+	}
+	// 不该产生垃圾键。
+	for k := range got {
+		if len(k) > 0 && (k == "cn:trae:cn:glm-5.2" || k == "global:trae:cn:glm-5.2") {
+			t.Errorf("产生了永远不会命中的垃圾键 %q", k)
+		}
+	}
+
+	got = NormalizeHiddenModels([]string{"trae:global:gpt-5.4"})
+	if _, ok := got["global:gpt-5.4"]; !ok {
+		t.Errorf("Trae global 三段式应折算为 %q，实际 %v", "global:gpt-5.4", got)
+	}
+	if _, ok := got["cn:gpt-5.4"]; ok {
+		t.Errorf("指定 global 时不该隐藏 cn，实际 %v", got)
+	}
+}

@@ -507,6 +507,7 @@ func (p *Panel) nicknames() map[string]string {
 // 标明所属上游，前端据此做徽标与筛选。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	results := p.cfg.Pool.CatalogAll(r.Context())
+	hidden := p.cfg.Live.Load().HiddenModels
 	out := make([]map[string]any, 0, 64)
 	var fetchErrs []string
 	for _, res := range results {
@@ -520,7 +521,15 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 		prefix := panelPrefixFor(res.Backend, res.Realm)
 		for _, m := range res.Models {
-			out = append(out, panelCatalogEntry(res.Backend, prefix, m))
+			entry := panelCatalogEntry(res.Backend, prefix, m)
+			// 真实域与黑名单标记：面板要能把「客户端实际调不到」的条目显示出来。
+			//
+			// 此前面板完全没有应用 models.hidden，于是「页面看得见、客户端调不到」
+			// ——以最坏的方式误导人。这里不直接过滤掉，而是打标记让前端标灰：
+			// 运维页面上「被藏了什么」本身是需要知道的信息。
+			entry["realm"] = panelRealmOf(res.Realm)
+			entry["hidden"] = panelModelHidden(hidden, res.Backend, res.Realm, m.ID)
+			out = append(out, entry)
 		}
 	}
 
@@ -532,7 +541,260 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"models": out,
+		// merged：按**归一后的裸模型名**去重后的一行一模型视图。
+		//
+		// 为什么要后端算而不是前端拼：去重必须用归一后的小写名（上游目录里
+		// 同一个模型可能写作 DeepSeek-V4.1-Flash，而另一个上游写全小写），
+		// 这个归一规则只在 Go 侧有一份权威实现（gateway.NormalizeModel）。
+		// 前端自己写一遍 `toLowerCase()` 看着等价，但一旦归一规则变化
+		// （比如将来要剥 __dev 后缀）两处就会漂移。
+		"merged": panelMergeModels(out),
+	})
+}
+
+// panelRealmOf 域值兜底：空域按 CN（与 gateway.DefaultRealm 同口径）。
+func panelRealmOf(realm string) string {
+	if realm == "" {
+		return gateway.DefaultRealm
+	}
+	return realm
+}
+
+// panelModelHidden 报告某条目录项是否被 models.hidden 隐藏。
+//
+// 这里的键形态必须与 /v1/models 的过滤逻辑逐字一致，否则面板显示「未隐藏」
+// 而客户端实际拿不到。两种 id 形态都要覆盖：
+//
+//	CodeBuddy: "cn:<模型>"          （两段）
+//	Trae:      "trae:<realm>:<模型>" （三段）
+//
+// **Trae 的三段式正是历史缺陷所在**：livecfg.NormalizeHiddenModels 只产出
+// "cn:x"/"global:x" 两段式，所以 `hidden["trae:cn:x"]` 永远不命中，Trae 模型
+// 从来没有被真正隐藏过。这里按「域+裸名」查（即 cn:x），与归一化输出对齐；
+// 同时兼容用户直接写三段式全名的情况。
+func panelModelHidden(hidden map[string]struct{}, backend, realm, bareModel string) bool {
+	if len(hidden) == 0 {
+		return false
+	}
+	realm = panelRealmOf(realm)
+	if backend == panelUpstreamTrae {
+		// 三段式全名（用户可能显式写 trae:cn:x）。
+		if _, ok := hidden[panelUpstreamTrae+":"+realm+":"+bareModel]; ok {
+			return true
+		}
+	}
+	// 两段式（NormalizeHiddenModels 的实际输出形态）。
+	_, ok := hidden[realm+":"+bareModel]
+	return ok
+}
+
+// panelMergeModels 把逐个「上游×域」的条目按裸模型名聚合，一行一模型。
+//
+// 聚合口径（每一处都是刻意的取舍）：
+//   - **去重键**用 gateway.NormalizeModel（小写+去空白）：Trae 目录里的
+//     `DeepSeek-V4.1-Flash` 与 CodeBuddy 的 `deepseek-v4.1-flash` 必须合成一行，
+//     否则「deepseek 显示一条」这个需求根本没实现；
+//   - **上下文/输出上限**取各来源的**最大值**（见下），能力取**并集**，但
+//     每个来源自己的值完整保留在 providers[] 里——主行不撒谎，细节可查；
+//   - **价格**不合并：不同来源的倍率是各自计的，合并成一个数会误导计费预期，
+//     所以 providers[] 里各带各的 credits。
+func panelMergeModels(entries []map[string]any) []map[string]any {
+	type group struct {
+		key       string
+		bareID    string // 首次出现的裸名（保留原始拼写，展示用）
+		name      string // 显示名（非空优先）
+		providers []map[string]any
+		// 能力并集
+		supportsTool, supportsImages, supportsReasoning, canDisable, onlyReasoning bool
+		// 上限取最大
+		contextLen, contextBase, maxOutput, maxAllowed int64
+		efforts                                        []string
+		effortSeen                                     map[string]bool
+		defaultEffort                                  string
+		hiddenAll                                      bool
+	}
+	order := make([]string, 0, len(entries))
+	byKey := make(map[string]*group, len(entries))
+
+	for _, e := range entries {
+		rawID, _ := e["id"].(string)
+		backend, _ := e["upstream"].(string)
+		realm, _ := e["realm"].(string)
+		bare := panelBareModelID(rawID)
+		key := gateway.NormalizeModel(bare)
+		if key == "" {
+			continue
+		}
+		g, seen := byKey[key]
+		if !seen {
+			g = &group{key: key, bareID: bare, effortSeen: map[string]bool{}, hiddenAll: true}
+			byKey[key] = g
+			order = append(order, key)
+		}
+		if g.name == "" {
+			if n, _ := e["name"].(string); n != "" {
+				g.name = n
+			}
+		}
+		prov := map[string]any{
+			"upstream": backend,
+			"realm":    realm,
+			"id":       rawID,
+		}
+		// 每个来源自己的数值原样带上（主行取并集/最大，细节在悬停里看）。
+		for _, k := range []string{"context_length", "context_length_base", "max_output_tokens",
+			"max_allowed_size", "credits", "promo_credits", "promo_label", "promo_factor"} {
+			if v, ok := e[k]; ok {
+				prov[k] = v
+			}
+		}
+		if v, _ := e["hidden"].(bool); v {
+			prov["hidden"] = true
+		} else {
+			g.hiddenAll = false // 只要有一个来源没被藏，这个模型就还能调到
+		}
+		g.providers = append(g.providers, prov)
+
+		// 能力并集：任一来源支持即算支持（主行不因此断言「每个来源都支持」，
+		// 来源粒度的差异在 providers[] 里可查）。
+		if v, _ := e["supports_tool_call"].(bool); v {
+			g.supportsTool = true
+		}
+		if v, _ := e["supports_images"].(bool); v {
+			g.supportsImages = true
+		}
+		if v, _ := e["supports_reasoning"].(bool); v {
+			g.supportsReasoning = true
+		}
+		if v, _ := e["can_disable_thinking"].(bool); v {
+			g.canDisable = true
+		}
+		if v, _ := e["only_reasoning"].(bool); v {
+			g.onlyReasoning = true
+		}
+		// 上限取最大：同一模型在 A 源能开 1M、B 源只有 200K 时，主行显示 1M，
+		// 但点开来源能看到 B 只有 200K——用户据此决定用哪个来源调用。
+		g.contextLen = maxInt64(g.contextLen, int64Of(e["context_length"]))
+		g.contextBase = maxInt64(g.contextBase, int64Of(e["context_length_base"]))
+		g.maxOutput = maxInt64(g.maxOutput, int64Of(e["max_output_tokens"]))
+		g.maxAllowed = maxInt64(g.maxAllowed, int64Of(e["max_allowed_size"]))
+		if eff, ok := e["supported_efforts"].([]string); ok {
+			for _, x := range eff {
+				if !g.effortSeen[x] {
+					g.effortSeen[x] = true
+					g.efforts = append(g.efforts, x)
+				}
+			}
+		}
+		if g.defaultEffort == "" {
+			if v, _ := e["default_effort"].(string); v != "" {
+				g.defaultEffort = v
+			}
+		}
+	}
+
+	out := make([]map[string]any, 0, len(order))
+	for _, key := range order {
+		g := byKey[key]
+		// 提供者按 (上游, 域) 稳定排序：同一份数据每次渲染顺序一致，
+		// 否则用户在列表里找同一个来源时位置会跳。
+		sort.SliceStable(g.providers, func(i, j int) bool {
+			ui, _ := g.providers[i]["upstream"].(string)
+			uj, _ := g.providers[j]["upstream"].(string)
+			if ui != uj {
+				return ui < uj
+			}
+			ri, _ := g.providers[i]["realm"].(string)
+			rj, _ := g.providers[j]["realm"].(string)
+			return ri < rj
+		})
+		m := map[string]any{
+			// id 用归一后的裸名：前端拿它做 key 与搜索，天然大小写不敏感。
+			"id":                   g.key,
+			"bare_id":              g.bareID,
+			"providers":            g.providers,
+			"provider_count":       len(g.providers),
+			"hidden_all":           g.hiddenAll,
+			"supports_tool_call":   g.supportsTool,
+			"supports_images":      g.supportsImages,
+			"supports_reasoning":   g.supportsReasoning,
+			"can_disable_thinking": g.canDisable,
+			"only_reasoning":       g.onlyReasoning,
+		}
+		if g.name != "" {
+			m["name"] = g.name
+		}
+		if g.contextLen > 0 {
+			m["context_length"] = g.contextLen
+		}
+		if g.contextBase > 0 {
+			m["context_length_base"] = g.contextBase
+		}
+		if g.maxOutput > 0 {
+			m["max_output_tokens"] = g.maxOutput
+		}
+		if g.maxAllowed > 0 {
+			m["max_allowed_size"] = g.maxAllowed
+		}
+		if len(g.efforts) > 0 {
+			m["supported_efforts"] = g.efforts
+		}
+		if g.defaultEffort != "" {
+			m["default_effort"] = g.defaultEffort
+		}
+		out = append(out, m)
+	}
+	// 多来源优先：被两个上游同时提供的模型更值得关注（可切换、可容灾）。
+	sort.SliceStable(out, func(i, j int) bool {
+		ci, _ := out[i]["provider_count"].(int)
+		cj, _ := out[j]["provider_count"].(int)
+		if ci != cj {
+			return ci > cj
+		}
+		return out[i]["id"].(string) < out[j]["id"].(string)
+	})
+	return out
+}
+
+// panelBareModelID 从带前缀的完整 id 里剥出裸模型名。
+//
+//	"cn:glm-5.2"          → "glm-5.2"
+//	"trae:cn:glm-5.2"     → "glm-5.2"
+//	"glm-5.2"             → "glm-5.2"
+func panelBareModelID(id string) string {
+	if rest, ok := strings.CutPrefix(id, panelUpstreamTrae+":"); ok {
+		id = rest
+	}
+	if i := strings.IndexByte(id, ':'); i >= 0 {
+		if p := id[:i]; p == "cn" || p == "global" {
+			return id[i+1:]
+		}
+	}
+	return id
+}
+
+// int64Of 宽容取 JSON 数值（面板条目里是 int64，但测试可能注入 float64）。
+func int64Of(v any) int64 {
+	switch n := v.(type) {
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	case float64:
+		return int64(n)
+	default:
+		return 0
+	}
+}
+
+func maxInt64(a, b int64) int64 {
+	if b > a {
+		return b
+	}
+	return a
 }
 
 // panelPrefixFor 该条目在面板上的 ID 前缀（即客户端调用时要填的 model 值前缀）。

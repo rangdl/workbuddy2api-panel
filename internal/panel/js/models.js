@@ -51,6 +51,8 @@ function rateCell(m) {
 async function loadModels() {
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
+  const mb = $('mdMergedBody');
+  if (mb) mb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     // 探测、模型锁与最近请求都是本地可选增强：任一失败不影响模型目录本身。
     // 可用性标签不额外发推理请求，只用模型锁和最近真实请求结果合成。
@@ -63,11 +65,14 @@ async function loadModels() {
       api('request_metrics').catch(() => ({})),
     ]);
     mdAll = d.models || [];
+    mdMerged = d.merged || [];
     mdProbes = pr.probes || {};
     mdLocks = Array.isArray(ov.model_locks) ? ov.model_locks : [];
     mdRecent = Array.isArray(rm.recent) ? rm.recent : [];
     if (!mdAll.length) {
-      tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>';
+      const empty = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>';
+      tb.innerHTML = empty;
+      if (mb) mb.innerHTML = empty;
       $('mdCount').textContent = '';
       $('mdNote').textContent = '上游未返回模型';
       return;
@@ -76,11 +81,15 @@ async function loadModels() {
     const probeKeys = Object.keys(mdProbes);
     mdProbeOf = id => mdProbes[id] || mdProbes[probeKeys.find(k => k.endsWith(':' + id))];
     const hit = mdAll.filter(m => mdProbeOf(m.id)).length;
-    $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
+    $('mdNote').textContent = mdMerged.length + ' 个模型（合并后）· 明细 ' + mdAll.length +
+      ' 条' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
     renderModels();
   } catch (e) {
     mdAll = [];
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    mdMerged = [];
+    const err = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    tb.innerHTML = err;
+    if (mb) mb.innerHTML = err;
     $('mdCount').textContent = '';
   }
 }
@@ -259,7 +268,189 @@ function mdRowHtml(m, pr) {
     outCell(m, pr) + '</tr>';
 }
 
+// mdProviderTag 单个「上游×域」徽标。
+//
+// 为什么把域并进徽标文字而不是单独一列：用户要的就是「这个模型谁提供」，
+// 拆成两列（上游 + 域）会让他自己做笛卡尔积式的阅读。合在一个 chip 里
+// 一眼就是「WorkBuddy·CN」这样的完整来源。
+//
+// 配色：上游决定色系（Trae 用 warn——它是后接入的少数派，需要从长列表里
+// 一眼挑出来；WorkBuddy 用 mute），域用深浅区分（global 加边框）。
+function mdProviderTag(p, clickable) {
+  const up = String((p && p.upstream) || '');
+  const realm = String((p && p.realm) || 'cn');
+  const upLabel = MD_UPSTREAM_LABEL[up] || up || '?';
+  const realmLabel = realm === 'global' ? 'Global' : 'CN';
+  const cls = up === 'trae' ? 'warn' : 'mute';
+  const hidden = p && p.hidden === true;
+  const bits = [];
+  if (p && p.credits) bits.push('倍率 ' + p.credits);
+  if (p && p.context_length) bits.push('上下文 ' + fmtK(p.context_length));
+  if (p && p.max_output_tokens) bits.push('最大输出 ' + fmtK(p.max_output_tokens));
+  if (hidden) bits.push('已被 models.hidden 隐藏（客户端调不到）');
+  const tip = '调用名：' + String((p && p.id) || '') + (bits.length ? ' · ' + bits.join(' · ') : '');
+  const text = esc(upLabel) + '·' + esc(realmLabel);
+  const style = hidden ? ' style="opacity:.45;text-decoration:line-through"' : '';
+  if (!clickable) return '<span class="tag ' + cls + '" title="' + esc(tip) + '"' + style + '>' + text + '</span>';
+  return '<span class="tag ' + cls + ' md-prov" data-up="' + esc(up) + '" data-realm="' + esc(realm) +
+    '" title="' + esc(tip + '（点击筛选该来源）') + '" style="cursor:pointer' +
+    (hidden ? ';opacity:.45;text-decoration:line-through' : '') + '">' + text + '</span>';
+}
+
+// mdProviderTags 一个模型的全部来源徽标。
+function mdProviderTags(m, clickable) {
+  const ps = (m && m.providers) || [];
+  return ps.map(p => mdProviderTag(p, clickable)).join(' ');
+}
+
+// mdMergedRateCell 合并视图的倍率列：各来源倍率不同，逐个列出。
+//
+// 刻意**不合并成一个数**：倍率是各自计费的，取最小或平均都会误导用户对
+// 「用这个模型要花多少」的预期。悬停里带来源名，一眼知道哪个便宜。
+function mdMergedRateCell(m) {
+  const ps = (m && m.providers) || [];
+  const parts = [];
+  for (const p of ps) {
+    if (!p.credits && !p.promo_credits) continue;
+    const upLabel = MD_UPSTREAM_LABEL[p.upstream] || p.upstream || '?';
+    const realmLabel = p.realm === 'global' ? 'Global' : 'CN';
+    const rate = p.promo_credits || p.credits;
+    const label = p.promo_label ? ' <span class="tag ok">' + esc(p.promo_label) + '</span>' : '';
+    parts.push('<div class="id" title="' + esc(upLabel + '·' + realmLabel) + '">' +
+      esc(rate) + label + ' <span style="color:var(--ink-3)">' + esc(upLabel) + '</span></div>');
+  }
+  return parts.length ? parts.join('') : '—';
+}
+
+// mdMergedRowHtml 合并视图的单行（纯渲染，便于独立测试）。
+//
+// 「提供者」列是这个视图的核心：一行一模型，右侧列出它由哪些上游×域提供。
+// 被全部来源隐藏的模型标灰划线而不是删掉——运维页面上「被藏了什么」本身
+// 是需要知道的信息，而客户端 /v1/models 确实不返回它。
+function mdMergedRowHtml(m) {
+  const eff = (m.supported_efforts || []).slice();
+  if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
+  const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
+    : '<span style="color:var(--ink-3);font-size:12.5px">' +
+      (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
+  const caps = [];
+  if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
+  if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
+  if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
+  const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
+  const hiddenAll = m.hidden_all === true;
+  const nmStyle = hiddenAll ? ' style="opacity:.5;text-decoration:line-through"' : '';
+  const nameLine = m.name && m.name !== m.bare_id
+    ? '<div class="id">' + esc(m.name) + '</div>' : '';
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td>' +
+    '<td class="who"><div class="nm"><span class="mid"' + nmStyle + '>' + esc(m.bare_id || m.id) + '</span>' +
+    (hiddenAll ? ' <span class="tag bad" title="所有来源都被 models.hidden 隐藏，客户端 /v1/models 不返回它">已隐藏</span>' : '') +
+    '</div>' + nameLine + capHtml + '</td>' +
+    '<td style="white-space:normal">' + mdProviderTags(m, true) + '</td>' +
+    '<td class="num">' + mdMergedRateCell(m) + '</td>' +
+    '<td class="efs" style="white-space:normal">' + effs + '</td>' +
+    '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
+    '<td class="num">' + (m.max_output_tokens ? fmtK(m.max_output_tokens) : '—') + '</td></tr>';
+}
+
+// mdMergedMatch 合并视图的筛选：复用现有条件，但按 providers 判定上游/域。
+//
+// 与明细视图的差别在语义：明细视图里「筛选 Trae」= 只留 Trae 那些行；合并
+// 视图里 = 只留有 Trae 来源的模型（该模型的其它来源仍然显示——那正是用户
+// 想看的信息：这个模型还有谁提供）。
+function mdMergedMatch(m, f) {
+  f = f || mdFilter;
+  if (f.q) {
+    const provText = ((m.providers) || []).map(p =>
+      [p.upstream, p.realm, MD_UPSTREAM_LABEL[p.upstream] || ''].join(' ')).join(' ');
+    const text = [m.id, m.bare_id, m.name, provText].filter(Boolean).join(' ').toLowerCase();
+    for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
+      if (!text.includes(kw)) return false;
+    }
+  }
+  const provs = m.providers || [];
+  if (f.upstream && !provs.some(p => p.upstream === f.upstream)) return false;
+  if (f.realm && !provs.some(p => p.realm === f.realm)) return false;
+  if (f.cap === 'tool' && !m.supports_tool_call) return false;
+  if (f.cap === 'vision' && !m.supports_images) return false;
+  if (f.cap === 'reasoning' && !m.supports_reasoning) return false;
+  if (f.effort === 'off') {
+    if (!m.can_disable_thinking) return false;
+  } else if (f.effort && !(m.supported_efforts || []).includes(f.effort)) {
+    return false;
+  }
+  // 价格筛选在合并视图里看「任一来源满足」：用户问的是「有没有便宜的来源」。
+  if (f.promo) {
+    const ok = provs.some(p => {
+      if (f.promo === 'promo') return p.promo_factor != null || p.promo_label;
+      if (f.promo === 'free') return p.promo_factor != null && Number(p.promo_factor) === 0;
+      if (f.promo === 'discount') return p.promo_factor != null && Number(p.promo_factor) > 0;
+      return true;
+    });
+    if (!ok) return false;
+  }
+  return true;
+}
+
+// mdMergedSortList 合并视图排序。默认保持后端给的「多来源优先」顺序。
+function mdMergedSortList(list, f) {
+  f = f || mdFilter;
+  const out = list.slice();
+  const num = v => { const n = Number(v || 0); return Number.isFinite(n) ? n : 0; };
+  if (f.sort === 'context') out.sort((a, b) => num(b.context_length) - num(a.context_length));
+  else if (f.sort === 'output') out.sort((a, b) => num(b.max_output_tokens) - num(a.max_output_tokens));
+  else if (f.sort === 'name') out.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  else if (f.sort === 'rate') {
+    // 合并视图按「最便宜的来源」排序：用户拿它找性价比最高的模型。
+    const cheapest = m => {
+      let best = Infinity;
+      for (const p of (m.providers || [])) {
+        const raw = (p.promo_credits != null && p.promo_credits !== '') ? p.promo_credits : p.credits;
+        const n = parseFloat(String(raw == null ? '' : raw).replace(/[^\d.]/g, ''));
+        if (Number.isFinite(n) && n < best) best = n;
+      }
+      return best;
+    };
+    out.sort((a, b) => cheapest(a) - cheapest(b));
+  }
+  return out;
+}
+
+function renderMergedModels() {
+  const tb = $('mdMergedBody');
+  if (!tb) return;
+  const list = mdMergedSortList(mdMerged.filter(m => mdMergedMatch(m)));
+  if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>';
+  } else {
+    tb.innerHTML = list.map(mdMergedRowHtml).join('');
+  }
+  const filtered = list.length !== mdMerged.length;
+  const el = $('mdCount');
+  el.textContent = !mdMerged.length ? ''
+    : filtered ? '命中 ' + list.length + ' / ' + mdMerged.length + ' 个模型'
+    : mdMerged.length + ' 个模型';
+  el.className = filtered ? 'note src-off' : 'note';
+}
+
+// mdApplyView 切换合并/明细视图（两个表格互斥显示，共用同一份筛选条件）。
+function mdApplyView() {
+  const merged = mdView !== 'detail';
+  const mt = $('mdMergedTable'), dt = $('mdDetailTable');
+  if (mt) mt.hidden = !merged;
+  if (dt) dt.hidden = merged;
+}
+
 function renderModels() {
+  mdApplyView();
+  if (mdView === 'detail') {
+    renderDetailModels();
+  } else {
+    renderMergedModels();
+  }
+}
+
+function renderDetailModels() {
   const tb = $('mdBody');
   const list = mdSortList(mdAll.filter(m => mdMatch(m)));
   if (!list.length) {
@@ -268,16 +459,19 @@ function renderModels() {
     tb.innerHTML = list.map(m => mdRowHtml(m, mdProbeOf(m.id))).join('');
   }
   const filtered = list.length !== mdAll.length;
-  $('mdCount').textContent = !mdAll.length ? ''
+  const el = $('mdCount');
+  el.textContent = !mdAll.length ? ''
     : filtered ? '命中 ' + list.length + ' / ' + mdAll.length + ' 个模型'
     : mdAll.length + ' 个模型';
-  $('mdCount').className = filtered ? 'note src-off' : 'note';
+  el.className = filtered ? 'note src-off' : 'note';
 }
 
 function resetModelFilter() {
   mdFilter = { q: '', upstream: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
   $('mdQ').value = ''; $('mdUpstream').value = ''; $('mdRealm').value = ''; $('mdCap').value = '';
   $('mdEffort').value = ''; $('mdPromo').value = ''; $('mdSort').value = 'default';
+  // 重置只清筛选条件，**不动视图选择**：用户选了明细视图是为了看细节，
+  // 清筛选条件不该顺手把他甩回合并视图。
   renderModels();
 }
 
@@ -294,3 +488,27 @@ for (const [id, key] of [['mdUpstream', 'upstream'], ['mdRealm', 'realm'], ['mdC
 }
 $('mdReset').onclick = resetModelFilter;
 $('btnModels').onclick = loadModels;
+
+// 视图切换：两种视图共用同一份筛选条件（mdFilter），切过去不会丢条件。
+if ($('mdViewSel')) {
+  $('mdViewSel').value = mdView;
+  $('mdViewSel').onchange = () => { mdView = $('mdViewSel').value; renderModels(); };
+}
+
+// 提供者徽标点击 = 筛到该来源。
+//
+// 用事件委托而不是给每个徽标挂 onclick：徽标是 innerHTML 批量生成的，
+// 每次重渲染都会重建 DOM，逐个绑定既啰嗦又会漏（重渲染后新节点没有监听器）。
+$('mdMergedBody').onclick = ev => {
+  const chip = ev.target.closest('.md-prov');
+  if (!chip) return;
+  const up = chip.getAttribute('data-up') || '';
+  const realm = chip.getAttribute('data-realm') || '';
+  // 再点一次同一个徽标 = 取消筛选（避免用户被自己锁在一个来源里）。
+  const same = mdFilter.upstream === up && mdFilter.realm === realm;
+  mdFilter.upstream = same ? '' : up;
+  mdFilter.realm = same ? '' : realm;
+  if ($('mdUpstream')) $('mdUpstream').value = mdFilter.upstream;
+  if ($('mdRealm')) $('mdRealm').value = mdFilter.realm;
+  renderModels();
+};

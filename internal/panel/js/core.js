@@ -12,6 +12,12 @@ let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', upstream: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
+/* mdMerged：按归一后裸模型名去重的一行一模型视图（后端 /panel/api/models 的
+   merged 字段）。去重键的归一规则只在 Go 侧有一份实现（gateway.NormalizeModel），
+   前端不自己复制一遍——否则规则变化时两处会漂移。 */
+let mdMerged = [];
+/* mdView：'merged'（一行一模型，默认）| 'detail'（逐个上游×域一行）。 */
+let mdView = 'merged';
 let mdLocks = [], mdRecent = [];
 let reqFilter = { q: '', outcome: '' };
 let reqEntries = [];
@@ -362,7 +368,10 @@ function go(v) {
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
-  if (v === 'models' && !$('mdBody').children.length) loadModels();
+  // 判「模型数据是否已加载」看 mdAll（数据）而不是 mdBody（某张表的 DOM）：
+  // 模型页有两种视图，合并视图下 mdBody 一直是空的，按 DOM 判会导致每次
+  // 进页面都重新打一次上游目录（那是很贵的实时查询）。
+  if (v === 'models' && !mdAll.length) loadModels();
   if (v === 'config') loadConfig();
   // 「上游接入」页已删除：Trae 的可配项（IDE 版本 / 签到 UA）并入配置页，
   // 由 loadConfig 一并回填（见 config.js 的 loadTraeConfig 调用点）。

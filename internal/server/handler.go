@@ -382,6 +382,31 @@ func fmtCreditsPrefix(raw string) string {
 // 缓存完全在池里（pool.catalogCached：成功 10 分钟 / 失败负缓存 5 分钟），
 // 本函数不做任何缓存判断，也不重复拉取——改造前 server 与 panel 各维护一份
 // TTL 不同的缓存，导致两侧列表机制上允许不一致。
+// modelHidden 报告「域:裸名」是否被 models.hidden 隐藏（大小写不敏感）。
+//
+// 归一化后的集合键是小写两段式（见 livecfg.NormalizeHiddenModels），而请求
+// 模型名来自客户端，两者大小写可能不一致。精确比对会让「列表里藏了、点名却
+// 仍能硬调」——正是黑名单要防的那件事。
+func (h *Handler) modelHidden(hidden map[string]struct{}, realm, bareModel string) bool {
+	if len(hidden) == 0 || bareModel == "" {
+		return false
+	}
+	if realm == "" {
+		realm = "cn"
+	}
+	want := gateway.NormalizeModel(realm + ":" + bareModel)
+	if _, ok := hidden[want]; ok {
+		return true
+	}
+	// 用户可能显式写了大写（配置层面我们不强行改写用户输入），逐一比对。
+	for k := range hidden {
+		if gateway.NormalizeModel(k) == want {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Handler) modelList(ctx context.Context) []map[string]any {
 	out := make([]map[string]any, 0)
 	// models.hidden 黑名单：快照外提，避免逐条目重复 Load。
@@ -394,7 +419,11 @@ func (h *Handler) modelList(ctx context.Context) []map[string]any {
 		prefix := catalogPrefix(res.Backend, realm)
 		for _, m := range res.Models {
 			id := prefix + m.ID
-			if _, ok := hidden[id]; ok {
+			// 查表用「域:裸名」而不是完整 id：Trae 的完整 id 是三段式
+			// "trae:cn:x"，而 NormalizeHiddenModels 只产出两段式 "cn:x"。
+			// 直接拿三段式查会永远不命中——Trae 模型从来没有被真正隐藏过。
+			// 口径与点名调用（modelHidden）保持一致：大小写不敏感。
+			if h.modelHidden(hidden, realm, m.ID) {
 				continue
 			}
 			out = append(out, catalogEntry(id, res.Backend, m))
@@ -571,7 +600,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// models.hidden 黑名单：点名调用直接拒绝，不打上游、不占选号。
 	// 与 /v1/models 的列表过滤对称（只藏列表不够，知道名字仍可硬调）。
-	if _, hide := h.loadLive().HiddenModels[realm+":"+bareModel]; hide {
+	//
+	// 键要归一：hidden 集合与请求模型名的大小写可能不一致（上游目录常是
+	// `DeepSeek-V4.1-Flash`，客户端写小写）。精确比对会让「藏了却仍能硬调」，
+	// 与列表侧的行为不一致。
+	if h.modelHidden(h.loadLive().HiddenModels, realm, bareModel) {
 		writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable",
 			"model is hidden by gateway configuration, try another model", "")
 		st.status = http.StatusBadRequest

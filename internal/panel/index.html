@@ -815,6 +815,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnModels">重新获取</button>
         </header>
         <div class="fbar" id="mdFilter">
+          <select id="mdViewSel" aria-label="视图">
+            <option value="merged">合并视图（一行一模型）</option>
+            <option value="detail">明细视图（按上游分开）</option>
+          </select>
           <input id="mdQ" type="search" placeholder="搜索模型 ID / 名称 / 描述 / 厂商" aria-label="搜索模型">
           <select id="mdUpstream" aria-label="按上游筛选">
             <option value="">全部上游</option>
@@ -860,7 +864,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs ghost" id="mdReset" title="清空全部筛选条件">重置</button>
         </div>
         <div class="tbl-wrap">
-        <table class="acc md">
+        <!-- 合并视图：一行一个模型（按归一后的裸名去重），「提供者」列标出它由哪些
+             上游×域提供。默认视图——用户关心的是「有哪些模型可调」，而不是
+             「每个上游各列了什么」。明细视图保留原有逐来源列表，用于对照倍率/上限。 -->
+        <table class="acc md" id="mdMergedTable">
+          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>提供者</th><th>积分倍率</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>
+          <tbody id="mdMergedBody"></tbody>
+        </table>
+        <table class="acc md" id="mdDetailTable" hidden>
           <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>
           <tbody id="mdBody"></tbody>
         </table>
